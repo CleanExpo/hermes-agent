@@ -53,8 +53,10 @@ HERMES_HOME="/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-2026
 
 Command evidence is a JSON list containing `name`, `exit_code`, `test_count`,
 `skipped`, and `flaky`. T2/T3 receipts also require runtime checks; T3 requires a
-passed rollback proof. Create a receipt only after the final commit because any
-commit or dirty-state change invalidates it.
+passed rollback proof. `TESTED` binds focused acceptance and real-path proof;
+`ENFORCED` additionally requires a passing command marked `"scope": "full"` (the
+complete repository suite or equivalent CI gate). Create a receipt only after the
+final commit because any commit or dirty-state change invalidates it.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \

@@ -285,6 +285,9 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
     )
     assert failed["result"] == "FAIL"
 
+    not_enforced = _passing_receipt(pilot, target="ENFORCED")
+    assert not_enforced["result"] == "FAIL"
+
     receipt_path = pilot["state"] / "receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     assert verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"]) == []

@@ -247,6 +247,13 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
             errors.append(f"command is flaky: {name}")
     if tier != "T0" and not has_positive_test:
         errors.append("receipt has no command with a positive test count")
+    if target == "ENFORCED" and not any(
+        isinstance(command, dict)
+        and command.get("scope") == "full"
+        and command.get("exit_code") == 0
+        for command in commands
+    ):
+        errors.append("ENFORCED requires a passing full-suite or CI command")
 
     runtime_checks = receipt.get("runtime_checks")
     if tier in {"T2", "T3"} and (
