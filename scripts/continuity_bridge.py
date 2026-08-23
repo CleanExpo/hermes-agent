@@ -163,6 +163,14 @@ def build_preflight(
         errors.append(str(exc))
         card = {}
         card_word_count = None
+    if state and card:
+        evidence = card.get("evidence")
+        evidence_commit = evidence.get("commit") if isinstance(evidence, dict) else None
+        if evidence_commit != state.commit:
+            errors.append(
+                "Basic Memory evidence commit is stale: "
+                f"expected {state.commit}, got {evidence_commit!r}"
+            )
 
     try:
         spec_path = repo_root / config["spec"]["path"]

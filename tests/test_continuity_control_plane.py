@@ -295,6 +295,9 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
     _git(pilot["repo"], "add", "seed.txt")
     _git(pilot["repo"], "commit", "-m", "change exact SHA")
     assert any(
+        "evidence commit is stale" in error for error in _preflight(pilot)["errors"]
+    )
+    assert any(
         "stale" in error
         for error in verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"])
     )
