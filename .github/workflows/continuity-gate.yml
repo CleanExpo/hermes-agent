@@ -1,0 +1,41 @@
+name: Continuity contract
+
+on:
+  pull_request:
+    paths:
+      - '.continuity/**'
+      - '.specify/**'
+      - '.claude/settings.json'
+      - '.codex/hooks.json'
+      - 'scripts/continuity_*.py'
+      - 'scripts/install_continuity_adapters.py'
+      - 'spec.md'
+      - 'specs/**'
+      - 'tests/test_continuity_control_plane.py'
+  push:
+    paths:
+      - '.continuity/**'
+      - '.specify/**'
+      - '.claude/settings.json'
+      - '.codex/hooks.json'
+      - 'scripts/continuity_*.py'
+      - 'scripts/install_continuity_adapters.py'
+      - 'spec.md'
+      - 'specs/**'
+      - 'tests/test_continuity_control_plane.py'
+
+permissions:
+  contents: read
+
+jobs:
+  static-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - run: pip install 'PyYAML==6.0.3'
+      - run: python3 scripts/install_continuity_adapters.py --repo-root "$PWD" --check
+      - run: python3 scripts/continuity_gate.py static --config .continuity/config.json
+      - run: scripts/run_tests.sh tests/test_continuity_control_plane.py

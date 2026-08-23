@@ -2,6 +2,11 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+The repository-wide safe-change contract in [`spec.md`](spec.md) is mandatory.
+For continuity work, the active Spec Kit change under `specs/` and its exact-state
+receipt refine that contract; neither memory nor task status can replace test and
+runtime evidence.
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
