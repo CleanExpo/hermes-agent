@@ -116,6 +116,38 @@ def _native_observer_interrupt_worker(
     )
 
 
+def _native_observer_spawn_race_worker(
+    state_dir: str, child_pid_path: str, sentinel_path: str
+) -> None:
+    state = Path(state_dir)
+    host = state / "spawn-race-native-host.py"
+    host.write_text(
+        "import pathlib,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(1.2)\n"
+        "pathlib.Path(sys.argv[1]).write_text('survived')\n",
+        encoding="utf-8",
+    )
+    real_popen = continuity_native_observation.subprocess.Popen
+
+    def interrupt_immediately_after_spawn(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        Path(child_pid_path).write_text(str(child.pid), encoding="utf-8")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return child
+
+    continuity_native_observation.subprocess.Popen = interrupt_immediately_after_spawn
+    continuity_native_observation._run_host_until_native_event(
+        [sys.executable, str(host), sentinel_path],
+        cwd=state,
+        env=os.environ.copy(),
+        checkpoint=(state / "events.jsonl", 0, None),
+        surface="claude",
+        output_dir=state,
+        timeout=30,
+    )
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=repo, text=True, capture_output=True, check=False
@@ -1846,6 +1878,35 @@ def test_interrupted_native_observer_reaps_isolated_host_group(
 
     os.kill(worker.pid, signal.SIGTERM)
     worker.join(5)
+    time.sleep(1.5)
+
+    try:
+        os.kill(nested_pid, 0)
+    except ProcessLookupError:
+        nested_alive = False
+    else:
+        nested_alive = True
+        if os.name == "posix":
+            os.killpg(nested_pid, signal.SIGKILL)
+    assert worker.exitcode == 128 + signal.SIGTERM
+    assert not nested_alive
+    assert not sentinel.exists()
+
+
+def test_native_observer_blocks_termination_across_spawn_handler_race(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "spawned-child-pid.txt"
+    sentinel = tmp_path / "spawn-race-host-survived.txt"
+    context = multiprocessing.get_context("fork")
+    worker = context.Process(
+        target=_native_observer_spawn_race_worker,
+        args=(str(tmp_path), str(child_pid_path), str(sentinel)),
+    )
+    worker.start()
+    worker.join(5)
+    assert child_pid_path.exists()
+    nested_pid = int(child_pid_path.read_text(encoding="utf-8"))
     time.sleep(1.5)
 
     try:

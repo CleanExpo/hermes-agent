@@ -144,17 +144,25 @@ def _run_host_until_native_event(
         stdout_path.open("w", encoding="utf-8") as stdout_handle,
         stderr_path.open("w", encoding="utf-8") as stderr_handle,
     ):
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            text=True,
-            start_new_session=os.name == "posix",
-        )
         handled_signals = (signal.SIGTERM, signal.SIGINT)
+        prior_mask: set[signal.Signals] | None = None
+        if os.name == "posix":
+            prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                start_new_session=os.name == "posix",
+            )
+        except BaseException:
+            if prior_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+            raise
         prior_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
 
         def terminate_nested_host(signum: int, _frame: object) -> None:
@@ -170,6 +178,8 @@ def _run_host_until_native_event(
 
         for sig in handled_signals:
             signal.signal(sig, terminate_nested_host)
+        if prior_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         try:
             deadline = time.monotonic() + timeout
             last_error: ContinuityError | None = None

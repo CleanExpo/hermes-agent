@@ -109,7 +109,9 @@ host CLIs with tools disabled, require the host-created session identity to matc
 redacted `SessionStart` audit record, and stop the credential-free host after that
 admission evidence appears instead of waiting on a downstream model request. Both the
 host and the complete project adapter surface are then rehashed. Observer interruption
-forwards a hard stop to the host's isolated process group before the observer exits.
+forwards a hard stop to the host's isolated process group before the observer exits;
+POSIX termination signals remain masked across child spawn and handler installation so
+there is no detached-child race window.
 Codex uses a
 temporary, external-state-root home that trusts only the exact project for the
 observation; the vetted hook source is still required to match the committed generated
