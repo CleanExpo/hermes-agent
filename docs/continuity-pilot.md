@@ -64,15 +64,17 @@ event, including the expected exit `2` from a blocked `pre_tool_call`.
 ## Receipt shape
 
 Command evidence input is a closed manifest containing `name`, a repository-local
-`argv`, optional `scope`, and optional timeout. The gate executes each command in a
+`argv`, and an optional timeout. The gate executes each command in a
 credential-minimized environment and records exit code, parsed positive test count,
-timestamps, duration, working directory, and a SHA-256 output digest; callers cannot
-self-attest results. Runtime and rollback inputs use the same manifest pattern. T2/T3
-receipts require runtime checks; T3 requires an executed rollback dry-run. `TESTED`
-binds focused acceptance and real-path proof;
-`ENFORCED` additionally requires a passing command marked `"scope": "full"` (the
-complete repository suite or equivalent CI gate). Create a receipt only after the
-final commit because any commit or dirty-state change invalidates it.
+timestamps, duration, working directory, command identity digest, and output digest;
+raw argv and output are not persisted. The gate derives `full` only when the resolved
+argv exactly matches `evidence_policy.full_suite_argv`; callers cannot label a focused
+command as full. Runtime and rollback inputs use the same manifest pattern. T2/T3
+receipts require runtime checks; T3 requires an executed rollback dry-run. Receipts are
+authenticated with a mode-`0600` pilot-local HMAC key. `ENFORCED` requires the
+gate-owned full-suite identity. Create a receipt only after the final commit because
+any commit, dirty-state change, integration-ref advance, or external-input drift
+invalidates it.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \
@@ -88,9 +90,9 @@ python3 scripts/continuity_gate.py verify-receipt \
 `promote` is the only supported route to `TESTED` or `ENFORCED`. It updates the
 external card, leaving the committed active specification unchanged so promotion does
 not invalidate its own exact-state fingerprint. `ENFORCED` also closes the Beads item;
-promotion is serialized with an external file lock. If task closure is interrupted,
-the durable journal records `RECOVERY_REQUIRED`, preflight blocks, and an idempotent
-retry with the same receipt finishes the transition.
+promotion is serialized with an external file lock and re-reads the task after close.
+If any `PREPARED`, `CARD_WRITTEN`, or `RECOVERY_REQUIRED` stage is interrupted,
+preflight blocks and an idempotent retry with the same receipt resumes the transition.
 
 ## Rollback
 
@@ -108,9 +110,9 @@ Rollback refuses to proceed if a managed hook changed after installation. Broade
 pilot retirement is recoverable and scoped:
 
 1. Verify the shared checkout and live global hook files are unchanged.
-2. Remove this isolated worktree through `git worktree remove` only after preserving
-   any desired branch/receipt evidence.
-3. Apply the adapter rollback, then move the isolated external pilot state directory
+2. Apply the adapter rollback while its repository tool still exists.
+3. Remove this isolated worktree through `git worktree remove` only after preserving
+   any desired branch/receipt evidence, then move the isolated external pilot directory
    into an archive on the Storage Unit; do not delete it during the pilot.
 4. Delete the pilot branch only after confirming no evidence is needed.
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import platform
+import secrets
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -192,14 +194,97 @@ def verify_pinned_executable(
 
 def external_input_digests(config: dict[str, Any], repo_root: Path) -> dict[str, str]:
     inputs: dict[str, str] = {}
-    for raw in config.get("external_instructions", []):
-        path = Path(raw).resolve()
-        inputs[str(path)] = sha256_file(path)
+    for item in config.get("external_instructions", []):
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise ContinuityError(
+                "external instruction pins require exactly path and sha256"
+            )
+        path = Path(str(item["path"])).resolve()
+        expected = item["sha256"]
+        if not isinstance(expected, str) or len(expected) != 64:
+            raise ContinuityError(f"external instruction has invalid SHA-256: {path}")
+        actual = sha256_file(path)
+        if not hmac.compare_digest(actual, expected):
+            raise ContinuityError(
+                f"external instruction digest mismatch: expected {expected}, got {actual}"
+            )
+        inputs[str(path)] = actual
     beads_path = Path(config["beads"]["binary"])
     inputs[str(beads_path.resolve())] = verify_pinned_executable(
         config, repo_root, "beads", beads_path
     )
     return dict(sorted(inputs.items()))
+
+
+def _receipt_key_path(config: dict[str, Any]) -> Path:
+    return Path(config["state_root"]) / "receipt-signing.key"
+
+
+def _load_receipt_key(config: dict[str, Any], *, create: bool) -> bytes:
+    path = _receipt_key_path(config)
+    if create and not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                key = secrets.token_bytes(32)
+                os.write(descriptor, key)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    try:
+        key = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+    except OSError as exc:
+        raise ContinuityError(f"cannot read receipt signing key: {exc}") from exc
+    if len(key) != 32 or mode & 0o077:
+        raise ContinuityError("receipt signing key must be 32 bytes with mode 0600")
+    return key
+
+
+def _receipt_auth_payload(receipt: dict[str, Any]) -> bytes:
+    unsigned = {key: value for key, value in receipt.items() if key != "auth"}
+    return json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def sign_receipt(config: dict[str, Any], receipt: dict[str, Any]) -> dict[str, str]:
+    key = _load_receipt_key(config, create=True)
+    return {
+        "algorithm": "hmac-sha256",
+        "key_id": hashlib.sha256(key).hexdigest()[:16],
+        "digest": hmac.new(
+            key, _receipt_auth_payload(receipt), hashlib.sha256
+        ).hexdigest(),
+    }
+
+
+def receipt_signature_errors(
+    config: dict[str, Any], receipt: dict[str, Any]
+) -> list[str]:
+    auth = receipt.get("auth")
+    if not isinstance(auth, dict) or set(auth) != {"algorithm", "key_id", "digest"}:
+        return ["receipt authentication record is absent or malformed"]
+    if auth.get("algorithm") != "hmac-sha256":
+        return ["receipt authentication algorithm is invalid"]
+    try:
+        key = _load_receipt_key(config, create=False)
+    except ContinuityError as exc:
+        return [str(exc)]
+    expected_id = hashlib.sha256(key).hexdigest()[:16]
+    expected_digest = hmac.new(
+        key, _receipt_auth_payload(receipt), hashlib.sha256
+    ).hexdigest()
+    errors: list[str] = []
+    if not hmac.compare_digest(str(auth.get("key_id")), expected_id):
+        errors.append("receipt signing key identity does not match")
+    if not hmac.compare_digest(str(auth.get("digest")), expected_digest):
+        errors.append("receipt signature is invalid")
+    return errors
 
 
 def run_command(
@@ -334,12 +419,16 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
         "runtime_checks",
         "rollback",
         "result",
+        "auth",
     }
     unknown_receipt = sorted(set(receipt) - allowed_receipt)
     if unknown_receipt:
         errors.append("receipt contains unknown keys: " + ", ".join(unknown_receipt))
     if receipt.get("gate") != "hermes-continuity-gate/2":
         errors.append("receipt was not emitted by hermes-continuity-gate/2")
+    auth = receipt.get("auth")
+    if not isinstance(auth, dict) or set(auth) != {"algorithm", "key_id", "digest"}:
+        errors.append("receipt authentication record is absent or malformed")
     external_inputs = receipt.get("external_inputs")
     if not isinstance(external_inputs, dict) or not external_inputs:
         errors.append("receipt has no external input digests")
@@ -349,6 +438,8 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
     expected_git = current.as_dict()
     if receipt.get("git") != expected_git:
         errors.append("receipt repository, branch, commit, or dirty state is stale")
+    if current.integration_ref and current.merge_base != current.integration_sha:
+        errors.append("current branch is not based on the configured integration SHA")
     authority = receipt.get("authority_check")
     if not isinstance(authority, dict) or authority.get("passed") is not True:
         errors.append("strict authority check is absent or failed")
@@ -370,7 +461,7 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
         allowed_command = {
             "name",
             "kind",
-            "argv",
+            "command_sha256",
             "cwd",
             "started_at",
             "completed_at",
@@ -427,7 +518,7 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
             allowed_runtime = {
                 "name",
                 "kind",
-                "argv",
+                "command_sha256",
                 "cwd",
                 "started_at",
                 "completed_at",
@@ -465,7 +556,7 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
         allowed_rollback = {
             "name",
             "kind",
-            "argv",
+            "command_sha256",
             "cwd",
             "started_at",
             "completed_at",

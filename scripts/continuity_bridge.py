@@ -19,6 +19,7 @@ from continuity_common import (
     minimal_child_env,
     read_markdown_frontmatter,
     receipt_errors,
+    receipt_signature_errors,
     run_command,
     verify_pinned_executable,
 )
@@ -102,24 +103,79 @@ def _read_beads(
 
 def validate_tool_adjacency(events: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
+    pending: list[str] = []
     for index, event in enumerate(events):
         event_type = event.get("type")
-        if event_type not in {"server_tool_use", "tool_use"}:
+        if event_type in {"server_tool_use", "tool_use"}:
+            pending.append(str(event.get("id") or index))
             continue
-        tool_id = event.get("id")
-        if index + 1 >= len(events):
-            errors.append(f"tool use {tool_id or index} has no adjacent result")
+        if event_type in {"tool_result", "server_tool_result"}:
+            result_id = str(event.get("tool_use_id") or event.get("id") or "")
+            if not pending:
+                errors.append(f"tool result {result_id or index} has no pending use")
+            elif result_id != pending[0]:
+                errors.append(
+                    f"tool result {result_id or index} does not match pending use {pending[0]}"
+                )
+            else:
+                pending.pop(0)
             continue
-        following = events[index + 1]
-        result_id = following.get("tool_use_id") or following.get("id")
-        if (
-            following.get("type") not in {"tool_result", "server_tool_result"}
-            or result_id != tool_id
-        ):
-            errors.append(
-                f"tool use {tool_id or index} is interrupted before its matching result"
+        if pending:
+            errors.extend(
+                f"tool use {tool_id} is interrupted before its matching result"
+                for tool_id in pending
             )
+            pending.clear()
+    errors.extend(f"tool use {tool_id} has no adjacent result" for tool_id in pending)
     return errors
+
+
+def tool_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Normalize explicit events or Hermes-native conversation history."""
+    raw_events = payload.get("events")
+    if isinstance(raw_events, list) and all(
+        isinstance(item, dict) for item in raw_events
+    ):
+        return raw_events
+    extra = payload.get("extra")
+    history = extra.get("conversation_history") if isinstance(extra, dict) else None
+    if not isinstance(history, list) or not all(
+        isinstance(item, dict) for item in history
+    ):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for message in history:
+        emitted = False
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if isinstance(call, dict):
+                    normalized.append({"type": "tool_use", "id": call.get("id")})
+                    emitted = True
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type in {"tool_use", "server_tool_use"}:
+                    normalized.append({"type": block_type, "id": block.get("id")})
+                    emitted = True
+                elif block_type in {"tool_result", "server_tool_result"}:
+                    normalized.append({
+                        "type": block_type,
+                        "tool_use_id": block.get("tool_use_id") or block.get("id"),
+                    })
+                    emitted = True
+        if message.get("role") == "tool":
+            normalized.append({
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id"),
+            })
+            emitted = True
+        if not emitted:
+            normalized.append({"type": str(message.get("role") or "message")})
+    return normalized
 
 
 def _required(mapping: dict[str, Any], fields: set[str], authority: str) -> list[str]:
@@ -229,6 +285,12 @@ def build_preflight(
         errors.append(f"Beads task is stale or terminal: {task.get('status')!r}")
     if task_status == "blocked":
         errors.append("Beads task lifecycle is blocked")
+    if (
+        card.get("state") == "ENFORCED"
+        and task_status != "closed"
+        and not allow_recovery_journal
+    ):
+        errors.append("ENFORCED lifecycle requires a closed Beads task")
     terminal_states = {"TESTED", "ENFORCED"}
     card_state = card.get("state")
     spec_state = spec.get("state")
@@ -247,6 +309,7 @@ def build_preflight(
         elif state:
             try:
                 receipt = load_json(Path(receipt_path))
+                errors.extend(receipt_signature_errors(config, receipt))
                 errors.extend(receipt_errors(receipt, state))
                 try:
                     current_inputs = external_input_digests(config, repo_root)
@@ -279,7 +342,7 @@ def build_preflight(
             journal = load_json(journal_path)
             blocked_journals = {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
             if journal.get("status") in blocked_journals and not (
-                allow_recovery_journal and journal.get("status") == "RECOVERY_REQUIRED"
+                allow_recovery_journal and journal.get("status") in blocked_journals
             ):
                 errors.append(
                     f"promotion journal requires recovery: {journal.get('status')}"
@@ -311,6 +374,10 @@ def build_preflight(
         errors.extend(validate_tool_adjacency(tool_events))
 
     if state is not None:
+        if state.integration_ref and state.merge_base != state.integration_sha:
+            errors.append(
+                "current branch is not based on the configured integration SHA"
+            )
         try:
             final_state = git_state(
                 cwd.resolve(), integration_ref=config.get("integration_ref")

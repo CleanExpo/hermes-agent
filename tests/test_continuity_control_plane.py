@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,10 +17,22 @@ sys.path.insert(0, str(SCRIPTS))
 
 import continuity_bridge
 import continuity_gate
+import install_continuity_adapters as continuity_adapters
 from continuity_bridge import build_preflight, validate_tool_adjacency
-from continuity_common import ContinuityError, atomic_write_json, git_state, sha256_file
+from continuity_common import (
+    ContinuityError,
+    atomic_write_json,
+    git_state,
+    read_markdown_frontmatter,
+    sha256_file,
+)
 from continuity_event import dispatch
-from continuity_gate import create_receipt, promote, verify_receipt
+from continuity_gate import (
+    create_receipt,
+    manifest_membership_errors,
+    promote,
+    verify_receipt,
+)
 from install_continuity_adapters import (
     install_hermes_adapter,
     render_project_adapters,
@@ -28,6 +43,16 @@ from install_continuity_adapters import (
 GOAL = "Pilot deterministic cross-agent continuity in Hermes"
 TASK_ID = "hermes-continuity-b6l"
 CHANGE_ID = "001-global-continuity-pilot"
+
+
+def _lock_worker(config_path: str, marker_path: str, label: str) -> None:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    with continuity_gate._promotion_lock(config, timeout=5):
+        with Path(marker_path).open("a", encoding="utf-8") as handle:
+            handle.write(f"{label}-start\n")
+        time.sleep(0.2)
+        with Path(marker_path).open("a", encoding="utf-8") as handle:
+            handle.write(f"{label}-end\n")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -150,6 +175,10 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
         "import sys\nprint('=== Summary: 1 files, 0 tests passed, 1 failed ===')\nsys.exit(1)\n",
         encoding="utf-8",
     )
+    (scripts_dir / "full_suite.py").write_text(
+        "print('=== Summary: 1 files, 1 tests passed, 0 failed (100% complete) ===')\n",
+        encoding="utf-8",
+    )
     (scripts_dir / "runtime_check.py").write_text(
         "print('runtime ok')\n", encoding="utf-8"
     )
@@ -194,6 +223,10 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
             "path": "specs/001-global-continuity-pilot/spec.md",
         },
         "instructions": ["AGENTS.md", ".specify/memory/constitution.md"],
+        "evidence_policy": {
+            "full_suite_argv": [sys.executable, "scripts/full_suite.py"],
+            "runtime_surfaces": ["sandbox"],
+        },
         "external_instructions": [],
         "event_log": str(event_log),
         "receipt_dir": str(state / "receipts"),
@@ -228,8 +261,12 @@ def _passing_receipt(pilot: dict[str, Path], target: str = "TESTED") -> dict:
         commands=[
             {
                 "name": "focused",
-                "argv": [sys.executable, "scripts/evidence_pass.py"],
-                "scope": "full" if target == "ENFORCED" else "focused",
+                "argv": [
+                    sys.executable,
+                    "scripts/full_suite.py"
+                    if target == "ENFORCED"
+                    else "scripts/evidence_pass.py",
+                ],
             }
         ],
         runtime_checks=[
@@ -257,6 +294,23 @@ def test_healthy_preflight_recovers_exact_scope(pilot: dict[str, Path]) -> None:
     assert first["active_task"] == TASK_ID
     assert first["spec_change"] == CHANGE_ID
     assert len(json.dumps(first, separators=(",", ":"))) <= 8000
+
+
+def test_preflight_detects_repository_mutation_mid_read(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = continuity_bridge.git_state
+    calls = 0
+
+    def changing_state(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        state = original(*args, **kwargs)
+        return replace(state, fingerprint="f" * 64) if calls == 2 else state
+
+    monkeypatch.setattr(continuity_bridge, "git_state", changing_state)
+    result = _preflight(pilot)
+    assert any("changed while preflight" in error for error in result["errors"])
 
 
 def test_wrong_folder_and_missing_drive_block(
@@ -349,7 +403,6 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
             {
                 "name": "focused",
                 "argv": [sys.executable, "scripts/evidence_fail.py"],
-                "scope": "focused",
             }
         ],
         runtime_checks=[
@@ -384,6 +437,54 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
         "stale" in error
         for error in verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"])
     )
+
+
+def test_signed_receipt_rejects_forged_evidence(pilot: dict[str, Path]) -> None:
+    receipt_path = pilot["state"] / "signed.json"
+    receipt = _passing_receipt(pilot)
+    atomic_write_json(receipt_path, receipt)
+    assert verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"]) == []
+    receipt["commands"][0]["test_count"] = 999
+    atomic_write_json(receipt_path, receipt)
+    assert any(
+        "signature is invalid" in error
+        for error in verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"])
+    )
+
+
+def test_full_suite_identity_and_integration_ancestry_are_gate_owned(
+    pilot: dict[str, Path],
+) -> None:
+    with pytest.raises(ContinuityError, match="unknown keys"):
+        create_receipt(
+            pilot["config"],
+            cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="ENFORCED",
+            commands=[
+                {
+                    "name": "forged-full",
+                    "argv": [sys.executable, "scripts/evidence_pass.py"],
+                    "scope": "full",
+                }
+            ],
+            runtime_checks=[],
+            rollback={},
+            require_mounted_volume=False,
+        )
+
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["integration_ref"] = "integration"
+    atomic_write_json(pilot["config"], config)
+    _git(pilot["repo"], "branch", "integration")
+    _git(pilot["repo"], "checkout", "integration")
+    (pilot["repo"] / "base.txt").write_text("advanced\n", encoding="utf-8")
+    _git(pilot["repo"], "add", "base.txt")
+    _git(pilot["repo"], "commit", "-m", "advance integration")
+    _git(pilot["repo"], "checkout", "pilot")
+    result = _passing_receipt(pilot)
+    assert result["result"] == "FAIL"
+    assert any("not based" in error for error in _preflight(pilot)["errors"])
 
 
 def test_only_gate_promotes_terminal_state(
@@ -447,7 +548,7 @@ def test_gate_executes_evidence_and_rejects_legacy_attestations(
         commands=[
             {
                 "name": "minimal-env",
-                "argv": [sys.executable, "scripts/env_check.py"],
+                "argv": [sys.executable, "scripts/env_check.py", "sk-live-example"],
             }
         ],
         runtime_checks=[],
@@ -456,13 +557,17 @@ def test_gate_executes_evidence_and_rejects_legacy_attestations(
     )
     assert clean_env["result"] == "PASS"
     assert "stdout" not in clean_env["commands"][0]
+    assert "argv" not in clean_env["commands"][0]
+    assert "sk-live-example" not in json.dumps(clean_env)
 
 
 def test_pinned_inputs_invalidate_preflight_and_receipt(pilot: dict[str, Path]) -> None:
     instruction = pilot["state"] / "external-skill.md"
     instruction.write_text("v1\n", encoding="utf-8")
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
-    config["external_instructions"] = [str(instruction)]
+    config["external_instructions"] = [
+        {"path": str(instruction), "sha256": sha256_file(instruction)}
+    ]
     atomic_write_json(pilot["config"], config)
     receipt_path = pilot["state"] / "receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
@@ -499,18 +604,58 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
         assert json.loads(result.stdout).get("additional_context")
 
     interrupted = {
-        "events": [
-            {"type": "tool_use", "id": "call-1"},
-            {"type": "user", "content": "interrupt"},
-            {"type": "tool_result", "tool_use_id": "call-1"},
-        ]
+        "hook_event_name": "pre_tool_call",
+        "extra": {
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call-1"}],
+                },
+                {"role": "user", "content": "interrupt"},
+                {"role": "tool", "tool_call_id": "call-1", "content": "late"},
+            ]
+        },
     }
-    hermes = dispatch("pre_tool_call", "hermes", pilot["config"], interrupted)
-    assert hermes["action"] == "block"
+    hermes_process = subprocess.run(
+        [
+            sys.executable,
+            str(entry),
+            "pre_tool_call",
+            "--surface",
+            "hermes",
+            "--config",
+            str(pilot["config"]),
+        ],
+        cwd=pilot["repo"],
+        input=json.dumps(interrupted),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert hermes_process.returncode == 2
+    assert json.loads(hermes_process.stdout)["action"] == "block"
 
     pilot["card"].unlink()
-    claude = dispatch("stop", "claude", pilot["config"], {})
-    assert claude["decision"] == "block"
+    for surface in ("claude", "codex"):
+        stopped = subprocess.run(
+            [
+                sys.executable,
+                str(entry),
+                "stop",
+                "--surface",
+                surface,
+                "--config",
+                str(pilot["config"]),
+            ],
+            cwd=pilot["repo"],
+            input="{}",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert stopped.returncode == 0
+        assert json.loads(stopped.stdout)["decision"] == "block"
     audit = pilot["events"].read_text(encoding="utf-8")
     assert '"preflight_status":"BLOCKED"' in audit
 
@@ -542,6 +687,114 @@ def test_hermes_adapter_has_owned_reversible_before_image(
     rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
     restored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert restored == original
+
+
+def test_interrupted_hermes_install_remains_rollback_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    hermes_home = tmp_path / "interrupted-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    original = {"model": "fixture", "hooks": {"unrelated": [{"command": "keep"}]}}
+    config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+    real_write = continuity_adapters.atomic_write_text
+
+    def interrupt_final_manifest(path: Path, content: str) -> None:
+        if (
+            path.name == continuity_adapters.HERMES_MANIFEST
+            and '"INSTALLED"' in content
+        ):
+            raise OSError("simulated manifest finalization interruption")
+        real_write(path, content)
+
+    monkeypatch.setattr(
+        continuity_adapters, "atomic_write_text", interrupt_final_manifest
+    )
+    with pytest.raises(OSError, match="finalization interruption"):
+        install_hermes_adapter(REPO_ROOT, hermes_home)
+    monkeypatch.setattr(continuity_adapters, "atomic_write_text", real_write)
+    assert rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=False)[
+        "rollback_valid"
+    ]
+    rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
+
+
+def test_promotion_recovers_prepared_and_card_written_stages(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = pilot["state"] / "enforced-stages.json"
+    atomic_write_json(receipt_path, _passing_receipt(pilot, target="ENFORCED"))
+    real_card_write = continuity_gate.atomic_write_text
+
+    def interrupt_card(path: Path, content: str) -> None:
+        if path == pilot["card"]:
+            raise OSError("simulated card interruption")
+        real_card_write(path, content)
+
+    monkeypatch.setattr(continuity_gate, "atomic_write_text", interrupt_card)
+    with pytest.raises(OSError, match="card interruption"):
+        promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
+    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    assert journal["status"] == "PREPARED"
+
+    monkeypatch.setattr(continuity_gate, "atomic_write_text", real_card_write)
+    real_journal_write = continuity_gate.atomic_write_json
+
+    def interrupt_card_written(path: Path, value: dict) -> None:
+        real_journal_write(path, value)
+        if path.name == "promotion.json" and value.get("status") == "CARD_WRITTEN":
+            raise KeyboardInterrupt("simulated process death")
+
+    monkeypatch.setattr(continuity_gate, "atomic_write_json", interrupt_card_written)
+    with pytest.raises(KeyboardInterrupt, match="process death"):
+        promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
+    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    assert journal["status"] == "CARD_WRITTEN"
+
+    monkeypatch.setattr(continuity_gate, "atomic_write_json", real_journal_write)
+    promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
+    assert _preflight(pilot)["status"] == "AVAILABLE"
+
+
+def test_enforced_promotion_verifies_beads_close_effect(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = pilot["state"] / "enforced-noop.json"
+    atomic_write_json(receipt_path, _passing_receipt(pilot, target="ENFORCED"))
+    monkeypatch.setattr(continuity_gate, "_run_beads", lambda *_args, **_kwargs: None)
+    with pytest.raises(ContinuityError, match="did not reach closed"):
+        promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
+    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    assert journal["status"] == "RECOVERY_REQUIRED"
+
+
+def test_promotion_lock_serializes_processes(pilot: dict[str, Path]) -> None:
+    marker = pilot["state"] / "lock-order.txt"
+    context = multiprocessing.get_context("fork")
+    first = context.Process(
+        target=_lock_worker,
+        args=(str(pilot["config"]), str(marker), "first"),
+    )
+    second = context.Process(
+        target=_lock_worker,
+        args=(str(pilot["config"]), str(marker), "second"),
+    )
+    first.start()
+    time.sleep(0.05)
+    second.start()
+    first.join(5)
+    second.join(5)
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "first-start",
+        "first-end",
+        "second-start",
+        "second-end",
+    ]
 
 
 def test_enforced_promotion_closes_task_and_recovers_interruption(
@@ -583,3 +836,20 @@ def test_dispatcher_logs_metadata_not_payload(pilot: dict[str, Path]) -> None:
 def test_committed_adapters_match_single_contract() -> None:
     for path, rendered in render_project_adapters(REPO_ROOT).items():
         assert path.read_text(encoding="utf-8") == rendered
+
+
+def test_supply_chain_manifest_membership_is_closed() -> None:
+    installed = ["claude", "codex", "hermes"]
+    assert not manifest_membership_errors(
+        installed, ["claude", "codex", "hermes", "speckit"]
+    )
+    assert any(
+        "membership mismatch" in error
+        for error in manifest_membership_errors(installed, ["claude"])
+    )
+    assert any(
+        "duplicated" in error
+        for error in manifest_membership_errors(
+            installed, ["claude", "codex", "hermes", "speckit", "claude"]
+        )
+    )

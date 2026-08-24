@@ -31,14 +31,16 @@ from continuity_common import (
     minimal_child_env,
     read_markdown_frontmatter,
     receipt_errors,
+    receipt_signature_errors,
     render_markdown_frontmatter,
     run_command,
     sha256_file,
+    sign_receipt,
     verify_pinned_executable,
 )
 
 
-COMMAND_SPEC_KEYS = {"name", "argv", "scope", "timeout_seconds"}
+COMMAND_SPEC_KEYS = {"name", "argv", "timeout_seconds"}
 RUNTIME_SPEC_KEYS = {"name", "argv", "surface", "timeout_seconds"}
 ROLLBACK_SPEC_KEYS = {"name", "argv", "mode", "timeout_seconds"}
 TEST_PATTERNS = (
@@ -46,7 +48,7 @@ TEST_PATTERNS = (
     re.compile(r"(?<![\w])(?P<passed>\d+) passed(?:,\s+(?P<skipped>\d+) skipped)?"),
 )
 SENSITIVE_ARG = re.compile(
-    r"(?i)(authorization|api[_-]?key|access[_-]?token|password|passwd|secret)"
+    r"(?i)(authorization|api[_-]?key|cookie|credential|password|passwd|secret|token)"
 )
 
 
@@ -194,7 +196,13 @@ def _test_summary(output: str) -> tuple[int, int, int]:
 
 
 def _execute_evidence(
-    spec: dict[str, Any], repo_root: Path, *, kind: str, state_root: Path
+    spec: dict[str, Any],
+    repo_root: Path,
+    *,
+    kind: str,
+    state_root: Path,
+    config: dict[str, Any],
+    index: int,
 ) -> dict[str, Any]:
     allowed = {
         "command": COMMAND_SPEC_KEYS,
@@ -203,6 +211,18 @@ def _execute_evidence(
     }[kind]
     _validate_closed_spec(spec, allowed, f"{kind} evidence")
     argv = _resolved_argv(spec, repo_root)
+    policy = config.get("evidence_policy")
+    if not isinstance(policy, dict):
+        raise ContinuityError("continuity config has no evidence_policy")
+    if kind == "runtime":
+        allowed_surfaces = policy.get("runtime_surfaces")
+        if (
+            not isinstance(allowed_surfaces, list)
+            or spec.get("surface") not in allowed_surfaces
+        ):
+            raise ContinuityError("runtime evidence surface is not allowlisted")
+    if kind == "rollback" and spec.get("mode") != "dry-run":
+        raise ContinuityError("receipt rollback evidence must use dry-run mode")
     timeout = float(spec.get("timeout_seconds", 900))
     if timeout <= 0 or timeout > 7200:
         raise ContinuityError(f"{kind} evidence timeout is outside 1..7200 seconds")
@@ -222,9 +242,11 @@ def _execute_evidence(
     output = (result.stdout or "") + (result.stderr or "")
     test_count, failed_count, skipped = _test_summary(output)
     record: dict[str, Any] = {
-        "name": spec["name"],
+        "name": f"{kind}-{index + 1}",
         "kind": kind,
-        "argv": argv,
+        "command_sha256": hashlib.sha256(
+            json.dumps(argv, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         "cwd": str(repo_root),
         "started_at": started.isoformat(),
         "completed_at": completed.isoformat(),
@@ -233,8 +255,11 @@ def _execute_evidence(
         "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
     }
     if kind == "command":
+        full_spec = {"name": "full-suite", "argv": policy.get("full_suite_argv")}
+        _validate_closed_spec(full_spec, {"name", "argv"}, "configured full suite")
+        full_argv = _resolved_argv(full_spec, repo_root)
         record.update({
-            "scope": spec.get("scope", "focused"),
+            "scope": "full" if argv == full_argv else "focused",
             "test_count": test_count,
             "failed_count": failed_count,
             "skipped": skipped,
@@ -289,21 +314,33 @@ def create_receipt(
         "external_inputs": external_input_digests(config, repo_root),
         "commands": [
             _execute_evidence(
-                spec, repo_root, kind="command", state_root=Path(config["state_root"])
+                spec,
+                repo_root,
+                kind="command",
+                state_root=Path(config["state_root"]),
+                config=config,
+                index=index,
             )
-            for spec in commands
+            for index, spec in enumerate(commands)
         ],
         "runtime_checks": [
             _execute_evidence(
-                spec, repo_root, kind="runtime", state_root=Path(config["state_root"])
+                spec,
+                repo_root,
+                kind="runtime",
+                state_root=Path(config["state_root"]),
+                config=config,
+                index=index,
             )
-            for spec in runtime_checks
+            for index, spec in enumerate(runtime_checks)
         ],
         "rollback": _execute_evidence(
             rollback,
             repo_root,
             kind="rollback",
             state_root=Path(config["state_root"]),
+            config=config,
+            index=0,
         )
         if rollback
         else {},
@@ -311,7 +348,13 @@ def create_receipt(
     final_state = git_state(
         cwd.resolve(), integration_ref=config.get("integration_ref")
     )
+    receipt["auth"] = {
+        "algorithm": "hmac-sha256",
+        "key_id": "pending",
+        "digest": "0" * 64,
+    }
     receipt["result"] = "PASS" if not receipt_errors(receipt, final_state) else "FAIL"
+    receipt["auth"] = sign_receipt(config, receipt)
     return receipt
 
 
@@ -329,6 +372,7 @@ def verify_receipt(
     if current.root != str(Path(config["expected_repo_root"]).resolve()):
         errors.append("current repository root does not match continuity config")
     receipt = load_json(receipt_path)
+    errors.extend(receipt_signature_errors(config, receipt))
     if receipt.get("project") != config.get("project"):
         errors.append("receipt project does not match continuity config")
     if receipt.get("repo_id") != config.get("repo_id"):
@@ -372,6 +416,29 @@ def _run_beads(config: dict[str, Any], arguments: list[str], repo_root: Path) ->
         raise ContinuityError(f"Beads update failed: {detail}")
 
 
+def _beads_status(config: dict[str, Any], repo_root: Path) -> str | None:
+    beads = config["beads"]
+    verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
+    result = run_command(
+        [beads["binary"], "show", beads["active_task"], "--json"],
+        cwd=repo_root,
+        timeout=float(beads.get("completion_timeout_seconds", 60)),
+        env=minimal_child_env({
+            "BEADS_DIR": beads["data_dir"],
+            "HOME": config["state_root"],
+        }),
+    )
+    if result.returncode != 0:
+        raise ContinuityError("Beads verification query failed")
+    try:
+        task = _task_from_value(json.loads(result.stdout), beads["active_task"])
+    except json.JSONDecodeError as exc:
+        raise ContinuityError("Beads verification returned invalid JSON") from exc
+    if task is None:
+        raise ContinuityError("Beads verification did not return the active task")
+    return task.get("status")
+
+
 @contextmanager
 def _promotion_lock(config: dict[str, Any], timeout: float = 15):
     if fcntl is None:
@@ -413,7 +480,8 @@ def promote(
         if journal_path.is_file():
             existing_journal = load_json(journal_path)
             recovery = (
-                existing_journal.get("status") == "RECOVERY_REQUIRED"
+                existing_journal.get("status")
+                in {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
                 and existing_journal.get("target") == target
                 and existing_journal.get("receipt") == str(receipt_path.resolve())
             )
@@ -424,6 +492,10 @@ def promote(
             allow_recovery_journal=recovery,
         )
         receipt = load_json(receipt_path)
+        if recovery and existing_journal.get("commit") != receipt.get("git", {}).get(
+            "commit"
+        ):
+            errors.append("recovery journal commit does not match receipt")
         if receipt.get("lifecycle_target") != target:
             errors.append("requested target does not match receipt lifecycle target")
         if errors:
@@ -474,16 +546,20 @@ def promote(
         atomic_write_json(journal_path, journal)
         if target == "ENFORCED":
             try:
-                _run_beads(
-                    config,
-                    [
-                        "close",
-                        config["beads"]["active_task"],
-                        "--reason",
-                        f"ENFORCED by exact-state receipt {receipt_path.name}",
-                    ],
-                    Path(config["expected_repo_root"]),
-                )
+                repo_root = Path(config["expected_repo_root"])
+                if _beads_status(config, repo_root) != "closed":
+                    _run_beads(
+                        config,
+                        [
+                            "close",
+                            config["beads"]["active_task"],
+                            "--reason",
+                            f"ENFORCED by exact-state receipt {receipt_path.name}",
+                        ],
+                        repo_root,
+                    )
+                if _beads_status(config, repo_root) != "closed":
+                    raise ContinuityError("Beads task did not reach closed state")
             except BaseException as exc:
                 journal["status"] = "RECOVERY_REQUIRED"
                 journal["error_type"] = type(exc).__name__
@@ -493,6 +569,24 @@ def promote(
         journal["status"] = "COMMITTED"
         journal["updated_at"] = datetime.now(timezone.utc).isoformat()
         atomic_write_json(journal_path, journal)
+
+
+def manifest_membership_errors(
+    installed: list[str], identities: list[str]
+) -> list[str]:
+    required = set(installed) | {"speckit"}
+    actual = set(identities)
+    errors: list[str] = []
+    if actual != required:
+        errors.append(
+            "integration manifest membership mismatch: expected "
+            + ", ".join(sorted(required))
+            + "; got "
+            + ", ".join(sorted(actual))
+        )
+    if len(identities) != len(actual):
+        errors.append("integration manifest identities are duplicated")
+    return errors
 
 
 def static_validate(config_path: Path) -> list[str]:
@@ -517,6 +611,20 @@ def static_validate(config_path: Path) -> list[str]:
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
             errors.append(f"instruction missing: {relative}")
+    policy = config.get("evidence_policy")
+    if not isinstance(policy, dict) or set(policy) != {
+        "full_suite_argv",
+        "runtime_surfaces",
+    }:
+        errors.append("evidence_policy has an invalid closed schema")
+    for item in config.get("external_instructions", []):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256"}
+            or not isinstance(item.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+        ):
+            errors.append("external instruction pin is malformed")
     try:
         spec, _ = read_markdown_frontmatter(repo_root / config["spec"]["path"])
         if spec.get("change_id") != config["spec"].get("change_id"):
@@ -562,9 +670,11 @@ def static_validate(config_path: Path) -> list[str]:
     manifests = sorted((repo_root / ".specify/integrations").glob("*.manifest.json"))
     if not manifests:
         errors.append("no integration supply-chain manifests are committed")
+    identities: list[str] = []
     for manifest_path in manifests:
         try:
             manifest = load_json(manifest_path)
+            identities.append(str(manifest.get("integration") or ""))
             files = manifest.get("files")
             if not manifest.get("integration") or not manifest.get("version"):
                 errors.append(
@@ -585,6 +695,17 @@ def static_validate(config_path: Path) -> list[str]:
                     errors.append(f"integration manifest digest mismatch: {relative}")
         except ContinuityError as exc:
             errors.append(str(exc))
+    try:
+        integration_state = load_json(repo_root / ".specify/integration.json")
+        installed = integration_state.get("installed_integrations")
+        if not isinstance(installed, list) or not all(
+            isinstance(item, str) and item for item in installed
+        ):
+            errors.append("Spec Kit installed integration list is invalid")
+        else:
+            errors.extend(manifest_membership_errors(installed, identities))
+    except ContinuityError as exc:
+        errors.append(str(exc))
     return errors
 
 

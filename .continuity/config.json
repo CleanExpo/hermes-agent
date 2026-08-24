@@ -31,8 +31,22 @@
     ".agents/skills/speckit-implement/SKILL.md",
     ".claude/skills/speckit-implement/SKILL.md"
   ],
+  "evidence_policy": {
+    "full_suite_argv": [
+      "scripts/run_tests.sh"
+    ],
+    "runtime_surfaces": [
+      "claude",
+      "codex",
+      "hermes",
+      "sandbox"
+    ]
+  },
   "external_instructions": [
-    "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/skills/speckit-implement/SKILL.md"
+    {
+      "path": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/skills/speckit-implement/SKILL.md",
+      "sha256": "511f28d0a64c8a39ca9d50d4506b9db2d092ad847ac430213587cd41f3bb4aa8"
+    }
   ],
   "event_log": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/events/events.jsonl",
   "receipt_dir": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/receipts"

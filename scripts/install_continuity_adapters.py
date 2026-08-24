@@ -115,6 +115,23 @@ def _managed_hermes_hooks(repo_root: Path) -> dict[str, Any]:
     return dict(rendered.get("hooks") or {})
 
 
+def _before_hook_projection(manifest: dict[str, Any]) -> dict[str, Any]:
+    installed = manifest.get("installed_hooks")
+    before = manifest.get("before_hooks")
+    absent = manifest.get("absent_before")
+    if (
+        not isinstance(installed, dict)
+        or not isinstance(before, dict)
+        or not isinstance(absent, list)
+    ):
+        raise ContinuityError("Hermes adapter manifest has an invalid before-image")
+    return {
+        event: before[event] if event in before else None
+        for event in installed
+        if event in before or event in absent
+    }
+
+
 def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
     target = hermes_home.resolve() / "config.yaml"
     manifest_path = hermes_home.resolve() / HERMES_MANIFEST
@@ -124,20 +141,41 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
 
     if manifest_path.is_file():
         prior = load_json(manifest_path)
-        if prior.get("status") == "INSTALLED":
-            if prior.get("repo_root") != str(repo_root):
+        if prior.get("status") in {"PREPARED", "INSTALLED"}:
+            if prior.get("repo_root") != str(repo_root) or prior.get("target") != str(
+                target
+            ):
                 raise ContinuityError("Hermes adapter is owned by another repository")
+            installed_hooks = prior.get("installed_hooks")
+            if not isinstance(installed_hooks, dict):
+                raise ContinuityError("Hermes adapter manifest is malformed")
             current = {name: hooks.get(name) for name in installed_hooks}
             if current != prior.get("installed_hooks"):
-                raise ContinuityError("managed Hermes hooks changed after installation")
-            return {"hermes_config": str(target), "installed": True, "changed": False}
+                if prior.get(
+                    "status"
+                ) != "PREPARED" or current != _before_hook_projection(prior):
+                    raise ContinuityError(
+                        "managed Hermes hooks changed after installation"
+                    )
+            else:
+                if prior.get("status") == "PREPARED":
+                    prior["status"] = "INSTALLED"
+                    atomic_write_text(
+                        manifest_path,
+                        json.dumps(prior, indent=2, sort_keys=True) + "\n",
+                    )
+                return {
+                    "hermes_config": str(target),
+                    "installed": True,
+                    "changed": prior.get("status") == "PREPARED",
+                }
 
     before_hooks = {name: hooks[name] for name in installed_hooks if name in hooks}
     absent_before = sorted(name for name in installed_hooks if name not in hooks)
     after_text = render_hermes_config(repo_root, existing)
     manifest = {
         "schema_version": 1,
-        "status": "INSTALLED",
+        "status": "PREPARED",
         "repo_root": str(repo_root),
         "target": str(target),
         "before_sha256": _sha256_text(before_text),
@@ -146,7 +184,11 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
         "absent_before": absent_before,
         "installed_hooks": installed_hooks,
     }
+    atomic_write_text(
+        manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
     atomic_write_text(target, after_text)
+    manifest["status"] = "INSTALLED"
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -160,7 +202,7 @@ def rollback_hermes_adapter(
     manifest = load_json(manifest_path)
     if manifest.get("repo_root") != str(repo_root):
         raise ContinuityError("rollback manifest belongs to another repository")
-    if manifest.get("status") != "INSTALLED":
+    if manifest.get("status") not in {"PREPARED", "INSTALLED"}:
         raise ContinuityError("Hermes adapter is not in INSTALLED state")
     target = Path(str(manifest.get("target"))).resolve()
     if target != hermes_home.resolve() / "config.yaml":
@@ -171,25 +213,28 @@ def rollback_hermes_adapter(
     if not isinstance(installed, dict):
         raise ContinuityError("rollback manifest has invalid installed hooks")
     current = {name: hooks.get(name) for name in installed}
-    if current != installed:
+    before_projection = _before_hook_projection(manifest)
+    already_before = current == before_projection
+    if current != installed and not (
+        manifest.get("status") == "PREPARED" and already_before
+    ):
         raise ContinuityError("managed Hermes hooks changed after installation")
     if not apply:
         return {"rollback_valid": True, "applied": False, "target": str(target)}
 
-    before_hooks = manifest.get("before_hooks")
-    absent_before = manifest.get("absent_before")
-    if not isinstance(before_hooks, dict) or not isinstance(absent_before, list):
-        raise ContinuityError("rollback manifest has invalid before-image")
-    for event in installed:
-        if event in before_hooks:
-            hooks[event] = before_hooks[event]
-        elif event in absent_before:
-            hooks.pop(event, None)
-        else:
-            raise ContinuityError(f"rollback manifest has no before-image for {event}")
-    config["hooks"] = hooks
-    restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
-    atomic_write_text(target, restored)
+    if not already_before:
+        before_hooks = manifest["before_hooks"]
+        absent_before = manifest["absent_before"]
+        for event in installed:
+            if event in before_hooks:
+                hooks[event] = before_hooks[event]
+            elif event in absent_before:
+                hooks.pop(event, None)
+        config["hooks"] = hooks
+        restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+        atomic_write_text(target, restored)
+    else:
+        restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     manifest["status"] = "ROLLED_BACK"
     manifest["restored_sha256"] = _sha256_text(restored)
     atomic_write_text(

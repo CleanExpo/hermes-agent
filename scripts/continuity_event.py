@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from continuity_bridge import build_preflight
+from continuity_bridge import build_preflight, tool_events_from_payload
 from continuity_common import ContinuityError, compact_json, load_json
 
 
@@ -72,13 +72,7 @@ def dispatch(
     result: dict[str, Any] = {"event": event_name, "surface": surface, "handled": True}
     preflight: dict[str, Any] | None = None
     if event_name in PREFLIGHT_EVENTS:
-        raw_events = payload.get("events")
-        tool_events = (
-            raw_events
-            if isinstance(raw_events, list)
-            and all(isinstance(item, dict) for item in raw_events)
-            else None
-        )
+        tool_events = tool_events_from_payload(payload)
         preflight = build_preflight(
             config_path, cwd=Path.cwd(), tool_events=tool_events
         )
@@ -150,8 +144,9 @@ def main(argv: list[str] | None = None) -> int:
         result = dispatch(args.event, args.surface, args.config, payload)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         blocked = result.get("decision") == "block" or result.get("action") == "block"
-        return 2 if blocked else 0
+        return 2 if blocked and args.surface == "hermes" else 0
     except (ContinuityError, KeyError, OSError, TypeError, ValueError) as exc:
+        print(f"Continuity hook failure: {exc}", file=sys.stderr)
         print(
             json.dumps(
                 {

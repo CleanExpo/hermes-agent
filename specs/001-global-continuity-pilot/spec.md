@@ -61,8 +61,9 @@ hook dependency.
 - **FR-005**: Tool-call envelopes MUST reject interrupted adjacency where a tool use is
   not immediately followed by its matching result.
 - **FR-006**: Only the gate MAY promote the lifecycle to `TESTED` or `ENFORCED`; it
-  MUST execute required commands itself, serialize promotion, and preserve a durable
-  recoverable journal across interrupted multi-authority transitions.
+  MUST execute required commands itself, authenticate the receipt, derive full-suite
+  identity from committed policy, serialize promotion, and preserve a durable
+  recoverable journal across every interrupted multi-authority transition stage.
 - **FR-007**: Host adapters MUST call one dispatcher and MUST NOT persist raw prompt,
   transcript, reasoning, tool input, tool output, secret, or customer-data content.
 - **FR-008**: All storage-dependent state MUST remain on the mounted external volume;
@@ -72,7 +73,8 @@ hook dependency.
 - **FR-010**: Rollback MUST remove only pilot adapters/state and leave the dirty shared
   checkout and pre-existing global hooks unchanged.
 - **FR-011**: Authority-bearing children MUST run without inherited credential
-  variables, and external executables/instructions MUST match pinned SHA-256 digests.
+  variables; receipts MUST NOT persist raw argv/output; and external executables and
+  instructions MUST match committed SHA-256 pins.
 - **FR-012**: Claude/Codex finalization and Hermes tool execution MUST use each host's
   native blocking contract. Hermes ordinary prose remains outside shell-hook blocking;
   the gate MUST still prevent lifecycle promotion from advisory context alone.
