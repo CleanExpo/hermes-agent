@@ -177,25 +177,24 @@ def _run_host_until_native_event(
         lifecycle: dict[str, object] = {
             "contained": None,
             "pending_signal": None,
-            "terminating": False,
         }
 
-        def terminate_nested_host(signum: int, _frame: object) -> None:
-            if lifecycle["terminating"]:
-                return
-            contained = lifecycle["contained"]
-            if contained is None:
+        def request_nested_host_termination(signum: int, _frame: object) -> None:
+            if lifecycle["pending_signal"] is None:
                 lifecycle["pending_signal"] = signum
+
+        def terminate_for_pending_signal(contained: object) -> None:
+            pending_signal = lifecycle["pending_signal"]
+            if not isinstance(pending_signal, int):
                 return
-            lifecycle["terminating"] = True
             contained.terminate_tree()
-            raise SystemExit(128 + signum)
+            raise SystemExit(128 + pending_signal)
 
         prior_mask: set[signal.Signals] | None = None
         if os.name == "posix":
             prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
         for sig in handled_signals:
-            signal.signal(sig, terminate_nested_host)
+            signal.signal(sig, request_nested_host_termination)
         mask_is_blocked = prior_mask is not None
         try:
             contained = _spawn_contained_process(
@@ -214,12 +213,11 @@ def _run_host_until_native_event(
             if prior_mask is not None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
                 mask_is_blocked = False
-            pending_signal = lifecycle["pending_signal"]
-            if isinstance(pending_signal, int):
-                terminate_nested_host(pending_signal, None)
+            terminate_for_pending_signal(contained)
             deadline = time.monotonic() + timeout
             last_error: ContinuityError | None = None
             while time.monotonic() < deadline:
+                terminate_for_pending_signal(contained)
                 if required_mount is not None:
                     try:
                         validate_state_storage(*required_mount)
@@ -240,11 +238,15 @@ def _run_host_until_native_event(
                     last_error = exc
                 else:
                     contained.terminate_tree()
+                    terminate_for_pending_signal(contained)
                     return output
-                if process.poll() is not None:
+                process_returncode = process.poll()
+                terminate_for_pending_signal(contained)
+                if process_returncode is not None:
                     break
                 time.sleep(0.1)
             contained.terminate_tree()
+            terminate_for_pending_signal(contained)
             stdout_handle.flush()
             stderr_handle.flush()
         finally:

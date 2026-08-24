@@ -1148,6 +1148,10 @@ def terminate(signum):
 
 signal.signal(signal.SIGTERM, request_termination)
 signal.signal(signal.SIGINT, request_termination)
+# A caller may block termination signals to close its spawn-to-handler race.
+# The wrapper inherits that mask, so unblock only after its passive handlers
+# are installed; otherwise cooperative cleanup can never receive termination.
+signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT))
 # If the controlling Hermes process is killed, retain the wrapper long enough
 # to run its bounded adopted-descendant cleanup. Check for the standard race in
 # which the parent exits between recording its PID and arming PDEATHSIG.

@@ -119,7 +119,7 @@ def _native_observer_interrupt_worker(
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "time.sleep(0.2)\n"
         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
-        "time.sleep(1.2)\n"
+        "time.sleep(4.0)\n"
         "pathlib.Path(sys.argv[2]).write_text('survived')\n",
         encoding="utf-8",
     )
@@ -3157,7 +3157,7 @@ def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     assert not sentinel.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+@pytest.mark.linux_only
 def test_interrupted_native_observer_reaps_isolated_host_group(
     tmp_path: Path,
 ) -> None:
@@ -3177,7 +3177,7 @@ def test_interrupted_native_observer_reaps_isolated_host_group(
 
     os.kill(worker.pid, signal.SIGTERM)
     worker.join(5)
-    time.sleep(1.5)
+    time.sleep(4.2)
 
     nested_alive = psutil.pid_exists(nested_pid)
     if nested_alive:
@@ -3187,7 +3187,7 @@ def test_interrupted_native_observer_reaps_isolated_host_group(
     assert not sentinel.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX repeated-signal semantics")
+@pytest.mark.linux_only
 def test_native_observer_repeated_signal_cleanup_is_non_reentrant(
     tmp_path: Path,
 ) -> None:
@@ -3209,11 +3209,65 @@ def test_native_observer_repeated_signal_cleanup_is_non_reentrant(
     time.sleep(0.1)
     os.kill(worker.pid, signal.SIGINT)
     worker.join(5)
-    time.sleep(1.5)
+    time.sleep(4.2)
 
     assert worker.exitcode == 128 + signal.SIGTERM
     assert not psutil.pid_exists(nested_pid)
     assert not sentinel.exists()
+
+
+@pytest.mark.linux_only
+def test_native_observer_defers_signal_cleanup_until_poll_lock_is_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class LockSignalingProcess:
+        def __init__(self) -> None:
+            self.waitpid_lock = threading.Lock()
+            self.signaled = False
+
+        def poll(self) -> None:
+            with self.waitpid_lock:
+                if not self.signaled:
+                    self.signaled = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return None
+
+    class LockAwareContainment:
+        def __init__(self) -> None:
+            self.process = LockSignalingProcess()
+            self.termination_calls = 0
+
+        def terminate_tree(self) -> None:
+            assert not self.process.waitpid_lock.locked()
+            self.termination_calls += 1
+
+    contained = LockAwareContainment()
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "_spawn_contained_process",
+        lambda *_args, **_kwargs: contained,
+    )
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "_require_native_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ContinuityError("event is pending")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as interrupted:
+        continuity_native_observation._run_host_until_native_event(
+            ["native-host"],
+            cwd=tmp_path,
+            env={},
+            checkpoint=(tmp_path / "events.jsonl", 0, None, {}),
+            surface="hermes",
+            output_dir=tmp_path,
+            timeout=5,
+        )
+
+    assert interrupted.value.code == 128 + signal.SIGTERM
+    assert contained.termination_calls == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fork test; Windows proof follows")
