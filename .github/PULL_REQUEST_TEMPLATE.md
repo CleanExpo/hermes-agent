@@ -46,7 +46,7 @@ Fixes #
 - [ ] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.)
 - [ ] I searched for [existing PRs](https://github.com/NousResearch/hermes-agent/pulls) to make sure this isn't a duplicate
 - [ ] My PR contains **only** changes related to this fix/feature (no unrelated commits)
-- [ ] I've run the applicable tests through `scripts/run_tests.sh` and all tests pass
+- [ ] I've run `pytest tests/ -q` and all tests pass
 - [ ] I've added tests for my changes (required for bug fixes, strongly encouraged for features)
 - [ ] I've tested on my platform: <!-- e.g. Ubuntu 24.04, macOS 15.2, Windows 11 -->
 
@@ -59,14 +59,6 @@ Fixes #
 - [ ] I've updated `CONTRIBUTING.md` or `AGENTS.md` if I changed architecture or workflows — or N/A
 - [ ] I've considered cross-platform impact (Windows, macOS) per the [compatibility guide](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md#cross-platform-compatibility) — or N/A
 - [ ] I've updated tool descriptions/schemas if I changed tool behavior — or N/A
-
-### Safe-change evidence
-
-- [ ] Risk tier: `T0` / `T1` / `T2` / `T3`
-- [ ] Exact-state receipt attached, or the PR is explicitly marked pre-evidence
-- [ ] Receipt commit and dirty state match the state under review
-- [ ] Failed, skipped, flaky, timed-out, and excluded lanes are disclosed
-- [ ] Runtime/data target and rollback proof are recorded where required
 
 ## For New Skills
 

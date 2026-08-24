@@ -25,7 +25,6 @@
   },
   "instructions": [
     "AGENTS.md",
-    "spec.md",
     ".specify/memory/constitution.md",
     ".agents/skills/speckit-implement/SKILL.md",
     ".claude/skills/speckit-implement/SKILL.md"

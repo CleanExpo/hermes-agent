@@ -52,7 +52,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
     _git(repo, "add", "seed.txt")
     _git(repo, "commit", "-m", "seed")
 
-    for relative in ("AGENTS.md", "spec.md", ".specify/memory/constitution.md"):
+    for relative in ("AGENTS.md", ".specify/memory/constitution.md"):
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("fixture\n", encoding="utf-8")
@@ -124,7 +124,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
             "change_id": CHANGE_ID,
             "path": "specs/001-global-continuity-pilot/spec.md",
         },
-        "instructions": ["AGENTS.md", "spec.md", ".specify/memory/constitution.md"],
+        "instructions": ["AGENTS.md", ".specify/memory/constitution.md"],
         "external_instructions": [],
         "event_log": str(event_log),
         "receipt_dir": str(state / "receipts"),

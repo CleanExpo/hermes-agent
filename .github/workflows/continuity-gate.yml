@@ -9,7 +9,6 @@ on:
       - '.codex/hooks.json'
       - 'scripts/continuity_*.py'
       - 'scripts/install_continuity_adapters.py'
-      - 'spec.md'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
   push:
@@ -20,7 +19,6 @@ on:
       - '.codex/hooks.json'
       - 'scripts/continuity_*.py'
       - 'scripts/install_continuity_adapters.py'
-      - 'spec.md'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
 
