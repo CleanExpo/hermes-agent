@@ -58,8 +58,9 @@ hook dependency.
   readable fallback, but MUST set `completion_allowed` to false.
 - **FR-004**: Missing drive, wrong folder, stale task, absent/corrupt card, incomplete
   spec, or authority conflict MUST forbid completion and identify the cause.
-- **FR-005**: Tool-call envelopes MUST reject interrupted adjacency where a tool use is
-  not immediately followed by its matching result.
+- **FR-005**: Tool-call envelopes MUST reject interrupted adjacency. A single tool use
+  or contiguous tool-use batch MUST be followed immediately by its matching result or
+  ordered result batch, with no unrelated event between the two batches.
 - **FR-006**: Only the gate MAY promote the lifecycle to `TESTED` or `ENFORCED`; it
   MUST execute required commands itself, authenticate the receipt, derive full-suite
   identity from committed policy, serialize promotion, and preserve a durable

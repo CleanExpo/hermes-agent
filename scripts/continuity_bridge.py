@@ -101,32 +101,47 @@ def _read_beads(
 
 def validate_tool_adjacency(events: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    for index, event in enumerate(events):
+    index = 0
+    while index < len(events):
+        event = events[index]
         event_type = event.get("type")
         if event_type in {"server_tool_use", "tool_use"}:
-            tool_id = str(event.get("id") or index)
-            if index + 1 >= len(events):
-                errors.append(f"tool use {tool_id} has no adjacent result")
-                continue
-            adjacent = events[index + 1]
-            result_type = adjacent.get("type")
-            result_id = str(adjacent.get("tool_use_id") or adjacent.get("id") or "")
-            if result_type not in {"tool_result", "server_tool_result"}:
-                errors.append(
-                    f"tool use {tool_id} is interrupted before its matching result"
+            uses: list[str] = []
+            while index < len(events) and events[index].get("type") in {
+                "server_tool_use",
+                "tool_use",
+            }:
+                uses.append(str(events[index].get("id") or index))
+                index += 1
+            results: list[str] = []
+            while index < len(events) and events[index].get("type") in {
+                "tool_result",
+                "server_tool_result",
+            }:
+                results.append(
+                    str(
+                        events[index].get("tool_use_id")
+                        or events[index].get("id")
+                        or index
+                    )
                 )
-            elif result_id != tool_id:
+                index += 1
+            if not results:
                 errors.append(
-                    f"tool result {result_id or index + 1} does not match tool use {tool_id}"
+                    f"tool use batch {', '.join(uses)} is interrupted before its results"
+                )
+            elif results != uses:
+                errors.append(
+                    "tool result batch does not match tool use batch: expected "
+                    + ", ".join(uses)
+                    + "; got "
+                    + ", ".join(results)
                 )
             continue
         if event_type in {"tool_result", "server_tool_result"}:
             result_id = str(event.get("tool_use_id") or event.get("id") or "")
-            if index == 0 or events[index - 1].get("type") not in {
-                "server_tool_use",
-                "tool_use",
-            }:
-                errors.append(f"tool result {result_id or index} has no pending use")
+            errors.append(f"tool result {result_id or index} has no pending use")
+        index += 1
     return errors
 
 

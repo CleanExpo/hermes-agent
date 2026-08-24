@@ -53,6 +53,9 @@ TEST_PATTERNS = (
 SENSITIVE_ARG = re.compile(
     r"(?i)(authorization|api[_-]?key|cookie|credential|password|passwd|secret|token)"
 )
+CANONICAL_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / ".continuity/config.json"
+)
 
 
 def _task_from_value(value: Any, task_id: str) -> dict[str, Any] | None:
@@ -67,13 +70,33 @@ def _task_from_value(value: Any, task_id: str) -> dict[str, Any] | None:
     )
 
 
-def _require_committed_config(config_path: Path, config: dict[str, Any]) -> Path:
-    repo_root = Path(config["expected_repo_root"]).resolve()
-    expected = repo_root / ".continuity/config.json"
+def _require_committed_config(
+    config_path: Path, config: dict[str, Any], *, cwd: Path
+) -> Path:
+    expected = CANONICAL_CONFIG_PATH.resolve()
     if config_path.resolve() != expected:
         raise ContinuityError(
             f"continuity authority requires committed config: {expected}"
         )
+    repo_root = Path(git_state(cwd.resolve()).root)
+    if expected.parent.parent != repo_root:
+        raise ContinuityError(
+            "continuity gate is not running from its canonical repository"
+        )
+    committed = run_command(
+        ["git", "show", "HEAD:.continuity/config.json"],
+        cwd=repo_root,
+        timeout=30,
+        env=minimal_child_env(),
+    )
+    try:
+        committed_config = (
+            json.loads(committed.stdout) if committed.returncode == 0 else None
+        )
+    except json.JSONDecodeError as exc:
+        raise ContinuityError("committed continuity config is invalid") from exc
+    if config != committed_config:
+        raise ContinuityError("continuity config does not match committed HEAD")
     return repo_root
 
 
@@ -368,7 +391,7 @@ def create_receipt(
     require_mounted_volume: bool = True,
 ) -> dict[str, Any]:
     config = load_json(config_path)
-    repo_root = _require_committed_config(config_path, config)
+    repo_root = _require_committed_config(config_path, config, cwd=cwd)
     configured_tier = config.get("risk_tier")
     if risk_tier != configured_tier:
         raise ContinuityError(
@@ -417,7 +440,9 @@ def create_receipt(
         require_mounted_volume=require_mounted_volume,
     )
     if not authority_check.get("passed"):
-        raise ContinuityError("strict authority check failed")
+        details = "; ".join(str(item) for item in authority_check.get("errors", []))
+        suffix = f": {details}" if details else ""
+        raise ContinuityError(f"strict authority check failed{suffix}")
     signing_key = receipt_signing_key(config)
     evidence_home = Path(config["state_root"]) / "evidence-home"
     evidence_home.mkdir(parents=True, exist_ok=True)
@@ -488,7 +513,7 @@ def verify_receipt(
     allow_recovery_journal: bool = False,
 ) -> list[str]:
     config = load_json(config_path)
-    repo_root = _require_committed_config(config_path, config)
+    repo_root = _require_committed_config(config_path, config, cwd=cwd)
     current = git_state(cwd.resolve(), integration_ref=config.get("integration_ref"))
     errors: list[str] = []
     if current.root != str(Path(config["expected_repo_root"]).resolve()):
@@ -534,8 +559,7 @@ def _run_beads(config: dict[str, Any], arguments: list[str], repo_root: Path) ->
         env=env,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ContinuityError(f"Beads update failed: {detail}")
+        raise ContinuityError(f"Beads update failed with status {result.returncode}")
 
 
 def _beads_status(config: dict[str, Any], repo_root: Path) -> str | None:
@@ -596,7 +620,18 @@ def promote(
     if target not in {"TESTED", "ENFORCED"}:
         raise ContinuityError("only TESTED or ENFORCED may be promoted by the gate")
     config = load_json(config_path)
-    _require_committed_config(config_path, config)
+    _require_committed_config(config_path, config, cwd=cwd)
+    if not external_volume_available(Path(config["external_volume"])):
+        raise ContinuityError("external volume is not mounted")
+    admission = strict_authority_check(
+        config_path,
+        cwd=cwd,
+        require_mounted_volume=True,
+        allow_closed_task=target == "ENFORCED",
+        allow_recovery_journal=True,
+    )
+    if not admission.get("passed"):
+        raise ContinuityError("promotion strict authority check failed")
     journal_path = Path(config["state_root"]) / "promotion.json"
     with _promotion_lock(config):
         recovery = False

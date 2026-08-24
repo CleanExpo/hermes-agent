@@ -100,7 +100,7 @@ def _lock_fake_bd(lock_path: Path, fake_bd: Path) -> None:
 
 
 @pytest.fixture()
-def pilot(tmp_path: Path) -> dict[str, Path]:
+def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
     repo.mkdir()
@@ -221,7 +221,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
             "data_dir": str(state / "beads"),
             "issues_path": str(issues),
             "active_task": TASK_ID,
-            "timeout_seconds": 1,
+            "timeout_seconds": 7,
             "completion_timeout_seconds": 7,
         },
         "spec": {
@@ -271,6 +271,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
     card_path.write_text(
         render_markdown_frontmatter(card_data, card_body), encoding="utf-8"
     )
+    monkeypatch.setattr(continuity_gate, "CANONICAL_CONFIG_PATH", config_path)
     return {
         "repo": repo,
         "state": state,
@@ -428,6 +429,23 @@ def test_beads_mutation_uses_completion_timeout(
     assert captured["timeout"] == 7
 
 
+def test_beads_mutation_failure_redacts_child_output(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "customer-token=TOP-SECRET"
+    monkeypatch.setattr(
+        continuity_gate,
+        "run_command",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 9, sentinel, sentinel
+        ),
+    )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    with pytest.raises(ContinuityError, match="status 9") as exc:
+        continuity_gate._run_beads(config, ["close", TASK_ID], pilot["repo"])
+    assert sentinel not in str(exc.value)
+
+
 def test_interrupted_tool_adjacency_is_rejected() -> None:
     events = [
         {"type": "server_tool_use", "id": "call-1"},
@@ -439,11 +457,17 @@ def test_interrupted_tool_adjacency_is_rejected() -> None:
         {"type": "tool_use", "id": "call-1"},
         {"type": "tool_result", "tool_use_id": "call-1"},
     ])
-    assert validate_tool_adjacency([
+    assert not validate_tool_adjacency([
         {"type": "tool_use", "id": "call-1"},
         {"type": "tool_use", "id": "call-2"},
         {"type": "tool_result", "tool_use_id": "call-1"},
         {"type": "tool_result", "tool_use_id": "call-2"},
+    ])
+    assert validate_tool_adjacency([
+        {"type": "tool_use", "id": "call-1"},
+        {"type": "tool_use", "id": "call-2"},
+        {"type": "tool_result", "tool_use_id": "call-2"},
+        {"type": "tool_result", "tool_use_id": "call-1"},
     ])
 
 
@@ -585,6 +609,29 @@ def test_gate_executes_evidence_and_rejects_legacy_attestations(
         create_receipt(
             alternate,
             cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="TESTED",
+            commands=[policy["focused_suite"]],
+            runtime_checks=policy["runtime_checks"],
+            rollback=policy["rollback_check"],
+            require_mounted_volume=False,
+        )
+
+    attacker = pilot["state"] / "attacker-repo"
+    attacker.mkdir()
+    _git(attacker, "init", "-b", "attacker")
+    _git(attacker, "config", "user.email", "attacker@example.invalid")
+    _git(attacker, "config", "user.name", "Attacker")
+    attacker_config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    attacker_config["expected_repo_root"] = str(attacker)
+    self_pointing = attacker / ".continuity/config.json"
+    atomic_write_json(self_pointing, attacker_config)
+    _git(attacker, "add", ".")
+    _git(attacker, "commit", "-m", "self-pointing alternate authority")
+    with pytest.raises(ContinuityError, match="requires committed config"):
+        create_receipt(
+            self_pointing,
+            cwd=attacker,
             risk_tier="T3",
             lifecycle_target="TESTED",
             commands=[policy["focused_suite"]],
@@ -1116,6 +1163,14 @@ def test_unmounted_volume_causes_no_state_writes(
         )
     assert not (pilot["state"] / "receipt-signing.key").exists()
     assert not (pilot["state"] / "evidence-home").exists()
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        promote(
+            pilot["config"],
+            pilot["state"] / "not-read.json",
+            cwd=pilot["repo"],
+            target="TESTED",
+        )
+    assert not (pilot["state"] / "promotion.lock").exists()
 
 
 def test_committed_adapters_match_single_contract() -> None:
