@@ -570,6 +570,8 @@ def _execute_evidence(
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")
+    if kind == "runtime" and sha256_file(adapter_path) != adapter_digest:
+        raise ContinuityError("native observation adapter changed during execution")
     completed = datetime.now(timezone.utc)
     output = (result.stdout or "") + (result.stderr or "")
     test_count, failed_count, skipped = _test_summary(output)
