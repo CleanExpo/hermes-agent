@@ -11,6 +11,8 @@ on:
       - 'scripts/install_continuity_adapters.py'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
+      - '.github/workflows/continuity-gate.yml'
+      - 'docs/continuity-pilot.md'
   push:
     paths:
       - '.continuity/**'
@@ -21,6 +23,8 @@ on:
       - 'scripts/install_continuity_adapters.py'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
+      - '.github/workflows/continuity-gate.yml'
+      - 'docs/continuity-pilot.md'
 
 permissions:
   contents: read

@@ -141,7 +141,7 @@ def minimal_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         "WINDIR",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
-    env.setdefault("PATH", os.defpath)
+    env["PATH"] = "/usr/bin:/bin"
     env.setdefault("HOME", env.get("TMPDIR", "/tmp"))
     if extra:
         env.update(extra)
@@ -209,6 +209,19 @@ def external_input_digests(config: dict[str, Any], repo_root: Path) -> dict[str,
                 f"external instruction digest mismatch: expected {expected}, got {actual}"
             )
         inputs[str(path)] = actual
+    for item in config.get("evidence_executables", []):
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise ContinuityError(
+                "evidence executable pins require exactly path and sha256"
+            )
+        path = Path(str(item["path"])).resolve()
+        expected = item["sha256"]
+        actual = sha256_file(path)
+        if not isinstance(expected, str) or not hmac.compare_digest(actual, expected):
+            raise ContinuityError(
+                f"evidence executable digest mismatch: expected {expected}, got {actual}"
+            )
+        inputs[str(path)] = actual
     beads_path = Path(config["beads"]["binary"])
     inputs[str(beads_path.resolve())] = verify_pinned_executable(
         config, repo_root, "beads", beads_path
@@ -252,8 +265,14 @@ def _receipt_auth_payload(receipt: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def sign_receipt(config: dict[str, Any], receipt: dict[str, Any]) -> dict[str, str]:
-    key = _load_receipt_key(config, create=True)
+def receipt_signing_key(config: dict[str, Any]) -> bytes:
+    return _load_receipt_key(config, create=True)
+
+
+def sign_receipt(
+    config: dict[str, Any], receipt: dict[str, Any], *, key: bytes | None = None
+) -> dict[str, str]:
+    key = key or _load_receipt_key(config, create=True)
     return {
         "algorithm": "hmac-sha256",
         "key_id": hashlib.sha256(key).hexdigest()[:16],
@@ -438,6 +457,8 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
     expected_git = current.as_dict()
     if receipt.get("git") != expected_git:
         errors.append("receipt repository, branch, commit, or dirty state is stale")
+    if current.dirty:
+        errors.append("terminal lifecycle receipt requires a clean repository")
     if current.integration_ref and current.merge_base != current.integration_sha:
         errors.append("current branch is not based on the configured integration SHA")
     authority = receipt.get("authority_check")

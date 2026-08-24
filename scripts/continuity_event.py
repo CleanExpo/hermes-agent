@@ -13,8 +13,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from continuity_bridge import build_preflight, tool_events_from_payload
-from continuity_common import ContinuityError, compact_json, load_json
+from continuity_bridge import (
+    build_preflight,
+    tool_events_from_payload,
+    validate_tool_adjacency,
+)
+from continuity_common import (
+    ContinuityError,
+    atomic_write_json,
+    compact_json,
+    load_json,
+)
 
 
 MAX_STDIN_BYTES = 1_048_576
@@ -45,10 +54,56 @@ def _read_payload() -> dict[str, Any]:
 
 
 def _session_fingerprint(payload: dict[str, Any]) -> str | None:
+    extra = payload.get("extra")
     value = payload.get("session_id") or payload.get("sessionId")
+    if not value and isinstance(extra, dict):
+        value = extra.get("session_id") or extra.get("sessionId")
     if not isinstance(value, str) or not value:
         return None
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _adjacency_guard_path(config: dict[str, Any], session: str) -> Path:
+    return Path(config["state_root"]) / "adjacency" / f"{session}.json"
+
+
+def _write_adjacency_guard(
+    config: dict[str, Any], session: str | None, *, allowed: bool
+) -> None:
+    if session is None:
+        return
+    atomic_write_json(
+        _adjacency_guard_path(config, session),
+        {
+            "schema_version": 1,
+            "session": session,
+            "allowed": allowed,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _consume_adjacency_guard(config: dict[str, Any], session: str | None) -> list[str]:
+    if session is None:
+        return ["Hermes tool call has no session identity"]
+    path = _adjacency_guard_path(config, session)
+    try:
+        guard = load_json(path)
+    except ContinuityError:
+        return ["Hermes tool call has no preceding adjacency check"]
+    errors: list[str] = []
+    if guard.get("session") != session or guard.get("allowed") is not True:
+        errors.append("Hermes tool call adjacency check is blocked or already consumed")
+    try:
+        checked = datetime.fromisoformat(str(guard.get("checked_at")))
+        if (datetime.now(timezone.utc) - checked).total_seconds() > 300:
+            errors.append("Hermes tool call adjacency check is stale")
+    except ValueError:
+        errors.append("Hermes tool call adjacency check has an invalid timestamp")
+    guard["allowed"] = False
+    guard["consumed_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(path, guard)
+    return errors
 
 
 def _append_redacted_event(path: Path, event: dict[str, Any]) -> None:
@@ -71,11 +126,28 @@ def dispatch(
     started = time.monotonic()
     result: dict[str, Any] = {"event": event_name, "surface": surface, "handled": True}
     preflight: dict[str, Any] | None = None
+    session = _session_fingerprint(payload)
+    hermes_guard_errors: list[str] = []
     if event_name in PREFLIGHT_EVENTS:
         tool_events = tool_events_from_payload(payload)
+        if surface == "hermes" and event_name == "pre_llm_call":
+            adjacency_errors = (
+                validate_tool_adjacency(tool_events) if tool_events is not None else []
+            )
+            _write_adjacency_guard(
+                config,
+                session,
+                allowed=not adjacency_errors and tool_events is not None,
+            )
+        elif surface == "hermes" and event_name == "pre_tool_call":
+            hermes_guard_errors = _consume_adjacency_guard(config, session)
         preflight = build_preflight(
             config_path, cwd=Path.cwd(), tool_events=tool_events
         )
+        if hermes_guard_errors:
+            preflight["errors"] = [*preflight.get("errors", []), *hermes_guard_errors]
+            preflight["status"] = "BLOCKED"
+            preflight["completion_allowed"] = False
         rendered = compact_json(preflight, int(config.get("max_output_chars", 8000)))
         result["preflight"] = preflight
         if surface == "hermes" and event_name == "pre_llm_call":
@@ -116,7 +188,7 @@ def dispatch(
         "at": datetime.now(timezone.utc).isoformat(),
         "event": event_name,
         "surface": surface,
-        "session": _session_fingerprint(payload),
+        "session": session,
         "preflight_status": preflight.get("status") if preflight else None,
         "completion_allowed": preflight.get("completion_allowed")
         if preflight

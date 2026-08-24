@@ -215,9 +215,7 @@ def rollback_hermes_adapter(
     current = {name: hooks.get(name) for name in installed}
     before_projection = _before_hook_projection(manifest)
     already_before = current == before_projection
-    if current != installed and not (
-        manifest.get("status") == "PREPARED" and already_before
-    ):
+    if current != installed and not already_before:
         raise ContinuityError("managed Hermes hooks changed after installation")
     if not apply:
         return {"rollback_valid": True, "applied": False, "target": str(target)}

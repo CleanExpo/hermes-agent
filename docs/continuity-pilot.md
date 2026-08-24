@@ -19,10 +19,12 @@ Receipt creation separately runs a live, longer-bounded `bd show` check; JSONL a
 can never authorize a terminal lifecycle state.
 
 Claude and Codex finalization hooks return their native blocking shape when preflight
-forbids completion. Hermes `pre_tool_call` is installed `fail_closed: true`, so a
-blocked or failed preflight prevents tool side effects. Hermes shell hooks do not have
-a blocking ordinary-prose or session-end event; for that surface the exact-state gate,
-not an advisory hook, prevents `TESTED`/`ENFORCED` promotion.
+forbids completion. Hermes `pre_llm_call` validates native conversation history and
+writes a content-free, per-session adjacency guard outside the repository.
+`pre_tool_call` consumes that guard and is installed `fail_closed: true`; a missing,
+stale, blocked, or already-consumed guard prevents tool side effects. Hermes shell
+hooks do not have a blocking ordinary-prose or session-end event; for that surface the
+exact-state gate, not advisory context, prevents `TESTED`/`ENFORCED` promotion.
 
 ## Tool pins and isolation
 
@@ -63,18 +65,20 @@ event, including the expected exit `2` from a blocked `pre_tool_call`.
 
 ## Receipt shape
 
-Command evidence input is a closed manifest containing `name`, a repository-local
-`argv`, and an optional timeout. The gate executes each command in a
-credential-minimized environment and records exit code, parsed positive test count,
-timestamps, duration, working directory, command identity digest, and output digest;
-raw argv and output are not persisted. The gate derives `full` only when the resolved
-argv exactly matches `evidence_policy.full_suite_argv`; callers cannot label a focused
-command as full. Runtime and rollback inputs use the same manifest pattern. T2/T3
-receipts require runtime checks; T3 requires an executed rollback dry-run. Receipts are
-authenticated with a mode-`0600` pilot-local HMAC key. `ENFORCED` requires the
-gate-owned full-suite identity. Create a receipt only after the final commit because
-any commit, dirty-state change, integration-ref advance, or external-input drift
-invalidates it.
+The committed T3 policy owns the focused suite, full suite, runtime checks, and
+rollback dry-run as closed manifests. Caller JSON must match that policy byte-for-byte
+as parsed data; it cannot select commands, surfaces, labels, or timeouts. The gate
+requires the canonical committed config, a clean repository, and the configured
+integration ancestry before it starts any evidence command. It resolves only pinned
+Python or `/bin/bash` entry points and repository scripts, runs them with a fixed PATH,
+credential-minimized environment, and a separate evidence HOME, then records exit
+code, parsed positive test count, timestamps, duration, working directory, command
+identity digest, and output digest. Raw argv and output are not persisted. The trusted
+boundary is the reviewed code at that clean exact SHA; this pilot is process-isolated,
+not an OS sandbox for hostile repository code. Receipts are authenticated with a
+mode-`0600` pilot-local HMAC key loaded before evidence starts. `ENFORCED` uses only the
+committed full-suite identity. Any commit, dirty-state change, integration-ref advance,
+executable-pin change, or external-input drift invalidates the receipt.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \

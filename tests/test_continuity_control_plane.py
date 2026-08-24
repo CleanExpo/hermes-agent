@@ -24,11 +24,13 @@ from continuity_common import (
     atomic_write_json,
     git_state,
     read_markdown_frontmatter,
+    render_markdown_frontmatter,
     sha256_file,
 )
 from continuity_event import dispatch
 from continuity_gate import (
     create_receipt,
+    managed_manifest_file_errors,
     manifest_membership_errors,
     promote,
     verify_receipt,
@@ -203,6 +205,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
         "schema_version": 1,
         "project": "Hermes",
         "repo_id": "hermes-agent",
+        "risk_tier": "T3",
         "integration_ref": "HEAD",
         "toolchain_lock": ".continuity/toolchain.lock.json",
         "goal": GOAL,
@@ -217,6 +220,7 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
             "issues_path": str(issues),
             "active_task": TASK_ID,
             "timeout_seconds": 1,
+            "completion_timeout_seconds": 7,
         },
         "spec": {
             "change_id": CHANGE_ID,
@@ -224,15 +228,47 @@ def pilot(tmp_path: Path) -> dict[str, Path]:
         },
         "instructions": ["AGENTS.md", ".specify/memory/constitution.md"],
         "evidence_policy": {
-            "full_suite_argv": [sys.executable, "scripts/full_suite.py"],
-            "runtime_surfaces": ["sandbox"],
+            "focused_suite": {
+                "name": "focused-suite",
+                "argv": [sys.executable, "scripts/evidence_pass.py"],
+                "timeout_seconds": 30,
+            },
+            "full_suite": {
+                "name": "full-suite",
+                "argv": [sys.executable, "scripts/full_suite.py"],
+                "timeout_seconds": 30,
+            },
+            "runtime_checks": [
+                {
+                    "name": "sandbox-hosts",
+                    "argv": [sys.executable, "scripts/runtime_check.py"],
+                    "surface": "sandbox",
+                    "timeout_seconds": 30,
+                }
+            ],
+            "rollback_check": {
+                "name": "rollback",
+                "argv": [sys.executable, "scripts/rollback_check.py"],
+                "mode": "dry-run",
+                "timeout_seconds": 30,
+            },
         },
+        "evidence_executables": [
+            {"path": sys.executable, "sha256": sha256_file(Path(sys.executable))}
+        ],
         "external_instructions": [],
         "event_log": str(event_log),
         "receipt_dir": str(state / "receipts"),
     }
-    config_path = state / "config.json"
+    config_path = repo / ".continuity/config.json"
     atomic_write_json(config_path, config)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "pilot fixture")
+    card_data, card_body = read_markdown_frontmatter(card_path)
+    card_data["evidence"]["commit"] = _git(repo, "rev-parse", "HEAD")
+    card_path.write_text(
+        render_markdown_frontmatter(card_data, card_body), encoding="utf-8"
+    )
     return {
         "repo": repo,
         "state": state,
@@ -252,35 +288,30 @@ def _preflight(pilot: dict[str, Path]) -> dict:
     )
 
 
+def _commit_and_rebind(pilot: dict[str, Path], message: str) -> None:
+    _git(pilot["repo"], "add", ".")
+    _git(pilot["repo"], "commit", "-m", message)
+    card_data, card_body = read_markdown_frontmatter(pilot["card"])
+    card_data["evidence"]["commit"] = _git(pilot["repo"], "rev-parse", "HEAD")
+    pilot["card"].write_text(
+        render_markdown_frontmatter(card_data, card_body), encoding="utf-8"
+    )
+
+
+def _policy(pilot: dict[str, Path]) -> dict:
+    return json.loads(pilot["config"].read_text(encoding="utf-8"))["evidence_policy"]
+
+
 def _passing_receipt(pilot: dict[str, Path], target: str = "TESTED") -> dict:
+    policy = _policy(pilot)
     return create_receipt(
         pilot["config"],
         cwd=pilot["repo"],
         risk_tier="T3",
         lifecycle_target=target,
-        commands=[
-            {
-                "name": "focused",
-                "argv": [
-                    sys.executable,
-                    "scripts/full_suite.py"
-                    if target == "ENFORCED"
-                    else "scripts/evidence_pass.py",
-                ],
-            }
-        ],
-        runtime_checks=[
-            {
-                "name": "sandbox-hosts",
-                "argv": [sys.executable, "scripts/runtime_check.py"],
-                "surface": "sandbox",
-            }
-        ],
-        rollback={
-            "name": "rollback",
-            "argv": [sys.executable, "scripts/rollback_check.py"],
-            "mode": "dry-run",
-        },
+        commands=[policy["full_suite" if target == "ENFORCED" else "focused_suite"]],
+        runtime_checks=policy["runtime_checks"],
+        rollback=policy["rollback_check"],
         require_mounted_volume=False,
     )
 
@@ -380,6 +411,21 @@ def test_beads_timeout_uses_degraded_jsonl_and_forbids_completion(
     assert "JSONL" in result["warnings"][0]
 
 
+def test_beads_mutation_uses_completion_timeout(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, float] = {}
+
+    def capture_run(argv, *, cwd, timeout, env):
+        captured["timeout"] = timeout
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+    monkeypatch.setattr(continuity_gate, "run_command", capture_run)
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    continuity_gate._run_beads(config, ["close", TASK_ID], pilot["repo"])
+    assert captured["timeout"] == 7
+
+
 def test_interrupted_tool_adjacency_is_rejected() -> None:
     events = [
         {"type": "server_tool_use", "id": "call-1"},
@@ -391,38 +437,45 @@ def test_interrupted_tool_adjacency_is_rejected() -> None:
         {"type": "tool_use", "id": "call-1"},
         {"type": "tool_result", "tool_use_id": "call-1"},
     ])
+    assert validate_tool_adjacency([
+        {"type": "tool_use", "id": "call-1"},
+        {"type": "tool_use", "id": "call-2"},
+        {"type": "tool_result", "tool_use_id": "call-1"},
+        {"type": "tool_result", "tool_use_id": "call-2"},
+    ])
 
 
 def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["evidence_policy"]["focused_suite"]["argv"] = [
+        sys.executable,
+        "scripts/evidence_fail.py",
+    ]
+    atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "bind failing evidence fixture")
+    policy = _policy(pilot)
     failed = create_receipt(
         pilot["config"],
         cwd=pilot["repo"],
         risk_tier="T3",
         lifecycle_target="TESTED",
-        commands=[
-            {
-                "name": "focused",
-                "argv": [sys.executable, "scripts/evidence_fail.py"],
-            }
-        ],
-        runtime_checks=[
-            {
-                "name": "sandbox",
-                "argv": [sys.executable, "scripts/runtime_check.py"],
-                "surface": "sandbox",
-            }
-        ],
-        rollback={
-            "name": "rollback",
-            "argv": [sys.executable, "scripts/rollback_check.py"],
-            "mode": "dry-run",
-        },
+        commands=[policy["focused_suite"]],
+        runtime_checks=policy["runtime_checks"],
+        rollback=policy["rollback_check"],
         require_mounted_volume=False,
     )
     assert failed["result"] == "FAIL"
 
     enforced = _passing_receipt(pilot, target="ENFORCED")
     assert enforced["result"] == "PASS"
+
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["evidence_policy"]["focused_suite"]["argv"] = [
+        sys.executable,
+        "scripts/evidence_pass.py",
+    ]
+    atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "restore passing evidence fixture")
 
     receipt_path = pilot["state"] / "receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
@@ -455,7 +508,7 @@ def test_signed_receipt_rejects_forged_evidence(pilot: dict[str, Path]) -> None:
 def test_full_suite_identity_and_integration_ancestry_are_gate_owned(
     pilot: dict[str, Path],
 ) -> None:
-    with pytest.raises(ContinuityError, match="unknown keys"):
+    with pytest.raises(ContinuityError, match="does not match committed policy"):
         create_receipt(
             pilot["config"],
             cwd=pilot["repo"],
@@ -476,14 +529,15 @@ def test_full_suite_identity_and_integration_ancestry_are_gate_owned(
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     config["integration_ref"] = "integration"
     atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "bind integration authority")
     _git(pilot["repo"], "branch", "integration")
     _git(pilot["repo"], "checkout", "integration")
     (pilot["repo"] / "base.txt").write_text("advanced\n", encoding="utf-8")
     _git(pilot["repo"], "add", "base.txt")
     _git(pilot["repo"], "commit", "-m", "advance integration")
     _git(pilot["repo"], "checkout", "pilot")
-    result = _passing_receipt(pilot)
-    assert result["result"] == "FAIL"
+    with pytest.raises(ContinuityError, match="include the integration SHA"):
+        _passing_receipt(pilot)
     assert any("not based" in error for error in _preflight(pilot)["errors"])
 
 
@@ -504,7 +558,7 @@ def test_only_gate_promotes_terminal_state(
 def test_gate_executes_evidence_and_rejects_legacy_attestations(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with pytest.raises(ContinuityError, match="unknown keys"):
+    with pytest.raises(ContinuityError, match="risk tier is committed"):
         create_receipt(
             pilot["config"],
             cwd=pilot["repo"],
@@ -522,39 +576,64 @@ def test_gate_executes_evidence_and_rejects_legacy_attestations(
             require_mounted_volume=False,
         )
 
-    zero = create_receipt(
-        pilot["config"],
-        cwd=pilot["repo"],
-        risk_tier="T1",
-        lifecycle_target="TESTED",
-        commands=[
-            {
-                "name": "zero-tests",
-                "argv": [sys.executable, "scripts/zero_tests.py"],
-            }
-        ],
-        runtime_checks=[],
-        rollback={},
-        require_mounted_volume=False,
-    )
+    policy = _policy(pilot)
+    alternate = pilot["state"] / "alternate-config.json"
+    alternate.write_text(pilot["config"].read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ContinuityError, match="requires committed config"):
+        create_receipt(
+            alternate,
+            cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="TESTED",
+            commands=[policy["focused_suite"]],
+            runtime_checks=policy["runtime_checks"],
+            rollback=policy["rollback_check"],
+            require_mounted_volume=False,
+        )
+
+    (pilot["repo"] / "seed.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ContinuityError, match="clean repository"):
+        _passing_receipt(pilot)
+    (pilot["repo"] / "seed.txt").write_text("seed\n", encoding="utf-8")
+
+    with pytest.raises(ContinuityError, match="does not match committed policy"):
+        create_receipt(
+            pilot["config"],
+            cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="TESTED",
+            commands=[
+                {
+                    "name": "fabricated",
+                    "argv": [sys.executable, "scripts/evidence_pass.py"],
+                    "passed": True,
+                }
+            ],
+            runtime_checks=[],
+            rollback={},
+            require_mounted_volume=False,
+        )
+
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["evidence_policy"]["focused_suite"]["argv"] = [
+        sys.executable,
+        "scripts/zero_tests.py",
+    ]
+    atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "bind zero-test evidence fixture")
+    zero = _passing_receipt(pilot)
     assert zero["result"] == "FAIL"
 
     monkeypatch.setenv("TOP_SECRET", "must-not-reach-child")
-    clean_env = create_receipt(
-        pilot["config"],
-        cwd=pilot["repo"],
-        risk_tier="T1",
-        lifecycle_target="TESTED",
-        commands=[
-            {
-                "name": "minimal-env",
-                "argv": [sys.executable, "scripts/env_check.py", "sk-live-example"],
-            }
-        ],
-        runtime_checks=[],
-        rollback={},
-        require_mounted_volume=False,
-    )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["evidence_policy"]["focused_suite"]["argv"] = [
+        sys.executable,
+        "scripts/env_check.py",
+        "sk-live-example",
+    ]
+    atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "bind minimal environment evidence fixture")
+    clean_env = _passing_receipt(pilot)
     assert clean_env["result"] == "PASS"
     assert "stdout" not in clean_env["commands"][0]
     assert "argv" not in clean_env["commands"][0]
@@ -569,6 +648,7 @@ def test_pinned_inputs_invalidate_preflight_and_receipt(pilot: dict[str, Path]) 
         {"path": str(instruction), "sha256": sha256_file(instruction)}
     ]
     atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "bind external instruction fixture")
     receipt_path = pilot["state"] / "receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     instruction.write_text("v2\n", encoding="utf-8")
@@ -604,7 +684,8 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
         assert json.loads(result.stdout).get("additional_context")
 
     interrupted = {
-        "hook_event_name": "pre_tool_call",
+        "hook_event_name": "pre_llm_call",
+        "session_id": "interrupted-hermes",
         "extra": {
             "conversation_history": [
                 {
@@ -617,6 +698,24 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
             ]
         },
     }
+    hermes_llm = subprocess.run(
+        [
+            sys.executable,
+            str(entry),
+            "pre_llm_call",
+            "--surface",
+            "hermes",
+            "--config",
+            str(pilot["config"]),
+        ],
+        cwd=pilot["repo"],
+        input=json.dumps(interrupted),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert hermes_llm.returncode == 0
+    assert json.loads(hermes_llm.stdout)["completion_allowed"] is False
     hermes_process = subprocess.run(
         [
             sys.executable,
@@ -628,7 +727,7 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
             str(pilot["config"]),
         ],
         cwd=pilot["repo"],
-        input=json.dumps(interrupted),
+        input=json.dumps({"session_id": "interrupted-hermes"}),
         text=True,
         capture_output=True,
         check=False,
@@ -720,6 +819,38 @@ def test_interrupted_hermes_install_remains_rollback_safe(
     ]
     rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
+
+
+def test_interrupted_hermes_rollback_finalization_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    hermes_home = tmp_path / "rollback-interrupted-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    original = {"model": "fixture", "hooks": {"unrelated": [{"command": "keep"}]}}
+    config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+    install_hermes_adapter(REPO_ROOT, hermes_home)
+    real_write = continuity_adapters.atomic_write_text
+
+    def interrupt_rolled_back_manifest(path: Path, content: str) -> None:
+        if (
+            path.name == continuity_adapters.HERMES_MANIFEST
+            and '"ROLLED_BACK"' in content
+        ):
+            raise OSError("simulated rollback finalization interruption")
+        real_write(path, content)
+
+    monkeypatch.setattr(
+        continuity_adapters, "atomic_write_text", interrupt_rolled_back_manifest
+    )
+    with pytest.raises(OSError, match="rollback finalization interruption"):
+        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
+
+    monkeypatch.setattr(continuity_adapters, "atomic_write_text", real_write)
+    assert rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)["applied"]
 
 
 def test_promotion_recovers_prepared_and_card_written_stages(
@@ -852,4 +983,13 @@ def test_supply_chain_manifest_membership_is_closed() -> None:
         for error in manifest_membership_errors(
             installed, ["claude", "codex", "hermes", "speckit", "claude"]
         )
+    )
+    assert not managed_manifest_file_errors({"one", "two"}, {"one", "two"})
+    assert any(
+        "missing from manifests" in error
+        for error in managed_manifest_file_errors({"one"}, {"one", "two"})
+    )
+    assert any(
+        "outside managed" in error
+        for error in managed_manifest_file_errors({"one", "extra"}, {"one"})
     )

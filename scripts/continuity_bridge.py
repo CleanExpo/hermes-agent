@@ -103,30 +103,32 @@ def _read_beads(
 
 def validate_tool_adjacency(events: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    pending: list[str] = []
     for index, event in enumerate(events):
         event_type = event.get("type")
         if event_type in {"server_tool_use", "tool_use"}:
-            pending.append(str(event.get("id") or index))
+            tool_id = str(event.get("id") or index)
+            if index + 1 >= len(events):
+                errors.append(f"tool use {tool_id} has no adjacent result")
+                continue
+            adjacent = events[index + 1]
+            result_type = adjacent.get("type")
+            result_id = str(adjacent.get("tool_use_id") or adjacent.get("id") or "")
+            if result_type not in {"tool_result", "server_tool_result"}:
+                errors.append(
+                    f"tool use {tool_id} is interrupted before its matching result"
+                )
+            elif result_id != tool_id:
+                errors.append(
+                    f"tool result {result_id or index + 1} does not match tool use {tool_id}"
+                )
             continue
         if event_type in {"tool_result", "server_tool_result"}:
             result_id = str(event.get("tool_use_id") or event.get("id") or "")
-            if not pending:
+            if index == 0 or events[index - 1].get("type") not in {
+                "server_tool_use",
+                "tool_use",
+            }:
                 errors.append(f"tool result {result_id or index} has no pending use")
-            elif result_id != pending[0]:
-                errors.append(
-                    f"tool result {result_id or index} does not match pending use {pending[0]}"
-                )
-            else:
-                pending.pop(0)
-            continue
-        if pending:
-            errors.extend(
-                f"tool use {tool_id} is interrupted before its matching result"
-                for tool_id in pending
-            )
-            pending.clear()
-    errors.extend(f"tool use {tool_id} has no adjacent result" for tool_id in pending)
     return errors
 
 

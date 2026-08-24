@@ -31,6 +31,7 @@ from continuity_common import (
     minimal_child_env,
     read_markdown_frontmatter,
     receipt_errors,
+    receipt_signing_key,
     receipt_signature_errors,
     render_markdown_frontmatter,
     run_command,
@@ -62,6 +63,16 @@ def _task_from_value(value: Any, task_id: str) -> dict[str, Any] | None:
         ),
         None,
     )
+
+
+def _require_committed_config(config_path: Path, config: dict[str, Any]) -> Path:
+    repo_root = Path(config["expected_repo_root"]).resolve()
+    expected = repo_root / ".continuity/config.json"
+    if config_path.resolve() != expected:
+        raise ContinuityError(
+            f"continuity authority requires committed config: {expected}"
+        )
+    return repo_root
 
 
 def strict_authority_check(
@@ -175,6 +186,15 @@ def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
         argv[0] = str(first)
         argv[1] = str(script)
         return argv
+    if first == Path("/bin/bash").resolve():
+        if len(argv) < 2 or argv[1].startswith("-"):
+            raise ContinuityError("Bash evidence commands require a repository script")
+        script = (repo_root / argv[1]).resolve()
+        if not script.is_relative_to(repo_root) or script.suffix != ".sh":
+            raise ContinuityError("Bash evidence script must be a repository .sh file")
+        argv[0] = str(first)
+        argv[1] = str(script)
+        return argv
     if not first.is_relative_to(repo_root):
         raise ContinuityError(f"evidence executable escapes repository: {first}")
     if not first.is_file():
@@ -200,7 +220,7 @@ def _execute_evidence(
     repo_root: Path,
     *,
     kind: str,
-    state_root: Path,
+    evidence_home: Path,
     config: dict[str, Any],
     index: int,
 ) -> dict[str, Any]:
@@ -215,11 +235,13 @@ def _execute_evidence(
     if not isinstance(policy, dict):
         raise ContinuityError("continuity config has no evidence_policy")
     if kind == "runtime":
-        allowed_surfaces = policy.get("runtime_surfaces")
-        if (
-            not isinstance(allowed_surfaces, list)
-            or spec.get("surface") not in allowed_surfaces
-        ):
+        configured_runtime = policy.get("runtime_checks")
+        allowed_surfaces = {
+            item.get("surface")
+            for item in configured_runtime or []
+            if isinstance(item, dict)
+        }
+        if spec.get("surface") not in allowed_surfaces:
             raise ContinuityError("runtime evidence surface is not allowlisted")
     if kind == "rollback" and spec.get("mode") != "dry-run":
         raise ContinuityError("receipt rollback evidence must use dry-run mode")
@@ -233,7 +255,7 @@ def _execute_evidence(
         cwd=repo_root,
         timeout=timeout,
         env=minimal_child_env({
-            "HOME": str(state_root),
+            "HOME": str(evidence_home),
             "PYTHONHASHSEED": "0",
             "TZ": "UTC",
         }),
@@ -255,8 +277,10 @@ def _execute_evidence(
         "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
     }
     if kind == "command":
-        full_spec = {"name": "full-suite", "argv": policy.get("full_suite_argv")}
-        _validate_closed_spec(full_spec, {"name", "argv"}, "configured full suite")
+        full_spec = policy.get("full_suite")
+        if not isinstance(full_spec, dict):
+            raise ContinuityError("configured full suite is missing")
+        _validate_closed_spec(full_spec, COMMAND_SPEC_KEYS, "configured full suite")
         full_argv = _resolved_argv(full_spec, repo_root)
         record.update({
             "scope": "full" if argv == full_argv else "focused",
@@ -290,20 +314,47 @@ def create_receipt(
     require_mounted_volume: bool = True,
 ) -> dict[str, Any]:
     config = load_json(config_path)
-    repo_root = Path(config["expected_repo_root"]).resolve()
+    repo_root = _require_committed_config(config_path, config)
+    configured_tier = config.get("risk_tier")
+    if risk_tier != configured_tier:
+        raise ContinuityError(
+            f"risk tier is committed as {configured_tier}; caller requested {risk_tier}"
+        )
     state = git_state(cwd.resolve(), integration_ref=config.get("integration_ref"))
     expected_root = str(Path(config["expected_repo_root"]).resolve())
     if state.root != expected_root:
         raise ContinuityError(
             f"wrong repository folder: expected {expected_root}, got {state.root}"
         )
+    if state.dirty:
+        raise ContinuityError("receipt creation requires a clean repository")
+    if state.integration_ref and state.merge_base != state.integration_sha:
+        raise ContinuityError(
+            "receipt creation requires the branch to include the integration SHA"
+        )
+    policy = config.get("evidence_policy")
+    if not isinstance(policy, dict):
+        raise ContinuityError("continuity config has no evidence_policy")
+    suite_key = "full_suite" if lifecycle_target == "ENFORCED" else "focused_suite"
+    expected_command = policy.get(suite_key)
+    expected_runtime = policy.get("runtime_checks")
+    expected_rollback = policy.get("rollback_check")
+    if commands != [expected_command]:
+        raise ContinuityError("command evidence does not match committed policy")
+    if runtime_checks != expected_runtime:
+        raise ContinuityError("runtime evidence does not match committed policy")
+    if rollback != expected_rollback:
+        raise ContinuityError("rollback evidence does not match committed policy")
+    signing_key = receipt_signing_key(config)
+    evidence_home = Path(config["state_root"]) / "evidence-home"
+    evidence_home.mkdir(parents=True, exist_ok=True)
     receipt = {
         "schema_version": 1,
         "gate": "hermes-continuity-gate/2",
         "project": config["project"],
         "repo_id": config["repo_id"],
         "lifecycle_target": lifecycle_target,
-        "risk_tier": risk_tier,
+        "risk_tier": configured_tier,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git": state.as_dict(),
         "authority_check": strict_authority_check(
@@ -317,7 +368,7 @@ def create_receipt(
                 spec,
                 repo_root,
                 kind="command",
-                state_root=Path(config["state_root"]),
+                evidence_home=evidence_home,
                 config=config,
                 index=index,
             )
@@ -328,7 +379,7 @@ def create_receipt(
                 spec,
                 repo_root,
                 kind="runtime",
-                state_root=Path(config["state_root"]),
+                evidence_home=evidence_home,
                 config=config,
                 index=index,
             )
@@ -338,7 +389,7 @@ def create_receipt(
             rollback,
             repo_root,
             kind="rollback",
-            state_root=Path(config["state_root"]),
+            evidence_home=evidence_home,
             config=config,
             index=0,
         )
@@ -354,7 +405,7 @@ def create_receipt(
         "digest": "0" * 64,
     }
     receipt["result"] = "PASS" if not receipt_errors(receipt, final_state) else "FAIL"
-    receipt["auth"] = sign_receipt(config, receipt)
+    receipt["auth"] = sign_receipt(config, receipt, key=signing_key)
     return receipt
 
 
@@ -366,7 +417,7 @@ def verify_receipt(
     allow_recovery_journal: bool = False,
 ) -> list[str]:
     config = load_json(config_path)
-    repo_root = Path(config["expected_repo_root"]).resolve()
+    repo_root = _require_committed_config(config_path, config)
     current = git_state(cwd.resolve(), integration_ref=config.get("integration_ref"))
     errors: list[str] = []
     if current.root != str(Path(config["expected_repo_root"]).resolve()):
@@ -408,7 +459,7 @@ def _run_beads(config: dict[str, Any], arguments: list[str], repo_root: Path) ->
     result = run_command(
         [beads["binary"], *arguments, "--json"],
         cwd=repo_root,
-        timeout=max(30, float(beads.get("timeout_seconds", 5))),
+        timeout=float(beads.get("completion_timeout_seconds", 60)),
         env=env,
     )
     if result.returncode != 0:
@@ -474,6 +525,7 @@ def promote(
     if target not in {"TESTED", "ENFORCED"}:
         raise ContinuityError("only TESTED or ENFORCED may be promoted by the gate")
     config = load_json(config_path)
+    _require_committed_config(config_path, config)
     journal_path = Path(config["state_root"]) / "promotion.json"
     with _promotion_lock(config):
         recovery = False
@@ -589,6 +641,54 @@ def manifest_membership_errors(
     return errors
 
 
+def managed_manifest_file_errors(
+    declared_files: set[str], managed_files: set[str]
+) -> list[str]:
+    missing = sorted(managed_files - declared_files)
+    extra = sorted(declared_files - managed_files)
+    errors: list[str] = []
+    if missing:
+        errors.append(
+            "managed integration files missing from manifests: " + ", ".join(missing)
+        )
+    if extra:
+        errors.append(
+            "manifest files outside managed integration set: " + ", ".join(extra)
+        )
+    return errors
+
+
+def _managed_integration_files(repo_root: Path) -> set[str]:
+    candidates: set[Path] = set()
+    for relative in (".specify/scripts", ".specify/templates", ".specify/workflows"):
+        root = repo_root / relative
+        if root.is_dir():
+            candidates.update(path for path in root.rglob("*") if path.is_file())
+    for relative in (
+        ".specify/.gitignore",
+        ".specify/events.py",
+        ".specify/init-options.json",
+        ".specify/integration.json",
+    ):
+        path = repo_root / relative
+        if path.is_file():
+            candidates.add(path)
+    for root_name in (".agents/skills", ".claude/skills"):
+        root = repo_root / root_name
+        if root.is_dir():
+            candidates.update(
+                path
+                for directory in root.glob("speckit-*")
+                for path in directory.rglob("*")
+                if path.is_file()
+            )
+    return {
+        str(path.relative_to(repo_root))
+        for path in candidates
+        if "__pycache__" not in path.parts and path.suffix != ".pyc"
+    }
+
+
 def static_validate(config_path: Path) -> list[str]:
     """Validate committed structure without requiring external pilot state (CI-safe)."""
     errors: list[str] = []
@@ -600,6 +700,7 @@ def static_validate(config_path: Path) -> list[str]:
     for key in (
         "project",
         "repo_id",
+        "risk_tier",
         "goal",
         "expected_repo_root",
         "external_volume",
@@ -608,15 +709,47 @@ def static_validate(config_path: Path) -> list[str]:
     ):
         if not config.get(key):
             errors.append(f"config missing {key}")
+    if config.get("risk_tier") != "T3":
+        errors.append("continuity pilot risk_tier must remain T3")
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
             errors.append(f"instruction missing: {relative}")
     policy = config.get("evidence_policy")
     if not isinstance(policy, dict) or set(policy) != {
-        "full_suite_argv",
-        "runtime_surfaces",
+        "focused_suite",
+        "full_suite",
+        "runtime_checks",
+        "rollback_check",
     }:
         errors.append("evidence_policy has an invalid closed schema")
+    elif not isinstance(policy["runtime_checks"], list):
+        errors.append("evidence_policy runtime_checks must be a list")
+    else:
+        policy_specs = [
+            (policy["focused_suite"], COMMAND_SPEC_KEYS, "focused suite"),
+            (policy["full_suite"], COMMAND_SPEC_KEYS, "full suite"),
+            *(
+                (item, RUNTIME_SPEC_KEYS, "runtime check")
+                for item in policy["runtime_checks"]
+            ),
+            (policy["rollback_check"], ROLLBACK_SPEC_KEYS, "rollback check"),
+        ]
+        for value, allowed, label in policy_specs:
+            if not isinstance(value, dict):
+                errors.append(f"evidence_policy {label} must be an object")
+                continue
+            try:
+                _validate_closed_spec(value, allowed, f"evidence_policy {label}")
+            except ContinuityError as exc:
+                errors.append(str(exc))
+    for item in config.get("evidence_executables", []):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256"}
+            or not Path(str(item.get("path", ""))).is_absolute()
+            or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) is None
+        ):
+            errors.append("evidence executable pin is malformed")
     for item in config.get("external_instructions", []):
         if (
             not isinstance(item, dict)
@@ -625,6 +758,7 @@ def static_validate(config_path: Path) -> list[str]:
             or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
         ):
             errors.append("external instruction pin is malformed")
+    spec_kit_version: str | None = None
     try:
         spec, _ = read_markdown_frontmatter(repo_root / config["spec"]["path"])
         if spec.get("change_id") != config["spec"].get("change_id"):
@@ -656,6 +790,9 @@ def static_validate(config_path: Path) -> list[str]:
                 if not isinstance(source, str) or not source.startswith("https://"):
                     errors.append(f"toolchain lock source is not HTTPS: {name}")
             beads = tools.get("beads")
+            spec_kit = tools.get("spec-kit")
+            if isinstance(spec_kit, dict) and isinstance(spec_kit.get("version"), str):
+                spec_kit_version = spec_kit["version"]
             hashes = [
                 value for key, value in (beads or {}).items() if key.endswith("-sha256")
             ]
@@ -671,10 +808,13 @@ def static_validate(config_path: Path) -> list[str]:
     if not manifests:
         errors.append("no integration supply-chain manifests are committed")
     identities: list[str] = []
+    manifest_versions: list[str] = []
+    declared_files: set[str] = set()
     for manifest_path in manifests:
         try:
             manifest = load_json(manifest_path)
             identities.append(str(manifest.get("integration") or ""))
+            manifest_versions.append(str(manifest.get("version") or ""))
             files = manifest.get("files")
             if not manifest.get("integration") or not manifest.get("version"):
                 errors.append(
@@ -686,6 +826,7 @@ def static_validate(config_path: Path) -> list[str]:
                 )
                 continue
             for relative, expected in files.items():
+                declared_files.add(relative)
                 candidate = (repo_root / relative).resolve()
                 if not candidate.is_relative_to(repo_root):
                     errors.append(f"integration manifest path escapes repo: {relative}")
@@ -704,8 +845,22 @@ def static_validate(config_path: Path) -> list[str]:
             errors.append("Spec Kit installed integration list is invalid")
         else:
             errors.extend(manifest_membership_errors(installed, identities))
+        integration_version = integration_state.get("version")
+        if not isinstance(integration_version, str) or any(
+            version != integration_version for version in manifest_versions
+        ):
+            errors.append(
+                "integration manifest versions do not match integration state"
+            )
+        if spec_kit_version != integration_version:
+            errors.append("integration state version does not match Spec Kit lock")
     except ContinuityError as exc:
         errors.append(str(exc))
+    errors.extend(
+        managed_manifest_file_errors(
+            declared_files, _managed_integration_files(repo_root)
+        )
+    )
     return errors
 
 
