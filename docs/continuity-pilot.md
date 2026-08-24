@@ -18,6 +18,10 @@ result `DEGRADED` and forbids completion. Missing or conflicting state is `BLOCK
 Receipt creation separately runs a live, longer-bounded `bd show` check; JSONL alone
 can never authorize a terminal lifecycle state.
 
+The human CLI preflight retains the card's next action and blockers. Host adapters do
+not place that free-form prose into model context: the dispatcher replaces it with only
+`next_action_recorded` and `blocker_count`, so card text cannot become tool authority.
+
 Claude and Codex finalization hooks return their native blocking shape when preflight
 forbids completion. Hermes `pre_llm_call` validates native conversation history and
 writes a content-free, per-session and per-turn adjacency admission outside the
@@ -58,6 +62,9 @@ HERMES_HOME="/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-2026
   hermes hooks list
 HERMES_HOME="/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes" \
   hermes hooks doctor
+python3 scripts/continuity_native_observation.py \
+  --surface hermes --config .continuity/config.json \
+  --hermes-home "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes"
 ```
 
 After the dispatcher file changes, refresh the isolated hook approvals before relying
@@ -80,6 +87,15 @@ not an OS sandbox for hostile repository code. Receipts are authenticated with a
 mode-`0600` pilot-local HMAC key loaded before evidence starts. `ENFORCED` uses only the
 committed full-suite identity. Any commit, dirty-state change, integration-ref advance,
 executable-pin change, or external-input drift invalidates the receipt.
+
+Evidence commands run in their own process group. Timeout or interruption reaps the
+whole descendant tree with bounded TERM-to-KILL escalation. The authenticated receipt
+also fingerprints the exact hashed requirements lock, Python launcher and executable,
+and installed distribution metadata; a lock mismatch or later resolved-environment
+change fails verification. Native runtime records bind Claude, Codex, and Hermes
+observations to the current commit, adapter digest, event, and a five-minute freshness
+window. Hermes observation executes `hooks list`, `hooks doctor`, and the native
+`hooks test pre_llm_call` admission path.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \
@@ -113,6 +129,11 @@ python3 scripts/install_continuity_adapters.py \
 The installer keeps a mode-`0600` ownership manifest inside the isolated Hermes home.
 Rollback refuses to proceed if a managed hook changed after installation. Broader
 pilot retirement is recoverable and scoped:
+
+`--rollback-apply` is acknowledgement-loss safe: repeating it after a successful
+rollback returns success with `already_rolled_back: true` and makes no file change.
+If a managed hook drifted after rollback, the command names the conflicting hook keys
+and gives the recovery sequence.
 
 1. Verify the shared checkout and live global hook files are unchanged.
 2. Apply the adapter rollback while its repository tool still exists.

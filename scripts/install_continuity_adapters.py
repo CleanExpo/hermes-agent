@@ -202,7 +202,8 @@ def rollback_hermes_adapter(
     manifest = load_json(manifest_path)
     if manifest.get("repo_root") != str(repo_root):
         raise ContinuityError("rollback manifest belongs to another repository")
-    if manifest.get("status") not in {"PREPARED", "INSTALLED"}:
+    status = manifest.get("status")
+    if status not in {"PREPARED", "INSTALLED", "ROLLED_BACK"}:
         raise ContinuityError("Hermes adapter is not in INSTALLED state")
     target = Path(str(manifest.get("target"))).resolve()
     if target != hermes_home.resolve() / "config.yaml":
@@ -215,6 +216,25 @@ def rollback_hermes_adapter(
     current = {name: hooks.get(name) for name in installed}
     before_projection = _before_hook_projection(manifest)
     already_before = current == before_projection
+    if status == "ROLLED_BACK":
+        if not already_before:
+            conflicts = sorted(
+                name
+                for name in installed
+                if current.get(name) != before_projection.get(name)
+            )
+            raise ContinuityError(
+                "managed Hermes hooks changed after rollback: "
+                + ", ".join(conflicts)
+                + "; recovery: restore those hooks to the recorded before-image "
+                "or reinstall this pilot adapter before retrying rollback"
+            )
+        return {
+            "rollback_valid": True,
+            "applied": False,
+            "already_rolled_back": True,
+            "target": str(target),
+        }
     if current != installed and not already_before:
         raise ContinuityError("managed Hermes hooks changed after installation")
     if not apply:
@@ -238,7 +258,12 @@ def rollback_hermes_adapter(
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
-    return {"rollback_valid": True, "applied": True, "target": str(target)}
+    return {
+        "rollback_valid": True,
+        "applied": True,
+        "already_rolled_back": False,
+        "target": str(target),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

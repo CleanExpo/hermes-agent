@@ -32,6 +32,14 @@
     ".agents/skills/speckit-implement/SKILL.md",
     ".claude/skills/speckit-implement/SKILL.md"
   ],
+  "dependency_identity": {
+    "python": ".venv/bin/python",
+    "requirements_lock": ".continuity/ci-requirements.txt"
+  },
+  "native_observation_policy": {
+    "required_surfaces": ["claude", "codex", "hermes"],
+    "max_age_seconds": 300
+  },
   "evidence_policy": {
     "focused_suite": {
       "name": "focused-suite",
@@ -52,14 +60,54 @@
     },
     "runtime_checks": [
       {
-        "name": "continuity-host-contract",
+        "name": "claude-project-hook-observation",
         "argv": [
-          "/bin/bash",
-          "scripts/run_tests.sh",
-          "tests/test_continuity_control_plane.py"
+          ".venv/bin/python",
+          "scripts/continuity_native_observation.py",
+          "--surface",
+          "claude",
+          "--config",
+          ".continuity/config.json"
         ],
-        "surface": "sandbox",
-        "timeout_seconds": 1800
+        "surface": "claude",
+        "event": "project-admission",
+        "adapter_path": ".claude/settings.json",
+        "native": true,
+        "timeout_seconds": 180
+      },
+      {
+        "name": "codex-project-hook-observation",
+        "argv": [
+          ".venv/bin/python",
+          "scripts/continuity_native_observation.py",
+          "--surface",
+          "codex",
+          "--config",
+          ".continuity/config.json"
+        ],
+        "surface": "codex",
+        "event": "project-admission",
+        "adapter_path": ".codex/hooks.json",
+        "native": true,
+        "timeout_seconds": 180
+      },
+      {
+        "name": "hermes-native-hook-observation",
+        "argv": [
+          ".venv/bin/python",
+          "scripts/continuity_native_observation.py",
+          "--surface",
+          "hermes",
+          "--config",
+          ".continuity/config.json",
+          "--hermes-home",
+          "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes"
+        ],
+        "surface": "hermes",
+        "event": "hooks-list-doctor-and-fresh-session",
+        "adapter_path": ".continuity/adapters.json",
+        "native": true,
+        "timeout_seconds": 300
       }
     ],
     "rollback_check": {

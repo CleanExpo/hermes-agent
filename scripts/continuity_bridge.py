@@ -242,6 +242,10 @@ def build_preflight(
             Path(config["basic_memory"]["card_path"])
         )
         errors.extend(_required(card, REQUIRED_CARD_FIELDS, "Basic Memory card"))
+        if not isinstance(card.get("next_action"), str):
+            errors.append("Basic Memory next_action must be a string")
+        if not isinstance(card.get("blockers"), list):
+            errors.append("Basic Memory blockers must be a list")
         card_word_count = len((json.dumps(card, default=str) + " " + card_body).split())
         if card_word_count > 1200:
             errors.append(f"Basic Memory card exceeds 1,200 words: {card_word_count}")

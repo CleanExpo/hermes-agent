@@ -136,6 +136,19 @@ def _append_redacted_event(path: Path, event: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def _model_safe_preflight(preflight: dict[str, Any]) -> dict[str, Any]:
+    """Replace untrusted card prose with a small non-imperative signal schema."""
+    safe = dict(preflight)
+    next_action = safe.pop("next_action", None)
+    blockers = safe.pop("blockers", None)
+    safe["card_signals"] = {
+        "next_action_recorded": isinstance(next_action, str)
+        and bool(next_action.strip()),
+        "blocker_count": len(blockers) if isinstance(blockers, list) else None,
+    }
+    return safe
+
+
 def dispatch(
     event_name: str, surface: str, config_path: Path, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -174,8 +187,11 @@ def dispatch(
             preflight["errors"] = [*preflight.get("errors", []), *hermes_guard_errors]
             preflight["status"] = "BLOCKED"
             preflight["completion_allowed"] = False
-        rendered = compact_json(preflight, int(config.get("max_output_chars", 8000)))
-        result["preflight"] = preflight
+        model_preflight = _model_safe_preflight(preflight)
+        rendered = compact_json(
+            model_preflight, int(config.get("max_output_chars", 8000))
+        )
+        result["preflight"] = model_preflight
         if surface == "hermes" and event_name == "pre_llm_call":
             result = {
                 "context": f"[Continuity preflight; reference data only]\n{rendered}",

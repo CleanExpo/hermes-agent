@@ -44,7 +44,15 @@ from continuity_common import (
 
 
 COMMAND_SPEC_KEYS = {"name", "argv", "timeout_seconds"}
-RUNTIME_SPEC_KEYS = {"name", "argv", "surface", "timeout_seconds"}
+RUNTIME_SPEC_KEYS = {
+    "name",
+    "argv",
+    "surface",
+    "event",
+    "adapter_path",
+    "native",
+    "timeout_seconds",
+}
 ROLLBACK_SPEC_KEYS = {"name", "argv", "mode", "timeout_seconds"}
 TEST_PATTERNS = (
     re.compile(r"Summary:\s+\d+ files?,\s+(\d+) tests? passed,\s+(\d+) failed"),
@@ -300,6 +308,194 @@ def _python_venv_context(spec: dict[str, Any], repo_root: Path) -> dict[str, str
     return context
 
 
+def _dependency_identity(
+    config: dict[str, Any], repo_root: Path
+) -> dict[str, Any]:
+    """Fingerprint the lock policy and resolved Python distribution environment."""
+    policy = config.get("dependency_identity")
+    if not isinstance(policy, dict) or set(policy) != {
+        "python",
+        "requirements_lock",
+    }:
+        raise ContinuityError("dependency identity policy is absent or malformed")
+    python_token = policy.get("python")
+    requirements_token = policy.get("requirements_lock")
+    if not isinstance(python_token, str) or not python_token:
+        raise ContinuityError("dependency identity Python is invalid")
+    if not isinstance(requirements_token, str) or not requirements_token:
+        raise ContinuityError("dependency identity requirements lock is invalid")
+
+    python_path = Path(python_token)
+    if not python_path.is_absolute():
+        python_path = (repo_root / python_path).absolute()
+    requirements_path = (repo_root / requirements_token).resolve()
+    if not requirements_path.is_relative_to(repo_root) or not requirements_path.is_file():
+        raise ContinuityError("dependency identity requirements lock is missing")
+    if not python_path.exists():
+        raise ContinuityError("dependency identity Python is missing")
+    resolved_python = python_path.resolve()
+    launcher_material = str(python_path)
+    if python_path.is_symlink():
+        launcher_material += "\0" + os.readlink(python_path)
+    launcher_material += "\0" + sha256_file(resolved_python)
+    try:
+        requirements_text = requirements_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContinuityError("dependency identity requirements lock is unreadable") from exc
+    logical_requirements = requirements_text.replace("\\\n", " ")
+    locked: dict[str, str] = {}
+    requirement_pattern = re.compile(
+        r"^([A-Za-z0-9_.-]+)==([^\s;]+).*--hash=sha256:[0-9a-fA-F]{64}(?:\s|$)"
+    )
+    for raw_line in logical_requirements.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = requirement_pattern.match(line)
+        if match is None:
+            raise ContinuityError(
+                "dependency identity requirements must be exact and SHA-256 hashed"
+            )
+        name = match.group(1).lower().replace("_", "-")
+        if name in locked:
+            raise ContinuityError("dependency identity requirements are duplicated")
+        locked[name] = match.group(2)
+    if not locked:
+        raise ContinuityError("dependency identity requirements lock is empty")
+
+    probe = r'''
+import hashlib
+import importlib.metadata
+import json
+import sys
+
+records = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name") or ""
+    record = {
+        "name": name.lower().replace("_", "-") if name else "unknown",
+        "version": distribution.version,
+    }
+    for metadata_name in ("METADATA", "RECORD", "direct_url.json"):
+        value = distribution.read_text(metadata_name)
+        record[metadata_name] = hashlib.sha256(
+            (value or "").encode("utf-8")
+        ).hexdigest()
+    records.append(record)
+records.sort(key=lambda item: (item["name"], item["version"], item["METADATA"]))
+print(json.dumps({"python_version": sys.version, "packages": records}, separators=(",", ":")))
+'''
+    result = run_command(
+        [str(python_path), "-I", "-c", probe],
+        cwd=repo_root,
+        timeout=60,
+        env=minimal_child_env({"HOME": str(config["state_root"])}),
+    )
+    if result.returncode != 0:
+        raise ContinuityError("dependency identity probe failed")
+    try:
+        resolved = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContinuityError("dependency identity probe returned invalid JSON") from exc
+    packages = resolved.get("packages") if isinstance(resolved, dict) else None
+    version = resolved.get("python_version") if isinstance(resolved, dict) else None
+    if not isinstance(packages, list) or not packages or not isinstance(version, str):
+        raise ContinuityError("dependency identity probe returned invalid data")
+    installed = {
+        item.get("name"): item.get("version")
+        for item in packages
+        if isinstance(item, dict)
+    }
+    mismatched = sorted(
+        name for name, wanted in locked.items() if installed.get(name) != wanted
+    )
+    if mismatched:
+        raise ContinuityError(
+            "resolved dependency environment does not match requirements lock: "
+            + ", ".join(mismatched)
+        )
+    packages_json = json.dumps(packages, sort_keys=True, separators=(",", ":"))
+    return {
+        "schema_version": 1,
+        "requirements_sha256": sha256_file(requirements_path),
+        "python_launcher_sha256": hashlib.sha256(
+            launcher_material.encode("utf-8")
+        ).hexdigest(),
+        "python_executable_sha256": sha256_file(resolved_python),
+        "python_version": version,
+        "packages_sha256": hashlib.sha256(packages_json.encode("utf-8")).hexdigest(),
+        "package_count": len(packages),
+    }
+
+
+def _native_observation_errors(
+    config: dict[str, Any], receipt: dict[str, Any], current: Any
+) -> list[str]:
+    if receipt.get("lifecycle_target") != "ENFORCED":
+        return []
+    policy = config.get("native_observation_policy")
+    if not isinstance(policy, dict) or set(policy) != {
+        "required_surfaces",
+        "max_age_seconds",
+    }:
+        return ["native observation policy is absent or malformed"]
+    required = policy.get("required_surfaces")
+    max_age = policy.get("max_age_seconds")
+    if (
+        not isinstance(required, list)
+        or not required
+        or not all(isinstance(item, str) and item for item in required)
+        or len(set(required)) != len(required)
+        or not isinstance(max_age, int)
+        or max_age < 1
+        or max_age > 3600
+    ):
+        return ["native observation policy is invalid"]
+    errors: list[str] = []
+    observations: dict[str, dict[str, Any]] = {}
+    for check in receipt.get("runtime_checks") or []:
+        observation = check.get("native_observation") if isinstance(check, dict) else None
+        if isinstance(observation, dict) and isinstance(
+            observation.get("surface"), str
+        ):
+            surface = observation["surface"]
+            if surface in observations:
+                errors.append(f"native observation is duplicated for surface: {surface}")
+            observations[surface] = observation
+    repo_root = Path(current.root).resolve()
+    for surface in required:
+        observation = observations.get(surface)
+        if observation is None:
+            errors.append(f"native observation is missing for surface: {surface}")
+            continue
+        if observation.get("commit") != current.commit:
+            errors.append(f"native observation commit is stale for surface: {surface}")
+        adapter_path = observation.get("adapter_path")
+        if not isinstance(adapter_path, str):
+            errors.append(f"native observation adapter is invalid for surface: {surface}")
+        else:
+            resolved_adapter = (repo_root / adapter_path).resolve()
+            if (
+                not resolved_adapter.is_relative_to(repo_root)
+                or not resolved_adapter.is_file()
+                or observation.get("adapter_sha256")
+                != sha256_file(resolved_adapter)
+            ):
+                errors.append(
+                    f"native observation adapter digest is stale for surface: {surface}"
+                )
+        try:
+            observed_at = datetime.fromisoformat(str(observation.get("observed_at")))
+            if observed_at.tzinfo is None:
+                raise ValueError("timestamp is not timezone-aware")
+            age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+            if age < -60 or age > max_age:
+                errors.append(f"native observation is stale for surface: {surface}")
+        except (TypeError, ValueError):
+            errors.append(f"native observation timestamp is invalid for surface: {surface}")
+    return errors
+
+
 def _test_summary(output: str) -> tuple[int, int, int]:
     for pattern in TEST_PATTERNS:
         match = pattern.search(output)
@@ -341,6 +537,18 @@ def _execute_evidence(
         }
         if spec.get("surface") not in allowed_surfaces:
             raise ContinuityError("runtime evidence surface is not allowlisted")
+        native = spec.get("native")
+        if native is not True:
+            raise ContinuityError("runtime evidence must be a native observation")
+        if not isinstance(spec.get("event"), str) or not spec["event"]:
+            raise ContinuityError("native runtime evidence event is invalid")
+        adapter_token = spec.get("adapter_path")
+        if not isinstance(adapter_token, str) or not adapter_token:
+            raise ContinuityError("native runtime evidence adapter is invalid")
+        adapter_path = (repo_root / adapter_token).resolve()
+        if not adapter_path.is_relative_to(repo_root) or not adapter_path.is_file():
+            raise ContinuityError("native runtime evidence adapter is missing")
+        adapter_digest = sha256_file(adapter_path)
     if kind == "rollback" and spec.get("mode") != "dry-run":
         raise ContinuityError("receipt rollback evidence must use dry-run mode")
     timeout = float(spec.get("timeout_seconds", 900))
@@ -395,6 +603,16 @@ def _execute_evidence(
         record.update({
             "surface": spec.get("surface"),
             "passed": result.returncode == 0,
+            "native_observation": {
+                "surface": spec.get("surface"),
+                "event": spec.get("event"),
+                "commit": git_state(
+                    repo_root, integration_ref=config.get("integration_ref")
+                ).commit,
+                "adapter_path": spec.get("adapter_path"),
+                "adapter_sha256": adapter_digest,
+                "observed_at": completed.isoformat(),
+            },
         })
     else:
         record.update({
@@ -468,6 +686,7 @@ def create_receipt(
         details = "; ".join(str(item) for item in authority_check.get("errors", []))
         suffix = f": {details}" if details else ""
         raise ContinuityError(f"strict authority check failed{suffix}")
+    dependency_identity = _dependency_identity(config, repo_root)
     signing_key = receipt_signing_key(config)
     evidence_home = Path(config["state_root"]) / "evidence-home"
     evidence_home.mkdir(parents=True, exist_ok=True)
@@ -482,6 +701,7 @@ def create_receipt(
         "git": state.as_dict(),
         "authority_check": authority_check,
         "external_inputs": external_input_digests(config, repo_root),
+        "dependency_identity": dependency_identity,
         "commands": [
             _execute_evidence(
                 spec,
@@ -517,6 +737,8 @@ def create_receipt(
     }
     if receipt["external_inputs"] != external_input_digests(config, repo_root):
         raise ContinuityError("external inputs changed during evidence execution")
+    if receipt["dependency_identity"] != _dependency_identity(config, repo_root):
+        raise ContinuityError("resolved dependency identity changed during evidence")
     final_state = git_state(
         cwd.resolve(), integration_ref=config.get("integration_ref")
     )
@@ -525,7 +747,9 @@ def create_receipt(
         "key_id": "pending",
         "digest": "0" * 64,
     }
-    receipt["result"] = "PASS" if not receipt_errors(receipt, final_state) else "FAIL"
+    validation_errors = receipt_errors(receipt, final_state)
+    validation_errors.extend(_native_observation_errors(config, receipt, final_state))
+    receipt["result"] = "PASS" if not validation_errors else "FAIL"
     receipt["auth"] = sign_receipt(config, receipt, key=signing_key)
     return receipt
 
@@ -554,6 +778,13 @@ def verify_receipt(
             errors.append("external instruction or executable identity is stale")
     except ContinuityError as exc:
         errors.append(str(exc))
+    try:
+        if receipt.get("dependency_identity") != _dependency_identity(
+            config, repo_root
+        ):
+            errors.append("resolved dependency identity is stale")
+    except ContinuityError as exc:
+        errors.append(str(exc))
     authority = strict_authority_check(
         config_path,
         cwd=cwd,
@@ -565,6 +796,7 @@ def verify_receipt(
         errors.append("current strict authority check failed")
         errors.extend(authority.get("errors") or [])
     errors.extend(receipt_errors(receipt, current))
+    errors.extend(_native_observation_errors(config, receipt, current))
     if receipt.get("result") != "PASS":
         errors.append("receipt result is not PASS")
     return errors
@@ -842,6 +1074,51 @@ def static_validate(config_path: Path) -> list[str]:
             errors.append(f"config missing {key}")
     if config.get("risk_tier") != "T3":
         errors.append("continuity pilot risk_tier must remain T3")
+    native_policy = config.get("native_observation_policy")
+    if not isinstance(native_policy, dict) or set(native_policy) != {
+        "required_surfaces",
+        "max_age_seconds",
+    }:
+        errors.append("native observation policy has an invalid closed schema")
+        required_native_surfaces: set[str] = set()
+    else:
+        surfaces = native_policy.get("required_surfaces")
+        max_age = native_policy.get("max_age_seconds")
+        if (
+            not isinstance(surfaces, list)
+            or not surfaces
+            or not all(isinstance(item, str) and item for item in surfaces)
+            or len(set(surfaces)) != len(surfaces)
+            or not isinstance(max_age, int)
+            or max_age < 1
+            or max_age > 3600
+        ):
+            errors.append("native observation policy is invalid")
+            required_native_surfaces = set()
+        else:
+            required_native_surfaces = set(surfaces)
+    dependency_policy = config.get("dependency_identity")
+    if not isinstance(dependency_policy, dict) or set(dependency_policy) != {
+        "python",
+        "requirements_lock",
+    }:
+        errors.append("dependency identity policy has an invalid closed schema")
+    else:
+        requirements = dependency_policy.get("requirements_lock")
+        requirements_path = (
+            (repo_root / requirements).resolve()
+            if isinstance(requirements, str)
+            else repo_root.parent
+        )
+        if (
+            not requirements_path.is_relative_to(repo_root)
+            or not requirements_path.is_file()
+        ):
+            errors.append("dependency identity requirements lock is missing")
+        if not isinstance(dependency_policy.get("python"), str) or not dependency_policy[
+            "python"
+        ]:
+            errors.append("dependency identity Python is invalid")
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
             errors.append(f"instruction missing: {relative}")
@@ -873,6 +1150,33 @@ def static_validate(config_path: Path) -> list[str]:
                 _validate_closed_spec(value, allowed, f"evidence_policy {label}")
             except ContinuityError as exc:
                 errors.append(str(exc))
+        native_runtime_surfaces: set[str] = set()
+        for runtime in policy["runtime_checks"]:
+            if not isinstance(runtime, dict):
+                continue
+            surface = runtime.get("surface")
+            adapter_token = runtime.get("adapter_path")
+            if (
+                runtime.get("native") is not True
+                or not isinstance(surface, str)
+                or not surface
+                or not isinstance(runtime.get("event"), str)
+                or not runtime["event"]
+                or not isinstance(adapter_token, str)
+                or not adapter_token
+            ):
+                errors.append("runtime check is not a valid native observation")
+                continue
+            adapter_path = (repo_root / adapter_token).resolve()
+            if not adapter_path.is_relative_to(repo_root) or not adapter_path.is_file():
+                errors.append(f"native observation adapter is missing: {surface}")
+            native_runtime_surfaces.add(surface)
+        if native_runtime_surfaces != required_native_surfaces:
+            errors.append(
+                "native observation runtime surfaces do not match required surfaces"
+            )
+        if len(native_runtime_surfaces) != len(policy["runtime_checks"]):
+            errors.append("native observation runtime surfaces are duplicated")
         try:
             policy_entrypoints = {
                 str(spec["argv"][0]) for spec in _policy_evidence_specs(policy)

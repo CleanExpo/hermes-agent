@@ -8,6 +8,7 @@ import hmac
 import os
 import platform
 import secrets
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -312,6 +313,44 @@ def receipt_signature_errors(
     return errors
 
 
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Boundedly terminate a command and every descendant it spawned."""
+    if os.name == "posix":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                process.communicate(timeout=0.75)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+    elif os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.communicate(timeout=0.75)
+    except subprocess.TimeoutExpired:
+        # A process that survives the platform's hard-kill primitive is no
+        # longer safe to wait for. The caller still fails closed.
+        pass
+
+
 def run_command(
     args: list[str],
     *,
@@ -319,18 +358,40 @@ def run_command(
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    popen_options: dict[str, Any] = {}
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif os.name == "nt":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             args,
             cwd=cwd,
             env=env,
             text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **popen_options,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ContinuityError(f"command failed or timed out: {args[0]}: {exc}") from exc
+    except OSError as exc:
+        raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        raise ContinuityError(
+            f"command timed out after {timeout:g}s: {args[0]}"
+        ) from exc
+    except BaseException:
+        _terminate_process_tree(process)
+        raise
+    return subprocess.CompletedProcess(
+        args=args,
+        returncode=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def git_state(
@@ -440,6 +501,7 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
         "git",
         "authority_check",
         "external_inputs",
+        "dependency_identity",
         "commands",
         "runtime_checks",
         "rollback",
@@ -457,6 +519,29 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
     external_inputs = receipt.get("external_inputs")
     if not isinstance(external_inputs, dict) or not external_inputs:
         errors.append("receipt has no external input digests")
+    dependency_identity = receipt.get("dependency_identity")
+    dependency_keys = {
+        "schema_version",
+        "requirements_sha256",
+        "python_launcher_sha256",
+        "python_executable_sha256",
+        "python_version",
+        "packages_sha256",
+        "package_count",
+    }
+    if (
+        not isinstance(dependency_identity, dict)
+        or set(dependency_identity) != dependency_keys
+        or dependency_identity.get("schema_version") != 1
+        or not isinstance(dependency_identity.get("package_count"), int)
+        or dependency_identity.get("package_count", 0) < 1
+        or any(
+            not isinstance(dependency_identity.get(key), str)
+            or not dependency_identity[key]
+            for key in dependency_keys - {"schema_version", "package_count"}
+        )
+    ):
+        errors.append("receipt dependency identity is absent or malformed")
     target = receipt.get("lifecycle_target")
     if target not in {"TESTED", "ENFORCED"}:
         errors.append(f"invalid lifecycle target: {target!r}")
@@ -554,12 +639,34 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
                 "output_sha256",
                 "surface",
                 "passed",
+                "native_observation",
             }
             unknown = sorted(set(check) - allowed_runtime)
             if unknown:
                 errors.append(
                     f"runtime check contains unknown keys ({check.get('name', 'unnamed')}): "
                     + ", ".join(unknown)
+                )
+            observation = check.get("native_observation")
+            observation_keys = {
+                "surface",
+                "event",
+                "commit",
+                "adapter_path",
+                "adapter_sha256",
+                "observed_at",
+            }
+            if (
+                not isinstance(observation, dict)
+                or set(observation) != observation_keys
+                or any(
+                    not isinstance(observation.get(key), str)
+                    or not observation[key]
+                    for key in observation_keys
+                )
+            ):
+                errors.append(
+                    f"runtime native observation is malformed: {check.get('name', 'unnamed')}"
                 )
         if (
             not isinstance(check, dict)
