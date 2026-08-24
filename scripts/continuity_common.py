@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import secrets
+import signal
 import subprocess
 import tempfile
 import time
@@ -345,16 +346,25 @@ def receipt_signature_errors(
     return errors
 
 
-def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+def _terminate_process_tree(
+    process: subprocess.Popen[str], *, process_group: int | None = None
+) -> None:
     """Boundedly terminate a command and its snapshotted descendants.
 
     ``psutil.Process`` retains the process identity (PID plus creation time),
     so the escalation pass cannot accidentally target a recycled PID.  Walk
     children before the parent to prevent a live parent from replacing exited
     descendants while cleanup is in progress.  This is the repository's
-    cross-platform process-tree primitive; it avoids both POSIX-only
-    ``killpg`` and the unbounded pipe behaviour of spawning ``taskkill``.
+    cross-platform process-tree primitive.  A retained POSIX group identity
+    additionally covers descendants after their leader exits; Windows callers
+    use a kill-on-close Job Object established before the child is resumed.
     """
+    if process_group is not None and os.name == "posix":
+        try:
+            os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok -- POSIX gate
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
     try:
         parent = psutil.Process(process.pid)
         descendants = parent.children(recursive=True)
@@ -407,6 +417,13 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
             process.kill()
         except (ProcessLookupError, PermissionError, OSError):
             pass
+    if process_group is not None and os.name == "posix":
+        try:
+            os.killpg(  # windows-footgun: ok -- POSIX gate
+                process_group, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
         process.communicate(timeout=0.75)
     except subprocess.TimeoutExpired:
@@ -415,13 +432,169 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def _isolated_process_options() -> dict[str, Any]:
+def _isolated_process_options(*, suspended: bool = False) -> dict[str, Any]:
     """Return host-native options that isolate a spawned command."""
     if os.name == "posix":
         return {"start_new_session": True}
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if suspended:
+            flags |= 0x00000004  # CREATE_SUSPENDED
+        return {"creationflags": flags}
     return {}
+
+
+def _create_windows_kill_job(process: subprocess.Popen[str]) -> int:
+    """Contain a suspended Windows child in a kill-on-close Job Object."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = wintypes.LONG
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "read_operations",
+                "write_operations",
+                "other_operations",
+                "read_bytes",
+                "write_bytes",
+                "other_bytes",
+            )
+        ]
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("per_process_time", ctypes.c_longlong),
+            ("per_job_time", ctypes.c_longlong),
+            ("limit_flags", wintypes.DWORD),
+            ("minimum_working_set", ctypes.c_size_t),
+            ("maximum_working_set", ctypes.c_size_t),
+            ("active_process_limit", wintypes.DWORD),
+            ("affinity", ctypes.c_size_t),
+            ("priority_class", wintypes.DWORD),
+            ("scheduling_class", wintypes.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("basic", BasicLimits),
+            ("io", IoCounters),
+            ("process_memory", ctypes.c_size_t),
+            ("job_memory", ctypes.c_size_t),
+            ("peak_process_memory", ctypes.c_size_t),
+            ("peak_job_memory", ctypes.c_size_t),
+        ]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    try:
+        limits = ExtendedLimits()
+        limits.basic.limit_flags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        process_handle = wintypes.HANDLE(int(process._handle))
+        if not kernel32.AssignProcessToJobObject(job, process_handle):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        status = ntdll.NtResumeProcess(process_handle)
+        if status != 0:
+            raise OSError(int(status), "NtResumeProcess failed")
+        return int(job)
+    except BaseException:
+        kernel32.CloseHandle(job)
+        raise
+
+
+def _close_windows_job(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise OSError(ctypes.get_last_error(), "CloseHandle failed for process job")
+
+
+@dataclass
+class _ContainedProcess:
+    process: subprocess.Popen[str]
+    process_group: int | None = None
+    windows_job: int | None = None
+    terminated: bool = False
+
+    def terminate_tree(self) -> None:
+        if self.terminated:
+            return
+        self.terminated = True
+        job_error: OSError | None = None
+        if self.windows_job is not None:
+            try:
+                _close_windows_job(self.windows_job)
+            except OSError as exc:
+                job_error = exc
+            self.windows_job = None
+        _terminate_process_tree(self.process, process_group=self.process_group)
+        if job_error is not None:
+            raise ContinuityError(
+                f"Windows process containment could not be released: {job_error}"
+            ) from job_error
+
+
+def _spawn_contained_process(
+    args: list[str], *, popen_factory: Any | None = None, **kwargs: Any
+) -> _ContainedProcess:
+    """Spawn only after durable platform containment can be established."""
+    suspended = os.name == "nt"
+    factory = popen_factory or subprocess.Popen
+    try:
+        process = factory(
+            args,
+            **kwargs,
+            **_isolated_process_options(suspended=suspended),
+        )
+    except OSError as exc:
+        raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
+    if os.name == "nt":
+        try:
+            job = _create_windows_kill_job(process)
+        except BaseException as exc:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=0.75)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            raise ContinuityError(
+                f"command containment failed before start: {args[0]}: {exc}"
+            ) from exc
+        return _ContainedProcess(process=process, windows_job=job)
+    return _ContainedProcess(
+        process=process,
+        process_group=process.pid if os.name == "posix" else None,
+    )
 
 
 def run_command(
@@ -431,29 +604,26 @@ def run_command(
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    try:
-        process = subprocess.Popen(
-            args,
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **_isolated_process_options(),
-        )
-    except OSError as exc:
-        raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
-
+    contained = _spawn_contained_process(
+        args,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process = contained.process
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        _terminate_process_tree(process)
+        contained.terminate_tree()
         raise ContinuityError(
             f"command timed out after {timeout:g}s: {args[0]}"
         ) from exc
     except BaseException:
-        _terminate_process_tree(process)
+        contained.terminate_tree()
         raise
+    contained.terminate_tree()
     return subprocess.CompletedProcess(
         args=args,
         returncode=process.returncode,

@@ -155,6 +155,41 @@ def _native_observer_spawn_race_worker(
     )
 
 
+def _assert_native_observer_reaps_after_root_exit(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "root-exit-child-pid.txt"
+    sentinel = tmp_path / "root-exit-child-survived.txt"
+    host = tmp_path / "root-exit-native-host.py"
+    grandchild = (
+        "import pathlib,sys,time; "
+        "time.sleep(1.0); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    host.write_text(
+        "import pathlib,subprocess,sys\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[2]], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ContinuityError, match="native host exited or timed out before evidence"
+    ):
+        continuity_native_observation._run_host_until_native_event(
+            [sys.executable, str(host), str(child_pid_path), str(sentinel)],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            checkpoint=(tmp_path / "events.jsonl", 0, None),
+            surface="claude",
+            output_dir=tmp_path,
+            timeout=5,
+        )
+
+    assert child_pid_path.exists()
+    time.sleep(1.2)
+    assert not sentinel.exists()
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=repo, text=True, capture_output=True, check=False
@@ -1957,6 +1992,18 @@ def test_windows_timed_out_evidence_reaps_delayed_grandchild(
     assert not sentinel.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_native_observer_reaps_descendant_after_root_exits(tmp_path: Path) -> None:
+    _assert_native_observer_reaps_after_root_exit(tmp_path)
+
+
+@pytest.mark.windows_only
+def test_windows_native_observer_job_reaps_descendant_after_root_exits(
+    tmp_path: Path,
+) -> None:
+    _assert_native_observer_reaps_after_root_exit(tmp_path)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signal-delivery semantics")
 def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     ready = tmp_path / "interrupt-ready.txt"
@@ -2332,9 +2379,12 @@ def test_privacy_canary_oracle_detects_mutated_adapter_write(
     sentinel = "MUTATION-CONTROL-CANARY-51af"
     real_append = continuity_event._append_redacted_event
 
-    def leaky_append(path: Path, event: dict) -> None:
-        real_append(path, event)
-        (path.parent / "mutated-debug.log").write_text(sentinel, encoding="utf-8")
+    def leaky_append(config: dict, event: dict) -> None:
+        real_append(config, event)
+        event_path = Path(config["event_log"])
+        (event_path.parent / "mutated-debug.log").write_text(
+            sentinel, encoding="utf-8"
+        )
 
     monkeypatch.setattr(continuity_event, "_append_redacted_event", leaky_append)
     continuity_event.dispatch(
@@ -2357,7 +2407,9 @@ def test_unmounted_volume_causes_no_state_writes(
         raise AssertionError("state write attempted while volume unavailable")
 
     monkeypatch.setattr(continuity_event, "external_volume_available", lambda _p: False)
-    monkeypatch.setattr(continuity_event, "atomic_write_json", forbidden_write)
+    monkeypatch.setattr(
+        continuity_event, "_atomic_write_confined_json", forbidden_write
+    )
     monkeypatch.setattr(continuity_event, "_append_redacted_event", forbidden_write)
     dispatch(
         "pre_llm_call",
@@ -2392,6 +2444,111 @@ def test_unmounted_volume_causes_no_state_writes(
             target="TESTED",
         )
     assert not (pilot["state"] / "promotion.lock").exists()
+
+
+def test_event_append_rechecks_storage_after_preflight(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checks = iter((True, False))
+    monkeypatch.chdir(pilot["repo"])
+    monkeypatch.setattr(
+        continuity_event,
+        "external_volume_available",
+        lambda _path: next(checks),
+    )
+
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        dispatch("session_start", "codex", pilot["config"], {})
+
+    assert not pilot["events"].exists()
+
+
+def test_adjacency_write_rechecks_storage_after_preflight(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checks = iter((True, True, False))
+    monkeypatch.chdir(pilot["repo"])
+    monkeypatch.setattr(
+        continuity_event,
+        "external_volume_available",
+        lambda _path: next(checks),
+    )
+
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        dispatch(
+            "pre_llm_call",
+            "hermes",
+            pilot["config"],
+            {
+                "session_id": "adjacency-race",
+                "extra": {"turn_id": "turn-race", "conversation_history": []},
+            },
+        )
+
+    assert not (pilot["state"] / "adjacency").exists()
+
+
+def test_event_append_rejects_existing_shadow_volume(
+    pilot: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shadow_volume = tmp_path / "shadow-volume"
+    shadow_state = shadow_volume / "state"
+    shadow_events = shadow_state / "events"
+    shadow_events.mkdir(parents=True)
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config.update({
+        "external_volume": str(shadow_volume),
+        "state_root": str(shadow_state),
+        "event_log": str(shadow_events / "events.jsonl"),
+    })
+    atomic_write_json(pilot["config"], config)
+    real_available = continuity_event.external_volume_available
+    calls = 0
+
+    def stale_then_live(path: Path) -> bool:
+        nonlocal calls
+        calls += 1
+        return True if calls == 1 else real_available(path)
+
+    monkeypatch.setattr(
+        continuity_event, "external_volume_available", stale_then_live
+    )
+
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        dispatch("post_tool_call", "hermes", pilot["config"], {})
+
+    assert not (shadow_events / "events.jsonl").exists()
+
+
+def test_event_append_rejects_log_outside_state_root(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    escaped_parent = tmp_path / "escaped"
+    escaped_parent.mkdir()
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["event_log"] = str(escaped_parent / "events.jsonl")
+    atomic_write_json(pilot["config"], config)
+
+    with pytest.raises(
+        ContinuityError, match="continuity event path escapes pilot state root"
+    ):
+        dispatch("post_tool_call", "hermes", pilot["config"], {})
+
+    assert not (escaped_parent / "events.jsonl").exists()
+
+
+def test_event_append_never_recreates_missing_parent(
+    pilot: dict[str, Path],
+) -> None:
+    missing_parent = pilot["state"] / "missing" / "events"
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["event_log"] = str(missing_parent / "events.jsonl")
+    atomic_write_json(pilot["config"], config)
+
+    with pytest.raises(ContinuityError, match="event storage is unavailable"):
+        dispatch("post_tool_call", "hermes", pilot["config"], {})
+
+    assert not missing_parent.exists()
 
 
 def test_committed_adapters_match_single_contract() -> None:

@@ -18,8 +18,7 @@ import yaml
 
 from continuity_common import (
     ContinuityError,
-    _isolated_process_options,
-    _terminate_process_tree,
+    _spawn_contained_process,
     load_json,
     minimal_child_env,
     run_command,
@@ -148,7 +147,7 @@ def _run_host_until_native_event(
         handled_signals = (signal.SIGTERM, signal.SIGINT)
         prior_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
         lifecycle: dict[str, object] = {
-            "process": None,
+            "contained": None,
             "pending_signal": None,
             "terminating": False,
         }
@@ -156,12 +155,12 @@ def _run_host_until_native_event(
         def terminate_nested_host(signum: int, _frame: object) -> None:
             if lifecycle["terminating"]:
                 return
-            process = lifecycle["process"]
-            if process is None:
+            contained = lifecycle["contained"]
+            if contained is None:
                 lifecycle["pending_signal"] = signum
                 return
             lifecycle["terminating"] = True
-            _terminate_process_tree(process)
+            contained.terminate_tree()
             raise SystemExit(128 + signum)
 
         prior_mask: set[signal.Signals] | None = None
@@ -171,17 +170,18 @@ def _run_host_until_native_event(
             signal.signal(sig, terminate_nested_host)
         mask_is_blocked = prior_mask is not None
         try:
-            process = subprocess.Popen(
+            contained = _spawn_contained_process(
                 command,
+                popen_factory=subprocess.Popen,
                 cwd=str(cwd),
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 text=True,
-                **_isolated_process_options(),
             )
-            lifecycle["process"] = process
+            lifecycle["contained"] = contained
+            process = contained.process
             if prior_mask is not None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
                 mask_is_blocked = False
@@ -201,12 +201,12 @@ def _run_host_until_native_event(
                 except ContinuityError as exc:
                     last_error = exc
                 else:
-                    _terminate_process_tree(process)
+                    contained.terminate_tree()
                     return output
                 if process.poll() is not None:
                     break
                 time.sleep(0.1)
-            _terminate_process_tree(process)
+            contained.terminate_tree()
             stdout_handle.flush()
             stderr_handle.flush()
         finally:

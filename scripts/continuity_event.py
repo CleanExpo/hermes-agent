@@ -9,9 +9,10 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from continuity_bridge import (
     build_preflight,
@@ -20,7 +21,6 @@ from continuity_bridge import (
 )
 from continuity_common import (
     ContinuityError,
-    atomic_write_json,
     compact_json,
     external_volume_available,
     load_json,
@@ -81,7 +81,8 @@ def _write_adjacency_guard(
 ) -> None:
     if session is None or turn is None:
         return
-    atomic_write_json(
+    _atomic_write_confined_json(
+        config,
         _adjacency_guard_path(config, session),
         {
             "schema_version": 1,
@@ -123,17 +124,200 @@ def _check_adjacency_guard(
     return errors
 
 
-def _append_redacted_event(path: Path, event: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+@contextmanager
+def _open_confined_parent(
+    config: dict[str, Any], path: Path, *, create_parent: bool = False
+) -> Iterator[tuple[int | None, Path | str]]:
+    """Anchor a confined target to its mounted state directory on POSIX."""
+    external_volume = Path(config["external_volume"])
+    if not external_volume_available(external_volume):
+        raise ContinuityError(f"external volume is not mounted: {external_volume}")
+    try:
+        mounted_root = external_volume.resolve(strict=True)
+        state_root = Path(config["state_root"]).resolve(strict=True)
+    except OSError as exc:
+        raise ContinuityError(f"continuity event storage is unavailable: {exc}") from exc
+    if not state_root.is_dir():
+        raise ContinuityError(f"pilot state root is unavailable: {state_root}")
+    if not state_root.is_relative_to(mounted_root):
+        raise ContinuityError(f"pilot state root escapes external volume: {state_root}")
+    if not path.is_absolute():
+        raise ContinuityError(f"continuity event path is not absolute: {path}")
+    normalized = Path(os.path.abspath(path))
+    try:
+        parent_parts = normalized.parent.relative_to(state_root).parts
+    except ValueError as exc:
+        raise ContinuityError(
+            f"continuity event path escapes pilot state root: {path}"
+        ) from exc
+
+    supports_dir_fd = os.open in os.supports_dir_fd
+    if not supports_dir_fd:
+        try:
+            parent = normalized.parent.resolve(strict=True)
+        except OSError as exc:
+            if not create_parent:
+                raise ContinuityError(
+                    f"continuity event storage is unavailable: {exc}"
+                ) from exc
+            try:
+                parent_parent = normalized.parent.parent.resolve(strict=True)
+            except OSError as parent_exc:
+                raise ContinuityError(
+                    f"continuity event storage is unavailable: {parent_exc}"
+                ) from parent_exc
+            if parent_parent != state_root:
+                raise ContinuityError(
+                    f"continuity event path escapes pilot state root: {path}"
+                ) from exc
+            if not external_volume_available(external_volume):
+                raise ContinuityError(
+                    f"external volume is not mounted: {external_volume}"
+                )
+            normalized.parent.mkdir(mode=0o700, exist_ok=True)
+            parent = normalized.parent.resolve(strict=True)
+        if not parent.is_relative_to(state_root):
+            raise ContinuityError(
+                f"continuity event path escapes pilot state root: {path}"
+            )
+        if normalized.exists():
+            try:
+                resolved_target = normalized.resolve(strict=True)
+            except OSError as exc:
+                raise ContinuityError(
+                    f"continuity event path is unavailable: {exc}"
+                ) from exc
+            if not resolved_target.is_relative_to(state_root):
+                raise ContinuityError(
+                    f"continuity event path escapes pilot state root: {path}"
+                )
+        if not external_volume_available(external_volume):
+            raise ContinuityError(f"external volume is not mounted: {external_volume}")
+        yield None, normalized
+        return
+
+    try:
+        parent_fd = os.open(state_root, _directory_open_flags())
+    except OSError as exc:
+        raise ContinuityError(f"cannot open pilot state root: {exc}") from exc
+    try:
+        if not external_volume_available(external_volume):
+            raise ContinuityError(
+                f"external volume is not mounted: {external_volume}"
+            )
+        for index, part in enumerate(parent_parts):
+            if create_parent and index == len(parent_parts) - 1:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+            try:
+                next_fd = os.open(part, _directory_open_flags(), dir_fd=parent_fd)
+            except OSError as exc:
+                raise ContinuityError(
+                    f"continuity event storage is unavailable: {exc}"
+                ) from exc
+            os.close(parent_fd)
+            parent_fd = next_fd
+        yield parent_fd, normalized.name
+    finally:
+        os.close(parent_fd)
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    written = 0
+    while written < len(data):
+        count = os.write(descriptor, data[written:])
+        if count == 0:
+            raise OSError("event write made no progress")
+        written += count
+
+
+def _atomic_write_confined_json(
+    config: dict[str, Any], path: Path, value: dict[str, Any]
+) -> None:
+    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    with _open_confined_parent(config, path, create_parent=True) as (
+        parent_fd,
+        target,
+    ):
+        if parent_fd is None:
+            temporary = Path(f"{target}.{os.getpid()}.{time.time_ns()}.tmp")
+            try:
+                descriptor = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                try:
+                    _write_all(descriptor, data)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.replace(temporary, target)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+            return
+        temporary_name = f".{target}.{os.getpid()}.{time.time_ns()}.tmp"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_all(descriptor, data)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(
+                temporary_name,
+                target,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except BaseException:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        os.fsync(parent_fd)
+
+
+def _append_redacted_event(config: dict[str, Any], event: dict[str, Any]) -> None:
+    path = Path(config["event_log"])
     data = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.write(descriptor, data)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    with _open_confined_parent(config, path) as (parent_fd, target):
+        flags = (
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = (
+                os.open(target, flags, 0o600)
+                if parent_fd is None
+                else os.open(target, flags, 0o600, dir_fd=parent_fd)
+            )
+        except OSError as exc:
+            raise ContinuityError(f"cannot open continuity event log: {exc}") from exc
+        try:
+            _write_all(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _model_safe_preflight(preflight: dict[str, Any]) -> dict[str, Any]:
@@ -274,7 +458,7 @@ def dispatch(
         "elapsed_ms": round((time.monotonic() - started) * 1000),
     }
     if storage_available:
-        _append_redacted_event(Path(config["event_log"]), audit)
+        _append_redacted_event(config, audit)
     return result
 
 
