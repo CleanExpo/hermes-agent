@@ -201,6 +201,7 @@ def _run_host_until_native_event(
             contained = _spawn_contained_process(
                 command,
                 popen_factory=subprocess.Popen,
+                require_native_containment=True,
                 cwd=str(cwd),
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -430,6 +431,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
             timeout=120,
             env=env,
             required_mount=(config["external_volume"], config["state_root"]),
+            require_native_containment=True,
         )
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode != 0:

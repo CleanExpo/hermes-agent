@@ -46,6 +46,23 @@ pilot does not alter `~/.hermes`, `~/.claude`, or `~/.codex`.
 
 ## Operator commands
 
+### Native-containment platform boundary
+
+Routine preflight, adapter, and static-contract commands remain available on the
+designated macOS pilot host. Exact native host observation has a stronger boundary:
+the observer must be able to reap descendants even if a child creates a new session
+and clears its environment. Windows satisfies that contract with a kill-on-close Job
+Object and Linux uses a nested child subreaper with bounded adopted-generation
+cleanup.
+
+macOS has no equivalent supported unprivileged primitive. Process groups, process
+snapshots, environment family tokens, Seatbelt, and launchd jobs can all be escaped by
+a sufficiently fast `setsid` child. The observer therefore fails closed before
+launching Claude, Codex, or Hermes on macOS until an approved privileged helper exists.
+Consequently, `ENFORCED` promotion remains unavailable on the designated Mac rather
+than recording an observation whose cleanup guarantee cannot be proved. Ubuntu CI is
+still static evidence and is not a substitute for the missing exact-host observation.
+
 ```bash
 python3 scripts/continuity_bridge.py --config .continuity/config.json --cwd "$PWD"
 python3 scripts/install_continuity_adapters.py --repo-root "$PWD" --check
@@ -90,8 +107,10 @@ mode-`0600` pilot-local HMAC key loaded before evidence starts. `ENFORCED` uses 
 committed full-suite identity. Any commit, dirty-state change, integration-ref advance,
 executable-pin change, or external-input drift invalidates the receipt.
 
-Evidence commands run in their own process group. Timeout or interruption reaps the
-whole descendant tree with bounded TERM-to-KILL escalation. The authenticated receipt
+Evidence commands run in their own process group. Native observations additionally
+require a non-escapable host primitive: a Windows Job Object or Linux child subreaper.
+Timeout or interruption reaps the whole descendant tree with bounded TERM-to-KILL
+escalation. The authenticated receipt
 also fingerprints the exact hashed requirements lock, Python launcher and executable,
 and installed distribution metadata; a lock mismatch or later resolved-environment
 change fails verification. Native runtime records bind Claude, Codex, and Hermes

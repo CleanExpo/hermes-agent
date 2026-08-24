@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import hmac
+import json
 import os
 import platform
 import re
@@ -12,6 +12,7 @@ import secrets
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1064,6 +1065,133 @@ def _isolated_process_options(*, suspended: bool = False) -> dict[str, Any]:
     return {}
 
 
+_LINUX_SUBREAPER = r"""
+import ctypes, os, signal, subprocess, sys, time
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+    raise SystemExit(125)
+
+child = None
+terminating = False
+expected_parent_pid = int(sys.argv[1])
+
+def direct_children():
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            raw = open(f'/proc/{name}/stat', encoding='utf-8').read()
+            fields = raw[raw.rfind(')') + 2:].split()
+            if int(fields[1]) == os.getpid():
+                found.append(int(name))
+        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+            pass
+    return found
+
+def signal_children(signum):
+    for pid in direct_children():
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+
+def reap_exited():
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+def cleanup():
+    soft_deadline = time.monotonic() + 0.2
+    while time.monotonic() < soft_deadline:
+        signal_children(signal.SIGTERM)
+        reap_exited()
+        if not direct_children():
+            return
+        time.sleep(0.01)
+    # Killing one generation can cause its still-living descendants to be
+    # adopted by this subreaper.  Rescan after every reap until the complete
+    # adopted tree is gone, rather than assuming one kill pass is sufficient.
+    hard_deadline = time.monotonic() + 2.0
+    while time.monotonic() < hard_deadline:
+        signal_children(signal.SIGKILL)
+        reap_exited()
+        if not direct_children():
+            reap_exited()
+            if not direct_children():
+                return
+        time.sleep(0.01)
+    signal_children(signal.SIGKILL)
+    reap_exited()
+    if direct_children():
+        raise SystemExit(125)
+
+def terminate(signum, _frame):
+    global terminating
+    if terminating:
+        return
+    terminating = True
+    if child is not None and child.poll() is None:
+        try:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+            child.wait()
+    cleanup()
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGTERM, terminate)
+signal.signal(signal.SIGINT, terminate)
+# If the controlling Hermes process is killed, retain the wrapper long enough
+# to run its bounded adopted-descendant cleanup. Check for the standard race in
+# which the parent exits between recording its PID and arming PDEATHSIG.
+if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+    raise SystemExit(125)
+if os.getppid() != expected_parent_pid:
+    terminate(signal.SIGTERM, None)
+try:
+    child = subprocess.Popen(sys.argv[2:], env=os.environ.copy())
+except OSError:
+    raise SystemExit(126)
+returncode = child.wait()
+cleanup()
+raise SystemExit(returncode)
+"""
+
+
+def _native_posix_containment_command(args: list[str]) -> list[str]:
+    system = platform.system().lower()
+    if system == "darwin":
+        raise ContinuityError(
+            "native macOS descendant containment is unavailable without a "
+            "privileged helper"
+        )
+    if system == "linux" and Path("/proc").is_dir():
+        return [
+            sys.executable,
+            "-I",
+            "-c",
+            _LINUX_SUBREAPER,
+            str(os.getpid()),
+            *args,
+        ]
+    raise ContinuityError(
+        f"native descendant containment is unavailable on POSIX {system or 'unknown'}"
+    )
+
+
 def _create_windows_kill_job(process: subprocess.Popen[str]) -> int:
     """Contain a suspended Windows child in a kill-on-close Job Object."""
     import ctypes
@@ -1163,6 +1291,7 @@ class _ContainedProcess:
     process_group: int | None = None
     windows_job: int | None = None
     windows_directory_lease: ExitStack | None = None
+    linux_subreaper: bool = False
     terminated: bool = False
     tracked_descendants: dict[tuple[int, float], psutil.Process] = field(
         default_factory=dict
@@ -1189,25 +1318,36 @@ class _ContainedProcess:
                 return
 
     def snapshot_process_family(self) -> None:
-        for candidate in psutil.process_iter(["pid"]):
-            if candidate.pid in {os.getpid(), self.process.pid}:
+        if os.name != "posix":
+            return
+        ps_binary = Path("/bin/ps")
+        if not ps_binary.is_file():
+            return
+        scanner_env = dict(os.environ)
+        scanner_env.pop("CONTINUITY_PROCESS_FAMILY", None)
+        try:
+            listing = subprocess.run(
+                [str(ps_binary), "eww", "-axo", "pid=,command="],
+                capture_output=True,
+                check=False,
+                env=scanner_env,
+                text=True,
+                timeout=0.2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        needle = f"CONTINUITY_PROCESS_FAMILY={self.family_token}"
+        for line in listing.stdout.splitlines()[:512]:
+            if needle not in line:
                 continue
             try:
-                candidate_environment = candidate.environ()
-            except (
-                psutil.NoSuchProcess,
-                psutil.AccessDenied,
-                OSError,
-                PermissionError,
-                SystemError,
-            ):
+                pid = int(line.lstrip().split(None, 1)[0])
+            except (ValueError, IndexError):
                 continue
-            if (
-                candidate_environment.get("CONTINUITY_PROCESS_FAMILY")
-                != self.family_token
-            ):
+            if pid in {os.getpid(), self.process.pid}:
                 continue
             try:
+                candidate = psutil.Process(pid)
                 identity = (candidate.pid, candidate.create_time())
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 continue
@@ -1234,7 +1374,7 @@ class _ContainedProcess:
             self.monitor_thread.join(timeout=0.1)
             self.monitor_thread = None
         self.snapshot_descendants()
-        if os.name == "posix":
+        if os.name == "posix" and self.process_group is None:
             self.snapshot_process_family()
         with self.descendant_lock:
             return tuple(self.tracked_descendants.values())
@@ -1254,12 +1394,29 @@ class _ContainedProcess:
                 job_error = exc
             self.windows_job = None
         try:
-            _terminate_process_tree(
-                self.process,
-                process_group=self.process_group,
-                tracked_descendants=tracked_descendants,
-            )
-            if os.name == "posix":
+            if self.linux_subreaper:
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        # The wrapper reserves 0.2s for cooperative child exit
+                        # and 2.2s for iterative adopted-generation cleanup.
+                        # Leave scheduling margin before the last-resort kill.
+                        self.process.wait(timeout=3.5)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_tree(
+                            self.process,
+                            process_group=self.process_group,
+                            tracked_descendants=tracked_descendants,
+                        )
+                # A completed wrapper already reaped its adopted tree. Do not
+                # signal its released process-group number, which may be reused.
+            else:
+                _terminate_process_tree(
+                    self.process,
+                    process_group=self.process_group,
+                    tracked_descendants=tracked_descendants,
+                )
+            if os.name == "posix" and self.process_group is None:
                 self.snapshot_process_family()
                 with self.descendant_lock:
                     late_descendants = tuple(
@@ -1283,15 +1440,26 @@ class _ContainedProcess:
 
 
 def _spawn_contained_process(
-    args: list[str], *, popen_factory: Any | None = None, **kwargs: Any
+    args: list[str],
+    *,
+    popen_factory: Any | None = None,
+    require_native_containment: bool = False,
+    **kwargs: Any,
 ) -> _ContainedProcess:
-    """Spawn only after durable platform containment can be established."""
+    """Spawn with native containment when the caller requires that boundary."""
     suspended = os.name == "nt"
     factory = popen_factory or subprocess.Popen
     family_token = secrets.token_hex(16)
     requested_env = kwargs.get("env")
     spawn_env = dict(os.environ if requested_env is None else requested_env)
     spawn_env["CONTINUITY_PROCESS_FAMILY"] = family_token
+    spawn_args = args
+    process_options = _isolated_process_options(suspended=suspended)
+    linux_subreaper = False
+    if os.name == "posix":
+        if require_native_containment:
+            spawn_args = _native_posix_containment_command(args)
+            linux_subreaper = platform.system().lower() == "linux"
     kwargs["env"] = spawn_env
     directory_lease: ExitStack | None = None
     if os.name == "nt":
@@ -1317,9 +1485,9 @@ def _spawn_contained_process(
             raise
     try:
         process = factory(
-            args,
+            spawn_args,
             **kwargs,
-            **_isolated_process_options(suspended=suspended),
+            **process_options,
         )
     except BaseException as exc:
         if directory_lease is not None:
@@ -1356,6 +1524,7 @@ def _spawn_contained_process(
         process=process,
         family_token=family_token,
         process_group=process.pid if os.name == "posix" else None,
+        linux_subreaper=linux_subreaper,
     )
     contained.start_descendant_monitor()
     return contained
@@ -1368,6 +1537,7 @@ def run_command(
     timeout: float,
     env: dict[str, str] | None = None,
     required_mount: tuple[str | Path, str | Path] | None = None,
+    require_native_containment: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if required_mount is not None:
         validate_state_storage(*required_mount)
@@ -1378,6 +1548,7 @@ def run_command(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        require_native_containment=require_native_containment,
     )
     process = contained.process
     deadline = time.monotonic() + timeout

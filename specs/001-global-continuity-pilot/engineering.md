@@ -111,6 +111,16 @@ The synchronous diagnostic requirement is present, but a hook that stops being i
 
 This merges eng-release's environment-parity finding: Ubuntu static CI remains useful but cannot substitute for an authenticated exact-HEAD observation on the designated macOS pilot host. [VERIFIED] `.github/workflows/continuity-gate.yml:48-67` and `docs/continuity-pilot.md:50-65`.
 
+[PRESCRIBED] Native observation must not launch when the host cannot provide a
+non-escapable descendant-cleanup primitive. Windows Job Objects and a Linux child
+subreaper meet the current bounded contract. Unprivileged macOS process groups,
+process snapshots, environment markers, Seatbelt profiles, and launchd jobs do not:
+a fast child can create a new session, clear inherited markers, and outlive the
+observer. Until an approved privileged macOS helper provides an equivalent boundary,
+the designated-host observation and therefore `ENFORCED` promotion fail closed. This
+is an explicit pilot limitation; Ubuntu evidence still cannot substitute for the
+missing exact macOS observation.
+
 ## Bounded output and execution
 
 > **FR-009**: Preflight output MUST be at most 8,000 characters (approximately 2,000 tokens), deterministic, and readable without a model.

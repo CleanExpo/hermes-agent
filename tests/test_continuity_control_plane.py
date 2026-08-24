@@ -111,6 +111,7 @@ def _interrupt_tree_worker(ready_path: str, sentinel_path: str) -> None:
 def _native_observer_interrupt_worker(
     state_dir: str, ready_path: str, sentinel_path: str
 ) -> None:
+    _allow_test_native_spawn_without_kernel_boundary_on_darwin()
     state = Path(state_dir)
     host = state / "nested-native-host.py"
     host.write_text(
@@ -136,6 +137,7 @@ def _native_observer_interrupt_worker(
 def _native_observer_spawn_race_worker(
     state_dir: str, child_pid_path: str, sentinel_path: str
 ) -> None:
+    _allow_test_native_spawn_without_kernel_boundary_on_darwin()
     state = Path(state_dir)
     host = state / "spawn-race-native-host.py"
     host.write_text(
@@ -167,6 +169,21 @@ def _native_observer_spawn_race_worker(
     )
 
 
+def _allow_test_native_spawn_without_kernel_boundary_on_darwin() -> None:
+    """Reach post-spawn lifecycle tests when production Darwin fails pre-spawn."""
+    if sys.platform != "darwin":
+        return
+    real_spawn = continuity_native_observation._spawn_contained_process
+
+    def spawn_without_native_boundary(*args, **kwargs):
+        kwargs["require_native_containment"] = False
+        return real_spawn(*args, **kwargs)
+
+    continuity_native_observation._spawn_contained_process = (
+        spawn_without_native_boundary
+    )
+
+
 def _assert_native_observer_reaps_after_root_exit(
     tmp_path: Path, *, detached: bool
 ) -> None:
@@ -190,9 +207,12 @@ def _assert_native_observer_reaps_after_root_exit(
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        ContinuityError, match="native host exited or timed out before evidence"
-    ):
+    expected_error = (
+        "native macOS descendant containment"
+        if sys.platform == "darwin"
+        else "native host exited or timed out before evidence"
+    )
+    with pytest.raises(ContinuityError, match=expected_error):
         continuity_native_observation._run_host_until_native_event(
             [
                 sys.executable,
@@ -209,6 +229,11 @@ def _assert_native_observer_reaps_after_root_exit(
             timeout=5,
         )
 
+    if sys.platform == "darwin":
+        assert not child_pid_path.exists()
+        time.sleep(1.2)
+        assert not sentinel.exists()
+        return
     assert child_pid_path.exists()
     time.sleep(1.2)
     assert not sentinel.exists()
@@ -1092,6 +1117,7 @@ def test_promotion_lock_capability_gate_precedes_authority_work(
     assert called is False
 
 
+@pytest.mark.live_system_guard_bypass
 def test_run_command_terminates_tree_when_required_mount_disappears(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1124,6 +1150,7 @@ def test_run_command_terminates_tree_when_required_mount_disappears(
     assert not sentinel.exists()
 
 
+@pytest.mark.live_system_guard_bypass
 def test_native_observer_terminates_tree_when_required_mount_disappears(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1147,6 +1174,21 @@ def test_native_observer_terminates_tree_when_required_mount_disappears(
             else (_ for _ in ()).throw(ContinuityError("external volume is not mounted"))
         ),
     )
+    if sys.platform == "darwin":
+        # This unit exercises mount-loss cleanup after a host has started. The
+        # separate native-containment tests prove that production observation
+        # fails before spawn when Darwin has no sufficient kernel boundary.
+        real_spawn = continuity_native_observation._spawn_contained_process
+
+        def spawn_without_native_boundary(*args, **kwargs):
+            kwargs["require_native_containment"] = False
+            return real_spawn(*args, **kwargs)
+
+        monkeypatch.setattr(
+            continuity_native_observation,
+            "_spawn_contained_process",
+            spawn_without_native_boundary,
+        )
 
     with pytest.raises(
         ContinuityError, match="became unavailable during claude native observation"
@@ -2106,6 +2148,13 @@ def test_native_project_observer_uses_generated_adapter_and_admission_path(
         check=False,
     )
 
+    if sys.platform == "darwin":
+        assert result.returncode == 2
+        assert (
+            "native macOS descendant containment is unavailable without a "
+            "privileged helper"
+        ) in result.stderr
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout) == {
         "surface": surface,
@@ -2188,6 +2237,9 @@ def test_native_project_observer_fails_when_host_does_not_invoke_hook(
     )
 
     assert result.returncode == 2
+    if sys.platform == "darwin":
+        assert "native macOS descendant containment" in result.stderr
+        return
     assert "produced no continuity event log" in result.stderr
 
 
@@ -2223,6 +2275,9 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
         "sha256": sha256_file(Path(sys.executable).resolve()),
     }
     atomic_write_json(pilot["config"], config)
+    events_before = (
+        pilot["events"].read_bytes() if pilot["events"].exists() else None
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -2240,6 +2295,14 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
         check=False,
     )
 
+    if sys.platform == "darwin":
+        assert result.returncode == 2
+        assert "native macOS descendant containment" in result.stderr
+        events_after = (
+            pilot["events"].read_bytes() if pilot["events"].exists() else None
+        )
+        assert events_after == events_before
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout) == {
         "surface": "hermes",
@@ -2450,6 +2513,7 @@ def test_rollback_replay_names_managed_hook_drift(tmp_path: Path) -> None:
         rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
 
 
+@pytest.mark.live_system_guard_bypass
 def test_timed_out_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     sentinel = tmp_path / "grandchild-survived.txt"
     grandchild = (
@@ -2521,39 +2585,257 @@ def test_native_observer_reaps_detached_descendant_after_root_exits(
 def test_fast_spawn_detach_exit_stress_reaps_every_descendant(
     tmp_path: Path,
 ) -> None:
-    host = tmp_path / "fast-detach-host.py"
+    denial = tmp_path / "fast-detach-denied.txt"
+    launched = tmp_path / "fast-detach-launched.txt"
     grandchild = (
         "import pathlib,signal,sys,time; "
+        "pathlib.Path(sys.argv[2]).write_text('launched', encoding='utf-8'); "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
         "time.sleep(0.6); "
         "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
     )
-    host.write_text(
-        "import subprocess,sys,time\n"
-        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[1]], "
-        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
-        "time.sleep(0.005)\n",
-        encoding="utf-8",
+    parent = (
+        "import errno,pathlib,subprocess,sys,time\n"
+        "try:\n"
+        f" subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[1], "
+        "sys.argv[2]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True, env={})\n"
+        "except PermissionError as exc:\n"
+        " if sys.platform != 'darwin' or exc.errno != errno.EPERM: raise\n"
+        " pathlib.Path(sys.argv[3]).write_text('denied', encoding='utf-8')\n"
+        "time.sleep(0.005)\n"
     )
     sentinels = [tmp_path / f"fast-detached-{index}.txt" for index in range(12)]
 
     for sentinel in sentinels:
-        with pytest.raises(
-            ContinuityError, match="native host exited or timed out before evidence"
-        ):
-            continuity_native_observation._run_host_until_native_event(
-                [sys.executable, str(host), str(sentinel)],
+        command = [
+            sys.executable,
+            "-c",
+            parent,
+            str(sentinel),
+            str(launched),
+            str(denial),
+        ]
+        if sys.platform == "darwin":
+            with pytest.raises(
+                ContinuityError, match="native macOS descendant containment"
+            ):
+                run_command(
+                    command,
+                    cwd=tmp_path,
+                    timeout=2,
+                    env={},
+                    require_native_containment=True,
+                )
+        else:
+            result = run_command(
+                command,
                 cwd=tmp_path,
-                env=os.environ.copy(),
-                checkpoint=_test_event_checkpoint(tmp_path / "events.jsonl"),
-                surface="claude",
-                output_dir=tmp_path,
                 timeout=2,
+                env={},
+                require_native_containment=True,
             )
+            assert result.returncode == 0
 
     time.sleep(0.8)
     assert not any(sentinel.exists() for sentinel in sentinels)
+    if sys.platform == "darwin":
+        assert not denial.exists()
+        assert not launched.exists()
+    else:
+        assert launched.read_text(encoding="utf-8") == "launched"
+
+
+def test_nested_contained_command_does_not_rewrap_or_kill_outer_authority(
+    tmp_path: Path,
+) -> None:
+    nested = (
+        "from pathlib import Path; import sys; "
+        f"sys.path.insert(0, {str(SCRIPTS)!r}); "
+        "from continuity_common import run_command; "
+        "result=run_command([sys.executable, '-c', 'print(\"nested-ok\")'], "
+        "cwd=Path(sys.argv[1]), timeout=5, env={}, "
+        "require_native_containment=True); "
+        "print(result.stdout.strip()); raise SystemExit(result.returncode)"
+    )
+
+    command = [sys.executable, "-c", nested, str(tmp_path)]
+    if sys.platform == "darwin":
+        with pytest.raises(
+            ContinuityError, match="native macOS descendant containment"
+        ):
+            run_command(
+                command,
+                cwd=tmp_path,
+                timeout=10,
+                env={},
+                require_native_containment=True,
+            )
+        return
+    result = run_command(
+        command,
+        cwd=tmp_path,
+        timeout=10,
+        env={},
+        require_native_containment=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "nested-ok"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+def test_linux_subreaper_reaps_multigeneration_token_scrubbed_detach(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "linux-multigeneration-survived.txt"
+    leaf = (
+        "import pathlib,sys,time; time.sleep(0.7); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    middle = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {leaf!r}, sys.argv[1]], "
+        "start_new_session=True, env={})"
+    )
+    root = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {middle!r}, sys.argv[1]], "
+        "start_new_session=True, env={}); time.sleep(0.005)"
+    )
+
+    result = run_command(
+        [sys.executable, "-c", root, str(sentinel)],
+        cwd=tmp_path,
+        timeout=5,
+        env={},
+        require_native_containment=True,
+    )
+
+    assert result.returncode == 0
+    time.sleep(0.9)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+def test_linux_strict_containment_ignores_forged_ambient_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lease_read, lease_write = os.pipe()
+    try:
+        monkeypatch.setenv("CONTINUITY_NATIVE_CONTAINMENT_ACTIVE", "1")
+        monkeypatch.setenv("CONTINUITY_NATIVE_CONTAINMENT_FD", str(lease_read))
+        result = run_command(
+            [sys.executable, "-c", "print('strict-ok')"],
+            cwd=tmp_path,
+            timeout=5,
+            require_native_containment=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "strict-ok"
+    finally:
+        os.close(lease_read)
+        os.close(lease_write)
+
+
+def test_unsupported_posix_native_containment_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(continuity_common.platform, "system", lambda: "FreeBSD")
+
+    with pytest.raises(ContinuityError, match="native descendant containment"):
+        continuity_common._native_posix_containment_command(["authority-command"])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+def test_linux_subreaper_timeout_reaps_token_scrubbed_multigeneration_detach(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "linux-timeout-multigeneration-survived.txt"
+    leaf = (
+        "import pathlib,sys,time; time.sleep(0.8); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    middle = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {leaf!r}, sys.argv[1]], "
+        "start_new_session=True, env={}); time.sleep(30)"
+    )
+    root = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {middle!r}, sys.argv[1]], "
+        "start_new_session=True, env={}); time.sleep(30)"
+    )
+
+    with pytest.raises(ContinuityError, match="command timed out"):
+        run_command(
+            [sys.executable, "-c", root, str(sentinel)],
+            cwd=tmp_path,
+            timeout=0.2,
+            env={},
+            require_native_containment=True,
+        )
+
+    time.sleep(1.0)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux parent-death signal")
+def test_linux_subreaper_cleans_tree_when_controller_is_sigkilled(
+    tmp_path: Path,
+) -> None:
+    wrapper_pid_path = tmp_path / "linux-wrapper.pid"
+    launched = tmp_path / "linux-pdeath-launched.txt"
+    sentinel = tmp_path / "linux-pdeath-survived.txt"
+    leaf = (
+        "import pathlib,sys,time; "
+        "pathlib.Path(sys.argv[1]).write_text('launched', encoding='utf-8'); "
+        "time.sleep(0.8); "
+        "pathlib.Path(sys.argv[2]).write_text('survived', encoding='utf-8')"
+    )
+    target = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {leaf!r}, sys.argv[1], "
+        "sys.argv[2]], start_new_session=True, env={}); time.sleep(30)"
+    )
+    controller = (
+        "import os,pathlib,subprocess,sys,time; "
+        "wrapper=subprocess.Popen([sys.executable, '-I', '-c', sys.argv[1], "
+        "str(os.getpid()), sys.executable, '-c', sys.argv[2], "
+        "sys.argv[4], sys.argv[5]]); "
+        "pathlib.Path(sys.argv[3]).write_text(str(wrapper.pid), encoding='utf-8'); "
+        "time.sleep(30)"
+    )
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            controller,
+            continuity_common._LINUX_SUBREAPER,
+            target,
+            str(wrapper_pid_path),
+            str(launched),
+            str(sentinel),
+        ],
+        cwd=tmp_path,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not launched.exists():
+            if parent.poll() is not None:
+                pytest.fail(f"controller exited before launch: {parent.returncode}")
+            time.sleep(0.02)
+        assert launched.exists()
+        wrapper = psutil.Process(int(wrapper_pid_path.read_text(encoding="utf-8")))
+        parent.kill()
+        parent.wait(timeout=2)
+        wrapper.wait(timeout=4)
+        time.sleep(1.0)
+        assert not sentinel.exists()
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=2)
 
 
 def test_fast_commands_leave_no_descendant_monitor_threads(tmp_path: Path) -> None:
@@ -2588,16 +2870,12 @@ def test_empty_child_environment_does_not_inherit_ambient_credentials(
 ) -> None:
     monkeypatch.setenv("CONTINUITY_AMBIENT_SECRET", "must-not-pass")
 
-    result = run_command(
-        [
-            sys.executable,
-            "-c",
-            "import os; print(os.environ.get('CONTINUITY_AMBIENT_SECRET', 'absent'))",
-        ],
-        cwd=tmp_path,
-        timeout=5,
-        env={},
-    )
+    command = [
+        sys.executable,
+        "-c",
+        "import os; print(os.environ.get('CONTINUITY_AMBIENT_SECRET', 'absent'))",
+    ]
+    result = run_command(command, cwd=tmp_path, timeout=5, env={})
 
     assert result.returncode == 0
     assert result.stdout.strip() == "absent"
