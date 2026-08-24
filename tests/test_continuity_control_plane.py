@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
@@ -19,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 import continuity_bridge
 import continuity_event
 import continuity_gate
+import continuity_native_observation
 import install_continuity_adapters as continuity_adapters
 from continuity_bridge import (
     build_preflight,
@@ -361,6 +363,12 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
             "hosts": {
                 surface: {"path": str(path), "sha256": sha256_file(path)}
                 for surface, path in native_hosts.items()
+            }
+            | {
+                "sandbox": {
+                    "path": str(Path(sys.executable).resolve()),
+                    "sha256": sha256_file(Path(sys.executable).resolve()),
+                }
             },
         },
         "evidence_policy": {
@@ -882,7 +890,9 @@ def test_enforced_receipt_requires_fresh_native_surface_coverage(
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     receipt_path = pilot["state"] / "native-deadman.json"
     receipt = _passing_receipt(pilot, target="ENFORCED")
-    assert receipt["result"] == "PASS"
+    assert receipt["result"] == "PASS", continuity_gate._native_observation_errors(
+        config, receipt, git_state(pilot["repo"])
+    )
 
     receipt["runtime_checks"] = []
     receipt["auth"] = sign_receipt(config, receipt)
@@ -909,6 +919,112 @@ def test_enforced_receipt_requires_fresh_native_surface_coverage(
         and "expected_adapter_sha256=" in error
         and "last_success=" in error
         for error in stale_errors
+    )
+
+
+def test_native_observation_is_bound_to_policy_artifacts_event_and_host(
+    pilot: dict[str, Path],
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    receipt_path = pilot["state"] / "native-binding.json"
+    receipt = _passing_receipt(pilot, target="ENFORCED")
+    observation = receipt["runtime_checks"][0]["native_observation"]
+
+    observation["event"] = "forged-event"
+    observation["adapter_path"] = ".continuity/toolchain.lock.json"
+    observation["adapter_sha256"] = sha256_file(pilot["lock"])
+    observation["host_identity"] = {
+        "path": "/tmp/forged-host",
+        "sha256": "f" * 64,
+    }
+    receipt["auth"] = sign_receipt(config, receipt)
+    atomic_write_json(receipt_path, receipt)
+
+    errors = verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"])
+    assert any("event does not match policy" in error for error in errors)
+    assert any("adapter does not match policy" in error for error in errors)
+    assert any("host identity is stale" in error for error in errors)
+
+
+def test_native_runtime_rechecks_every_bound_artifact_after_execution(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    spec = dict(config["evidence_policy"]["runtime_checks"][0])
+    spec["bound_paths"] = [
+        spec["adapter_path"],
+        ".continuity/toolchain.lock.json",
+    ]
+    config["evidence_policy"]["runtime_checks"][0] = spec
+    original_run = continuity_gate.run_command
+
+    def mutate_after_runtime(argv, **kwargs):
+        result = original_run(argv, **kwargs)
+        pilot["lock"].write_text("mutated after native observation\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(continuity_gate, "run_command", mutate_after_runtime)
+    with pytest.raises(ContinuityError, match="bound artifact changed"):
+        continuity_gate._execute_evidence(
+            spec,
+            pilot["repo"],
+            kind="runtime",
+            evidence_home=pilot["state"] / "evidence-home",
+            config=config,
+            index=0,
+        )
+
+
+def test_native_runtime_rechecks_host_identity_after_execution(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    host = pilot["state"] / "mutable-native-host"
+    host.write_text("host-v1\n", encoding="utf-8")
+    config["native_observation_policy"]["hosts"]["sandbox"] = {
+        "path": str(host),
+        "sha256": sha256_file(host),
+    }
+    spec = config["evidence_policy"]["runtime_checks"][0]
+    original_run = continuity_gate.run_command
+
+    def mutate_after_runtime(argv, **kwargs):
+        result = original_run(argv, **kwargs)
+        host.write_text("host-v2\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(continuity_gate, "run_command", mutate_after_runtime)
+    with pytest.raises(ContinuityError, match="host identity is stale"):
+        continuity_gate._execute_evidence(
+            spec,
+            pilot["repo"],
+            kind="runtime",
+            evidence_home=pilot["state"] / "evidence-home",
+            config=config,
+            index=0,
+        )
+
+
+def test_missing_native_observation_reports_authenticated_prior_success(
+    pilot: dict[str, Path],
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    prior = _passing_receipt(pilot, target="ENFORCED")
+    prior_path = pilot["state"] / "receipts" / "prior.json"
+    atomic_write_json(prior_path, prior)
+    observed_at = prior["runtime_checks"][0]["native_observation"]["observed_at"]
+
+    missing = _passing_receipt(pilot, target="ENFORCED")
+    missing["runtime_checks"] = []
+    missing["auth"] = sign_receipt(config, missing)
+    missing_path = pilot["state"] / "missing-native.json"
+    atomic_write_json(missing_path, missing)
+
+    errors = verify_receipt(pilot["config"], missing_path, cwd=pilot["repo"])
+    assert any(
+        error.startswith("native observation is missing: surface=sandbox;")
+        and f"last_success={observed_at}" in error
+        for error in errors
     )
 
 
@@ -1379,6 +1495,16 @@ def test_native_project_observer_fails_when_host_does_not_invoke_hook(
     assert "produced no continuity event log" in result.stderr
 
 
+def test_codex_native_observer_rejects_linked_worktree_provenance(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    linked = tmp_path / "linked"
+    _git(pilot["repo"], "worktree", "add", "-b", "native-linked", str(linked))
+
+    with pytest.raises(ContinuityError, match="canonical common checkout"):
+        continuity_native_observation._require_codex_discovery_checkout(linked)
+
+
 def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
@@ -1389,7 +1515,15 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
     config["evidence_policy"]["runtime_checks"].append({
         "surface": "hermes",
         "adapter_path": str(hermes_home / "config.yaml"),
+        "bound_paths": [
+            str(hermes_home / "config.yaml"),
+            str(hermes_home / continuity_adapters.HERMES_MANIFEST),
+        ],
     })
+    config["native_observation_policy"]["hosts"]["hermes"] = {
+        "path": str(Path(sys.executable).resolve()),
+        "sha256": sha256_file(Path(sys.executable).resolve()),
+    }
     atomic_write_json(pilot["config"], config)
     result = subprocess.run(
         [
@@ -1413,6 +1547,39 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
         "surface": "hermes",
         "checks": ["hooks-list", "hooks-doctor", "fresh-session-admission"],
     }
+
+
+def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    hermes_home = tmp_path / "forged-hermes-home"
+    hermes_home.mkdir()
+    install_hermes_adapter(pilot["repo"], hermes_home)
+    manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged = {"pre_llm_call": [{"command": "true", "timeout": 1}]}
+    manifest["installed_hooks"] = forged
+    atomic_write_json(manifest_path, manifest)
+    config_path = hermes_home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["hooks"] = forged
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    policy = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    policy["native_observation_policy"]["hosts"]["hermes"] = {
+        "path": str(Path(sys.executable).resolve()),
+        "sha256": sha256_file(Path(sys.executable).resolve()),
+    }
+    policy["evidence_policy"]["runtime_checks"].append({
+        "surface": "hermes",
+        "adapter_path": str(config_path),
+    })
+    atomic_write_json(pilot["config"], policy)
+
+    with pytest.raises(ContinuityError, match="ownership manifest is stale"):
+        continuity_native_observation.observe_hermes_hook(
+            pilot["repo"], pilot["config"], hermes_home
+        )
 
 
 def test_hermes_adapter_has_owned_reversible_before_image(
@@ -1911,6 +2078,20 @@ def test_unmounted_volume_causes_no_state_writes(
 def test_committed_adapters_match_single_contract() -> None:
     for path, rendered in render_project_adapters(REPO_ROOT).items():
         assert path.read_text(encoding="utf-8") == rendered
+
+
+def test_generated_adapters_use_the_locked_repository_interpreter() -> None:
+    rendered = render_project_adapters(REPO_ROOT)
+    claude = rendered[REPO_ROOT / ".claude/settings.json"]
+    codex = rendered[REPO_ROOT / ".codex/hooks.json"]
+    hermes = continuity_adapters.render_hermes_config(REPO_ROOT)
+    claude_commands = json.dumps(json.loads(claude)["hooks"])
+    codex_commands = json.dumps(json.loads(codex)["hooks"])
+
+    assert "$CLAUDE_PROJECT_DIR/.venv/bin/python" in claude_commands
+    assert ".venv/bin/python .specify/events.py" in codex_commands
+    assert str(REPO_ROOT / ".venv/bin/python") in hermes
+    assert "python3 " not in claude_commands + codex_commands + hermes
 
 
 def test_supply_chain_manifest_membership_is_closed() -> None:

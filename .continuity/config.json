@@ -47,6 +47,10 @@
       "codex": {
         "path": "/Users/phill-mac/.local/bin/codex",
         "sha256": "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02"
+      },
+      "hermes": {
+        "path": "/Users/phill-mac/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/bin/python3.11",
+        "sha256": "216061c513cab74dec6698580a9d51c5ab8ae8dc3d90f3ae88a57bbc4a9b1a92"
       }
     }
   },
@@ -82,6 +86,9 @@
         "surface": "claude",
         "event": "project-admission",
         "adapter_path": ".claude/settings.json",
+        "bound_paths": [
+          ".claude/settings.json"
+        ],
         "native": true,
         "timeout_seconds": 180
       },
@@ -98,6 +105,10 @@
         "surface": "codex",
         "event": "project-admission",
         "adapter_path": ".codex/hooks.json",
+        "bound_paths": [
+          ".codex/hooks.json",
+          ".codex/config.toml"
+        ],
         "native": true,
         "timeout_seconds": 180
       },
@@ -116,6 +127,10 @@
         "surface": "hermes",
         "event": "hooks-list-doctor-and-fresh-session",
         "adapter_path": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/config.yaml",
+        "bound_paths": [
+          "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/config.yaml",
+          "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/continuity-adapter-manifest.json"
+        ],
         "native": true,
         "timeout_seconds": 300
       }

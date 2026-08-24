@@ -6,20 +6,28 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
 
 from continuity_common import (
     ContinuityError,
+    _terminate_process_tree,
     load_json,
     minimal_child_env,
     run_command,
     sha256_file,
 )
-from install_continuity_adapters import HERMES_MANIFEST, render_project_adapters
+from install_continuity_adapters import (
+    HERMES_MANIFEST,
+    _managed_hermes_hooks,
+    render_project_adapters,
+)
 
 
 def _host_executable(config: dict, surface: str) -> Path:
@@ -32,6 +40,26 @@ def _host_executable(config: dict, surface: str) -> Path:
     if not executable.is_file() or sha256_file(executable) != identity.get("sha256"):
         raise ContinuityError(f"{surface} native host identity is stale")
     return executable
+
+
+def _require_codex_discovery_checkout(repo_root: Path) -> None:
+    result = run_command(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=repo_root,
+        timeout=30,
+        env=minimal_child_env(),
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ContinuityError("cannot resolve Codex hook discovery checkout")
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = repo_root / common
+    discovery_root = common.resolve().parent
+    if discovery_root != repo_root.resolve():
+        raise ContinuityError(
+            "Codex native observation requires the canonical common checkout; "
+            "linked worktree hook provenance is not certifiable"
+        )
 
 
 def _event_log_checkpoint(config: dict) -> tuple[Path, int, int | None]:
@@ -98,6 +126,70 @@ def _require_native_event(
         )
 
 
+def _run_host_until_native_event(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    checkpoint: tuple[Path, int, int | None],
+    surface: str,
+    output_dir: Path,
+    timeout: float,
+) -> str:
+    stdout_path = output_dir / "host.stdout"
+    stderr_path = output_dir / "host.stderr"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout_handle,
+        stderr_path.open("w", encoding="utf-8") as stderr_handle,
+    ):
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            start_new_session=os.name == "posix",
+        )
+        deadline = time.monotonic() + timeout
+        last_error: ContinuityError | None = None
+        while time.monotonic() < deadline:
+            stdout_handle.flush()
+            stderr_handle.flush()
+            output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
+                encoding="utf-8"
+            )
+            try:
+                _require_native_event(checkpoint, surface, output)
+            except ContinuityError as exc:
+                last_error = exc
+            else:
+                if process.poll() is None:
+                    _terminate_process_tree(process)
+                else:
+                    process.communicate()
+                return output
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        if process.poll() is None:
+            _terminate_process_tree(process)
+        stdout_handle.flush()
+        stderr_handle.flush()
+    output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
+        encoding="utf-8"
+    )
+    try:
+        _require_native_event(checkpoint, surface, output)
+    except ContinuityError as exc:
+        detail = str(last_error or exc)
+        raise ContinuityError(
+            f"{surface} native host exited or timed out before evidence: {detail}"
+        ) from exc
+    return output
+
+
 def _project_host_command(executable: Path, surface: str) -> list[str]:
     prompt = "Return only NATIVE_OBSERVATION_OK. Do not use tools."
     if surface == "claude":
@@ -144,6 +236,7 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
     if target.read_text(encoding="utf-8") != rendered[target]:
         raise ContinuityError(f"{surface} project hook adapter is stale")
     if surface == "codex":
+        _require_codex_discovery_checkout(repo_root)
         codex_config = repo_root / ".codex/config.toml"
         if codex_config.read_text(encoding="utf-8") != rendered[codex_config]:
             raise ContinuityError("codex project config layer is stale")
@@ -172,15 +265,28 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
                 encoding="utf-8",
             )
             extra_env["CODEX_HOME"] = str(codex_home)
-        result = run_command(
+        _run_host_until_native_event(
             _project_host_command(executable, surface),
             cwd=repo_root,
-            timeout=120,
             env=minimal_child_env(extra_env),
+            checkpoint=checkpoint,
+            surface=surface,
+            output_dir=Path(temp),
+            timeout=120,
         )
-    _require_native_event(
-        checkpoint, surface, (result.stdout or "") + (result.stderr or "")
-    )
+    if (
+        sha256_file(executable)
+        != (config["native_observation_policy"]["hosts"][surface]["sha256"])
+    ):
+        raise ContinuityError(f"{surface} native host changed during observation")
+    if target.read_text(encoding="utf-8") != rendered[target]:
+        raise ContinuityError(f"{surface} project hook changed during observation")
+    if (
+        surface == "codex"
+        and (repo_root / ".codex/config.toml").read_text(encoding="utf-8")
+        != rendered[repo_root / ".codex/config.toml"]
+    ):
+        raise ContinuityError("codex project config changed during observation")
 
 
 def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -> None:
@@ -200,12 +306,16 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
     ):
         raise ContinuityError("Hermes runtime policy does not bind installed config")
     manifest = load_json(hermes_home / HERMES_MANIFEST)
+    manifest_digest = sha256_file(hermes_home / HERMES_MANIFEST)
+    target_digest = sha256_file(target)
     installed_hooks = manifest.get("installed_hooks")
+    expected_hooks = _managed_hermes_hooks(repo_root)
     if (
         manifest.get("status") != "INSTALLED"
         or manifest.get("repo_root") != str(repo_root)
         or manifest.get("target") != str(target)
         or not isinstance(installed_hooks, dict)
+        or installed_hooks != expected_hooks
     ):
         raise ContinuityError("Hermes adapter ownership manifest is stale")
     loaded = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
@@ -215,6 +325,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
         or {name: hooks.get(name) for name in installed_hooks} != installed_hooks
     ):
         raise ContinuityError("installed Hermes hook config drifted from its manifest")
+    executable = _host_executable(config, "hermes")
     env = minimal_child_env({"HERMES_HOME": str(hermes_home)})
     commands = (
         ("list", ["hooks", "list"]),
@@ -223,7 +334,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
     )
     for action, arguments in commands:
         result = run_command(
-            [sys.executable, str(repo_root / "main.py"), *arguments],
+            [str(executable), str(repo_root / "main.py"), *arguments],
             cwd=repo_root,
             timeout=120,
             env=env,
@@ -241,6 +352,17 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
             raise ContinuityError(
                 "hermes hooks test did not produce an allowed fresh-session admission"
             )
+    if (
+        sha256_file(executable)
+        != (config["native_observation_policy"]["hosts"]["hermes"]["sha256"])
+    ):
+        raise ContinuityError("hermes native host changed during observation")
+    if sha256_file(target) != target_digest:
+        raise ContinuityError("installed Hermes config changed during observation")
+    if sha256_file(hermes_home / HERMES_MANIFEST) != manifest_digest:
+        raise ContinuityError(
+            "Hermes adapter ownership manifest changed during observation"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" post_tool --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" post_tool --surface claude",
             "timeout": 30,
             "type": "command"
           }
@@ -16,7 +16,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" pre_tool --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" pre_tool --surface claude",
             "timeout": 30,
             "type": "command"
           }
@@ -28,7 +28,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" session_end --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" session_end --surface claude",
             "timeout": 30,
             "type": "command"
           }
@@ -39,7 +39,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" session_start --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" session_start --surface claude",
             "timeout": 30,
             "type": "command"
           }
@@ -50,7 +50,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" stop --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" stop --surface claude",
             "timeout": 30,
             "type": "command"
           }
@@ -61,7 +61,7 @@
       {
         "hooks": [
           {
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.specify/events.py\" user_prompt --surface claude",
+            "command": "\"$CLAUDE_PROJECT_DIR/.venv/bin/python\" \"$CLAUDE_PROJECT_DIR/.specify/events.py\" user_prompt --surface claude",
             "timeout": 30,
             "type": "command"
           }

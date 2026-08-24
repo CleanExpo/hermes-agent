@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import os
 import platform
+import re
 import secrets
 import signal
 import subprocess
@@ -660,15 +661,42 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
                 "commit",
                 "adapter_path",
                 "adapter_sha256",
+                "bound_artifacts",
+                "host_identity",
                 "observed_at",
             }
+            bound_artifacts = (
+                observation.get("bound_artifacts")
+                if isinstance(observation, dict)
+                else None
+            )
+            host_identity = (
+                observation.get("host_identity")
+                if isinstance(observation, dict)
+                else None
+            )
             if (
                 not isinstance(observation, dict)
                 or set(observation) != observation_keys
                 or any(
                     not isinstance(observation.get(key), str) or not observation[key]
-                    for key in observation_keys
+                    for key in observation_keys - {"bound_artifacts", "host_identity"}
                 )
+                or not isinstance(bound_artifacts, dict)
+                or not bound_artifacts
+                or any(
+                    not isinstance(path, str)
+                    or not path
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    for path, digest in (bound_artifacts or {}).items()
+                )
+                or not isinstance(host_identity, dict)
+                or set(host_identity) != {"path", "sha256"}
+                or not isinstance(host_identity.get("path"), str)
+                or not host_identity["path"]
+                or not isinstance(host_identity.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", host_identity["sha256"]) is None
             ):
                 errors.append(
                     f"runtime native observation is malformed: {check.get('name', 'unnamed')}"

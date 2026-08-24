@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "python3 .specify/events.py post_tool --surface codex",
+            "command": ".venv/bin/python .specify/events.py post_tool --surface codex",
             "timeout": 30,
             "type": "command"
           }
@@ -16,7 +16,7 @@
       {
         "hooks": [
           {
-            "command": "python3 .specify/events.py pre_tool --surface codex",
+            "command": ".venv/bin/python .specify/events.py pre_tool --surface codex",
             "timeout": 30,
             "type": "command"
           }
@@ -28,7 +28,7 @@
       {
         "hooks": [
           {
-            "command": "python3 .specify/events.py session_start --surface codex",
+            "command": ".venv/bin/python .specify/events.py session_start --surface codex",
             "timeout": 30,
             "type": "command"
           }
@@ -39,7 +39,7 @@
       {
         "hooks": [
           {
-            "command": "python3 .specify/events.py stop --surface codex",
+            "command": ".venv/bin/python .specify/events.py stop --surface codex",
             "timeout": 30,
             "type": "command"
           }
@@ -50,7 +50,7 @@
       {
         "hooks": [
           {
-            "command": "python3 .specify/events.py user_prompt --surface codex",
+            "command": ".venv/bin/python .specify/events.py user_prompt --surface codex",
             "timeout": 30,
             "type": "command"
           }

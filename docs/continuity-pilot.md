@@ -95,21 +95,28 @@ whole descendant tree with bounded TERM-to-KILL escalation. The authenticated re
 also fingerprints the exact hashed requirements lock, Python launcher and executable,
 and installed distribution metadata; a lock mismatch or later resolved-environment
 change fails verification. Native runtime records bind Claude, Codex, and Hermes
-observations to the current commit, adapter digest, event, and a five-minute freshness
-window. Hermes observation executes `hooks list`, `hooks doctor`, and the native
-`hooks test pre_llm_call` admission path, and binds the installed external
-`config.yaml` plus its ownership manifest. Claude and Codex observations launch the
-digest-pinned native host CLIs with tools disabled, require the host-created session
-identity to match the redacted `SessionStart` audit record, and fail if the host stops
-loading the project hook or returns a blocked admission. Codex uses a temporary,
-external-state-root home that trusts only the exact project for the observation; the
-vetted hook source is still required to match the committed generated adapter.
+observations to the committed event and adapter path, every configured adapter
+artifact digest, the post-execution host executable identity, the current commit, and
+a five-minute freshness window. Missing-observation diagnostics obtain `last_success`
+only from a prior authenticated PASS receipt. Hermes observation executes `hooks
+list`, `hooks doctor`, and the native `hooks test pre_llm_call` admission path; its
+installed hooks must equal the current generated contract, and both external
+`config.yaml` and its ownership manifest are rehashed after execution and during
+receipt verification. Claude and Codex observations launch the digest-pinned native
+host CLIs with tools disabled, require the host-created session identity to match the
+redacted `SessionStart` audit record, and stop the credential-free host after that
+admission evidence appears instead of waiting on a downstream model request. Both the
+host and the complete project adapter surface are then rehashed. Codex uses a
+temporary, external-state-root home that trusts only the exact project for the
+observation; the vetted hook source is still required to match the committed generated
+adapter. Every generated dispatcher command uses the repository's locked `.venv`
+interpreter; system `python3` is not an admissible fallback.
 
-Codex resolves project hooks from the root checkout of a linked Git worktree. A
-worktree-only hardening commit therefore cannot satisfy the Codex native deadman until
-it is integrated into that trusted root checkout (or exercised from a standalone
-exact-head clone). This is an intentional promotion blocker, not a fallback to the
-direct dispatcher path.
+Codex resolves project hooks from the root checkout of a linked Git worktree. The
+observer therefore rejects linked worktrees outright: a worktree-only hardening commit
+cannot satisfy the Codex native deadman until it is integrated into that canonical
+checkout (or exercised from a standalone exact-head clone). This is an intentional
+promotion blocker, not a fallback to the direct dispatcher path.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \

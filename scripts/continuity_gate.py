@@ -50,6 +50,7 @@ RUNTIME_SPEC_KEYS = {
     "surface",
     "event",
     "adapter_path",
+    "bound_paths",
     "native",
     "timeout_seconds",
 }
@@ -81,6 +82,53 @@ def _native_adapter_path(
     if require_exists and not resolved.is_file():
         raise ContinuityError("native observation adapter is missing")
     return resolved
+
+
+def _native_bound_artifacts(
+    config: dict[str, Any],
+    repo_root: Path,
+    spec: dict[str, Any],
+    *,
+    require_exists: bool,
+) -> dict[str, Path]:
+    adapter_token = spec.get("adapter_path")
+    tokens = spec.get("bound_paths", [adapter_token])
+    if (
+        not isinstance(adapter_token, str)
+        or not adapter_token
+        or not isinstance(tokens, list)
+        or not tokens
+        or not all(isinstance(token, str) and token for token in tokens)
+        or len(set(tokens)) != len(tokens)
+        or adapter_token not in tokens
+    ):
+        raise ContinuityError("native observation bound paths are invalid")
+    return {
+        token: _native_adapter_path(
+            config,
+            repo_root,
+            token,
+            require_exists=require_exists and not Path(token).is_absolute(),
+        )
+        for token in tokens
+    }
+
+
+def _native_host_identity(
+    config: dict[str, Any], surface: str
+) -> dict[str, str] | None:
+    policy = config.get("native_observation_policy")
+    hosts = policy.get("hosts") if isinstance(policy, dict) else None
+    configured = hosts.get(surface) if isinstance(hosts, dict) else None
+    if configured is None:
+        return None
+    if not isinstance(configured, dict) or set(configured) != {"path", "sha256"}:
+        raise ContinuityError(f"{surface} native host identity is malformed")
+    path = Path(str(configured["path"])).resolve()
+    actual = sha256_file(path)
+    if not hmac.compare_digest(actual, str(configured["sha256"])):
+        raise ContinuityError(f"{surface} native host identity is stale")
+    return {"path": str(path), "sha256": actual}
 
 
 def _task_from_value(value: Any, task_id: str) -> dict[str, Any] | None:
@@ -496,6 +544,39 @@ def _native_observation_errors(
         if isinstance(item, dict) and isinstance(item.get("surface"), str)
     }
 
+    def last_authenticated_success(surface: str) -> str:
+        receipt_dir = Path(str(config.get("receipt_dir", "")))
+        if not receipt_dir.is_dir():
+            return "none"
+        latest: tuple[datetime, str] | None = None
+        for path in sorted(receipt_dir.glob("*.json"))[-100:]:
+            try:
+                candidate = load_json(path)
+                if (
+                    candidate.get("result") != "PASS"
+                    or candidate.get("project") != config.get("project")
+                    or candidate.get("repo_id") != config.get("repo_id")
+                    or receipt_signature_errors(config, candidate)
+                ):
+                    continue
+                for check in candidate.get("runtime_checks") or []:
+                    prior = (
+                        check.get("native_observation")
+                        if isinstance(check, dict)
+                        else None
+                    )
+                    if not isinstance(prior, dict) or prior.get("surface") != surface:
+                        continue
+                    token = str(prior.get("observed_at"))
+                    observed = datetime.fromisoformat(token)
+                    if observed.tzinfo is None:
+                        continue
+                    if latest is None or observed > latest[0]:
+                        latest = (observed, token)
+            except (ContinuityError, OSError, TypeError, ValueError):
+                continue
+        return latest[1] if latest else "none"
+
     def expectation(surface: str, observation: dict[str, Any] | None) -> str:
         spec = runtime_specs.get(surface) or {}
         event = spec.get("event") or "unknown"
@@ -512,7 +593,7 @@ def _native_observation_errors(
         last_success = (
             observation.get("observed_at")
             if isinstance(observation, dict) and observation.get("observed_at")
-            else "none"
+            else last_authenticated_success(surface)
         )
         return (
             f"surface={surface}; expected_event={event}; "
@@ -531,10 +612,18 @@ def _native_observation_errors(
                 "native observation commit is stale: "
                 + expectation(surface, observation)
             )
-        adapter_path = observation.get("adapter_path")
-        if not isinstance(adapter_path, str):
+        spec = runtime_specs.get(surface) or {}
+        if observation.get("event") != spec.get("event"):
             errors.append(
-                "native observation adapter is invalid: "
+                "native observation event does not match policy: "
+                + expectation(surface, observation)
+            )
+        adapter_path = observation.get("adapter_path")
+        if not isinstance(adapter_path, str) or adapter_path != spec.get(
+            "adapter_path"
+        ):
+            errors.append(
+                "native observation adapter does not match policy: "
                 + expectation(surface, observation)
             )
         else:
@@ -552,6 +641,32 @@ def _native_observation_errors(
                     "native observation adapter digest is stale: "
                     + expectation(surface, observation)
                 )
+        try:
+            current_artifacts = {
+                token: sha256_file(path)
+                for token, path in _native_bound_artifacts(
+                    config, repo_root, spec, require_exists=True
+                ).items()
+            }
+        except ContinuityError:
+            current_artifacts = {}
+        if observation.get("bound_artifacts") != current_artifacts:
+            errors.append(
+                "native observation bound artifacts are stale: "
+                + expectation(surface, observation)
+            )
+        try:
+            current_host = _native_host_identity(config, surface)
+        except ContinuityError:
+            current_host = {"stale": "true"}
+        if (
+            current_host is not None
+            and observation.get("host_identity") != current_host
+        ):
+            errors.append(
+                "native observation host identity is stale: "
+                + expectation(surface, observation)
+            )
         try:
             observed_at = datetime.fromisoformat(str(observation.get("observed_at")))
             if observed_at.tzinfo is None:
@@ -618,10 +733,15 @@ def _execute_evidence(
         adapter_token = spec.get("adapter_path")
         if not isinstance(adapter_token, str) or not adapter_token:
             raise ContinuityError("native runtime evidence adapter is invalid")
-        adapter_path = _native_adapter_path(
-            config, repo_root, adapter_token, require_exists=True
+        bound_paths = _native_bound_artifacts(
+            config, repo_root, spec, require_exists=True
         )
+        adapter_path = bound_paths[adapter_token]
         adapter_digest = sha256_file(adapter_path)
+        bound_artifacts = {
+            token: sha256_file(path) for token, path in bound_paths.items()
+        }
+        host_identity = _native_host_identity(config, str(spec.get("surface")))
     if kind == "rollback" and spec.get("mode") != "dry-run":
         raise ContinuityError("receipt rollback evidence must use dry-run mode")
     timeout = float(spec.get("timeout_seconds", 900))
@@ -643,8 +763,15 @@ def _execute_evidence(
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")
-    if kind == "runtime" and sha256_file(adapter_path) != adapter_digest:
-        raise ContinuityError("native observation adapter changed during execution")
+    if kind == "runtime":
+        if {
+            token: sha256_file(path) for token, path in bound_paths.items()
+        } != bound_artifacts:
+            raise ContinuityError(
+                "native observation bound artifact changed during execution"
+            )
+        if _native_host_identity(config, str(spec.get("surface"))) != host_identity:
+            raise ContinuityError("native observation host changed during execution")
     completed = datetime.now(timezone.utc)
     output = (result.stdout or "") + (result.stderr or "")
     test_count, failed_count, skipped = _test_summary(output)
@@ -686,6 +813,8 @@ def _execute_evidence(
                 ).commit,
                 "adapter_path": spec.get("adapter_path"),
                 "adapter_sha256": adapter_digest,
+                "bound_artifacts": bound_artifacts,
+                "host_identity": host_identity,
                 "observed_at": completed.isoformat(),
             },
         })
@@ -1170,6 +1299,7 @@ def static_validate(config_path: Path) -> list[str]:
             or max_age < 1
             or max_age > 3600
             or not isinstance(hosts, dict)
+            or not set(surfaces).issubset(hosts)
             or any(
                 not isinstance(surface, str)
                 or not isinstance(identity, dict)
@@ -1257,16 +1387,15 @@ def static_validate(config_path: Path) -> list[str]:
                 errors.append("runtime check is not a valid native observation")
                 continue
             try:
-                adapter_path = _native_adapter_path(
-                    config,
-                    repo_root,
-                    adapter_token,
-                    require_exists=not Path(adapter_token).is_absolute(),
+                artifacts = _native_bound_artifacts(
+                    config, repo_root, runtime, require_exists=True
                 )
             except ContinuityError:
-                adapter_path = None
-            if adapter_path is None:
-                errors.append(f"native observation adapter is missing: {surface}")
+                artifacts = None
+            if artifacts is None:
+                errors.append(
+                    f"native observation bound artifacts are invalid: {surface}"
+                )
             native_runtime_surfaces.add(surface)
         if native_runtime_surfaces != required_native_surfaces:
             errors.append(

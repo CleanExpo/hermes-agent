@@ -53,7 +53,8 @@ def render_project_adapters(repo_root: Path) -> dict[Path, str]:
     claude: dict[str, Any] = {"hooks": {}}
     for event in contract["surfaces"]["claude"]:
         command = (
-            f'python3 "$CLAUDE_PROJECT_DIR/.specify/events.py" {event} --surface claude'
+            f'"$CLAUDE_PROJECT_DIR/.venv/bin/python" '
+            f'"$CLAUDE_PROJECT_DIR/.specify/events.py" {event} --surface claude'
         )
         matcher = ".*" if event in {"pre_tool", "post_tool"} else None
         claude["hooks"][CLAUDE_EVENT_NAMES[event]] = _hook_block(
@@ -61,7 +62,7 @@ def render_project_adapters(repo_root: Path) -> dict[Path, str]:
         )
     codex: dict[str, Any] = {"hooks": {}}
     for event in contract["surfaces"]["codex"]:
-        command = f"python3 .specify/events.py {event} --surface codex"
+        command = f".venv/bin/python .specify/events.py {event} --surface codex"
         matcher = ".*" if event in {"pre_tool", "post_tool"} else None
         codex["hooks"][CODEX_EVENT_NAMES[event]] = _hook_block(
             command, timeout, matcher=matcher
@@ -89,9 +90,13 @@ def render_hermes_config(
     config = dict(existing or {})
     hooks = dict(config.get("hooks") or {})
     entry = repo_root / ".specify/events.py"
+    python = repo_root / ".venv/bin/python"
     for event in contract["surfaces"]["hermes"]:
         hook = {
-            "command": f"python3 {shlex.quote(str(entry))} {event} --surface hermes",
+            "command": (
+                f"{shlex.quote(str(python))} {shlex.quote(str(entry))} "
+                f"{event} --surface hermes"
+            ),
             "timeout": timeout,
         }
         if event == "pre_tool_call":
