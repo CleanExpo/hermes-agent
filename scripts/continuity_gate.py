@@ -1115,7 +1115,9 @@ def _promotion_lock(config: dict[str, Any], timeout: float = 15):
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise ContinuityError("timed out waiting for the promotion lock")
+                        raise ContinuityError(
+                            "timed out waiting for the promotion lock"
+                        )
                     time.sleep(0.05)
             yield
         finally:

@@ -179,15 +179,11 @@ def minimal_child_env(
     for name in ("HOME", "TMPDIR", "TEMP", "TMP"):
         path = Path(env[name]).resolve()
         if not path.is_relative_to(resolved_state):
-            raise ContinuityError(
-                f"child {name} escapes pilot state root: {path}"
-            )
+            raise ContinuityError(f"child {name} escapes pilot state root: {path}")
     return env
 
 
-def validate_state_storage(
-    external_volume: str | Path, state_root: str | Path
-) -> Path:
+def validate_state_storage(external_volume: str | Path, state_root: str | Path) -> Path:
     """Validate a real mount and an existing state directory beneath it."""
     secure_dirfd = (
         os.open in os.supports_dir_fd
@@ -235,7 +231,9 @@ def _windows_require_plain_path(path: Path, root: Path) -> None:
         try:
             metadata = os.lstat(current)
         except OSError as exc:
-            raise ContinuityError(f"state path is unavailable: {current}: {exc}") from exc
+            raise ContinuityError(
+                f"state path is unavailable: {current}: {exc}"
+            ) from exc
         if getattr(metadata, "st_file_attributes", 0) & reparse_point:
             raise ContinuityError(f"state path contains a reparse point: {current}")
 
@@ -253,9 +251,7 @@ def _windows_reject_reparse_target(path: Path) -> None:
 
 
 @contextmanager
-def _windows_hold_directory_chain(
-    path: Path, root: Path
-) -> Iterator[None]:
+def _windows_hold_directory_chain(path: Path, root: Path) -> Iterator[None]:
     """Retain non-delete-shared handles so checked directories cannot be swapped."""
     import ctypes
     from ctypes import wintypes
@@ -440,9 +436,7 @@ def confined_atomic_write_text(
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                validate_state_storage(
-                    config["external_volume"], config["state_root"]
-                )
+                validate_state_storage(config["external_volume"], config["state_root"])
                 _windows_reject_reparse_target(target_path)
                 os.replace(temporary, target_path)
             except BaseException as exc:
@@ -459,7 +453,9 @@ def confined_atomic_write_text(
         temporary = f".{target}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
             descriptor = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
                 dir_fd=parent_fd,
             )
             try:
@@ -529,9 +525,7 @@ def confined_append_text(config: dict[str, Any], path: Path, content: str) -> No
 def confined_read_bytes(config: dict[str, Any], path: Path) -> bytes:
     with confined_parent(config, path) as (parent_fd, target):
         flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             descriptor = (
@@ -567,9 +561,7 @@ def confined_file_checkpoint(
 ) -> tuple[int, tuple[int, int]]:
     with confined_parent(config, path) as (parent_fd, target):
         flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             descriptor = (
@@ -603,9 +595,7 @@ def confined_read_range(
         raise ContinuityError("confined read range is invalid")
     with confined_parent(config, path) as (parent_fd, target):
         flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             descriptor = (
@@ -631,9 +621,7 @@ def confined_read_range(
                 raise ContinuityError("confined state file was truncated")
             available = metadata.st_size - offset
             if available > max_bytes:
-                raise ContinuityError(
-                    f"confined state range exceeds {max_bytes} bytes"
-                )
+                raise ContinuityError(f"confined state range exceeds {max_bytes} bytes")
             os.lseek(descriptor, offset, os.SEEK_SET)
             chunks: list[bytes] = []
             remaining = available
@@ -657,11 +645,7 @@ def confined_read_range(
 def _require_regular_leaf(
     parent_fd: int | None, target: str | Path, *, missing_ok: bool
 ) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = (
             _windows_open_regular_fd(Path(target))
@@ -722,16 +706,13 @@ def confined_ensure_dir(config: dict[str, Any], name: str) -> Path:
             with _windows_hold_directory_chain(target, state):
                 if not target.is_dir():
                     raise ContinuityError(
-                        "state directory is not a confined direct directory: "
-                        f"{target}"
+                        f"state directory is not a confined direct directory: {target}"
                     )
         return target
     try:
         descriptor = os.open(
             state,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
     except OSError as exc:
         raise ContinuityError(f"cannot open confined state root: {exc}") from exc
@@ -886,9 +867,7 @@ def _load_receipt_key(config: dict[str, Any], *, create: bool) -> bytes:
                 if parent_fd is not None:
                     os.fsync(parent_fd)
         read_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             descriptor = (
@@ -901,9 +880,7 @@ def _load_receipt_key(config: dict[str, Any], *, create: bool) -> bytes:
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
-                    raise ContinuityError(
-                        "receipt signing key must be a regular file"
-                    )
+                    raise ContinuityError("receipt signing key must be a regular file")
                 key = os.read(descriptor, 33)
                 mode = metadata.st_mode & 0o777
             finally:
@@ -992,7 +969,9 @@ def _terminate_process_tree(
 
     if process_group is not None and os.name == "posix":
         try:
-            os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok -- POSIX gate
+            os.killpg(
+                process_group, signal.SIGTERM
+            )  # windows-footgun: ok -- POSIX gate
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -1456,9 +1435,7 @@ class _ContainedProcess:
             b"CLEANUP_ERROR\n",
             b"CONTAINMENT_ERROR\n",
         }:
-            raise ContinuityError(
-                "Linux native containment reported cleanup failure"
-            )
+            raise ContinuityError("Linux native containment reported cleanup failure")
         raise ContinuityError(
             "Linux native containment cleanup acknowledgement is missing or invalid"
         )
@@ -1511,9 +1488,7 @@ class _ContainedProcess:
                         )
                 # A completed wrapper already reaped its adopted tree. Do not
                 # signal its released process-group number, which may be reused.
-                self._require_linux_cleanup_ack(
-                    fallback_kill=linux_fallback_kill
-                )
+                self._require_linux_cleanup_ack(fallback_kill=linux_fallback_kill)
             else:
                 _terminate_process_tree(
                     self.process,
@@ -1595,9 +1570,7 @@ def _spawn_contained_process(
                 }
                 for directory in sorted(directory_paths, key=str):
                     directory_lease.enter_context(
-                        _windows_hold_directory_chain(
-                            directory, Path(directory.anchor)
-                        )
+                        _windows_hold_directory_chain(directory, Path(directory.anchor))
                     )
         except BaseException:
             directory_lease.close()
@@ -1616,9 +1589,7 @@ def _spawn_contained_process(
         if directory_lease is not None:
             directory_lease.close()
         if isinstance(exc, OSError):
-            raise ContinuityError(
-                f"command failed to start: {args[0]}: {exc}"
-            ) from exc
+            raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
         raise
     if linux_cleanup_ack_write is not None:
         os.close(linux_cleanup_ack_write)
