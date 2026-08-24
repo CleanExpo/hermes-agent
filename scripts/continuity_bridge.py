@@ -171,6 +171,8 @@ def tool_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]] | 
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
+                    normalized.append({"type": "content"})
+                    emitted = True
                     continue
                 block_type = block.get("type")
                 if block_type in {"tool_use", "server_tool_use"}:
@@ -182,6 +184,12 @@ def tool_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]] | 
                         "tool_use_id": block.get("tool_use_id") or block.get("id"),
                     })
                     emitted = True
+                else:
+                    normalized.append({"type": "content"})
+                    emitted = True
+        elif content not in (None, ""):
+            normalized.append({"type": "content"})
+            emitted = True
         if message.get("role") == "tool":
             normalized.append({
                 "type": "tool_result",

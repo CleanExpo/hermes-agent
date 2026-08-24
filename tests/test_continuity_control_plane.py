@@ -19,7 +19,11 @@ sys.path.insert(0, str(SCRIPTS))
 import continuity_bridge
 import continuity_gate
 import install_continuity_adapters as continuity_adapters
-from continuity_bridge import build_preflight, validate_tool_adjacency
+from continuity_bridge import (
+    build_preflight,
+    tool_events_from_payload,
+    validate_tool_adjacency,
+)
 from continuity_common import (
     ContinuityError,
     atomic_write_json,
@@ -469,6 +473,65 @@ def test_interrupted_tool_adjacency_is_rejected() -> None:
         {"type": "tool_result", "tool_use_id": "call-2"},
         {"type": "tool_result", "tool_use_id": "call-1"},
     ])
+
+
+def test_native_history_preserves_content_block_interruptions() -> None:
+    def native_events(history: list[dict]) -> list[dict]:
+        events = tool_events_from_payload({"extra": {"conversation_history": history}})
+        assert events is not None
+        return events
+
+    text_before_result = native_events([
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "call-1"}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "interrupt"},
+                {"type": "tool_result", "tool_use_id": "call-1"},
+            ],
+        },
+    ])
+    assert validate_tool_adjacency(text_before_result)
+
+    text_between_uses = native_events([
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1"},
+                {"type": "text", "text": "interrupt"},
+                {"type": "tool_use", "id": "call-2"},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call-1"},
+                {"type": "tool_result", "tool_use_id": "call-2"},
+            ],
+        },
+    ])
+    assert validate_tool_adjacency(text_between_uses)
+
+    ordered_parallel = native_events([
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1"},
+                {"type": "tool_use", "id": "call-2"},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call-1"},
+                {"type": "tool_result", "tool_use_id": "call-2"},
+            ],
+        },
+    ])
+    assert not validate_tool_adjacency(ordered_parallel)
 
 
 def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) -> None:
@@ -1214,9 +1277,16 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
         "scripts/run_tests.sh",
         "AGENTS.md",
         ".github/workflows/continuity-gate.yml",
+        ".github/actions/retry/**",
+        "pyproject.toml",
+        "uv.lock",
         "docs/continuity-pilot.md",
     ):
         assert workflow.count(f"- '{protected}'") == 2
+    assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in workflow
+    assert "uv sync --locked --python 3.11 --extra dev" in workflow
+    assert ".venv/bin/python scripts/continuity_gate.py static" in workflow
+    assert "scripts/run_tests.sh tests/test_continuity_control_plane.py" in workflow
     patterns = {
         stripped[3:-1]
         for line in workflow.splitlines()
