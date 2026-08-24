@@ -20,9 +20,10 @@ can never authorize a terminal lifecycle state.
 
 Claude and Codex finalization hooks return their native blocking shape when preflight
 forbids completion. Hermes `pre_llm_call` validates native conversation history and
-writes a content-free, per-session adjacency guard outside the repository.
-`pre_tool_call` consumes that guard and is installed `fail_closed: true`; a missing,
-stale, blocked, or already-consumed guard prevents tool side effects. Hermes shell
+writes a content-free, per-session and per-turn adjacency admission outside the
+repository. Every `pre_tool_call` in that turn checks the same admission and is
+installed `fail_closed: true`; a missing, stale, blocked, or cross-turn guard prevents
+tool side effects. Hermes shell
 hooks do not have a blocking ordinary-prose or session-end event; for that surface the
 exact-state gate, not advisory context, prevents `TESTED`/`ENFORCED` promotion.
 

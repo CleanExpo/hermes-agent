@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import os
 import hashlib
+import hmac
 import json
+import os
 import re
 import sys
 import time
@@ -25,6 +26,7 @@ from continuity_common import (
     ContinuityError,
     atomic_write_json,
     atomic_write_text,
+    external_volume_available,
     external_input_digests,
     git_state,
     load_json,
@@ -106,9 +108,7 @@ def strict_authority_check(
             env=env,
         )
         if result.returncode != 0:
-            raise ContinuityError(
-                (result.stderr or result.stdout).strip() or "bd show failed"
-            )
+            raise ContinuityError(f"bd show exited with status {result.returncode}")
         task = _task_from_value(json.loads(result.stdout), beads["active_task"])
         if task is None:
             errors.append("strict Beads query did not return the active task")
@@ -162,6 +162,57 @@ def _validate_closed_spec(value: dict[str, Any], allowed: set[str], label: str) 
         or not all(isinstance(item, str) and item for item in argv)
     ):
         raise ContinuityError(f"{label} argv must be a non-empty string list")
+
+
+def _policy_evidence_specs(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    runtime = policy.get("runtime_checks")
+    values = [
+        policy.get("focused_suite"),
+        policy.get("full_suite"),
+        *(runtime if isinstance(runtime, list) else []),
+        policy.get("rollback_check"),
+    ]
+    if not all(isinstance(value, dict) for value in values):
+        raise ContinuityError("evidence policy contains an invalid command spec")
+    return values  # type: ignore[return-value]
+
+
+def _evidence_pin_map(config: dict[str, Any]) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for item in config.get("evidence_executables", []):
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise ContinuityError("evidence executable pin is malformed")
+        token = item.get("path")
+        digest = item.get("sha256")
+        if (
+            not isinstance(token, str)
+            or not token
+            or token in pins
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ContinuityError("evidence executable pin is malformed or duplicated")
+        pins[token] = digest
+    return pins
+
+
+def _verify_evidence_entrypoint(
+    config: dict[str, Any], repo_root: Path, spec: dict[str, Any]
+) -> str:
+    token = str(spec["argv"][0])
+    pins = _evidence_pin_map(config)
+    expected = pins.get(token)
+    if expected is None:
+        raise ContinuityError(f"evidence executable is not pinned: {token}")
+    path = Path(token)
+    if not path.is_absolute():
+        path = repo_root / path
+    actual = sha256_file(path.resolve())
+    if not hmac.compare_digest(actual, expected):
+        raise ContinuityError(
+            f"evidence executable digest mismatch: expected {expected}, got {actual}"
+        )
+    return actual
 
 
 def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
@@ -230,6 +281,7 @@ def _execute_evidence(
         "rollback": ROLLBACK_SPEC_KEYS,
     }[kind]
     _validate_closed_spec(spec, allowed, f"{kind} evidence")
+    entrypoint_digest = _verify_evidence_entrypoint(config, repo_root, spec)
     argv = _resolved_argv(spec, repo_root)
     policy = config.get("evidence_policy")
     if not isinstance(policy, dict):
@@ -260,6 +312,8 @@ def _execute_evidence(
             "TZ": "UTC",
         }),
     )
+    if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
+        raise ContinuityError("evidence executable changed during execution")
     completed = datetime.now(timezone.utc)
     output = (result.stdout or "") + (result.stderr or "")
     test_count, failed_count, skipped = _test_summary(output)
@@ -333,6 +387,7 @@ def create_receipt(
             "receipt creation requires the branch to include the integration SHA"
         )
     policy = config.get("evidence_policy")
+    policy_entrypoints: set[str] | None = None
     if not isinstance(policy, dict):
         raise ContinuityError("continuity config has no evidence_policy")
     suite_key = "full_suite" if lifecycle_target == "ENFORCED" else "focused_suite"
@@ -345,6 +400,24 @@ def create_receipt(
         raise ContinuityError("runtime evidence does not match committed policy")
     if rollback != expected_rollback:
         raise ContinuityError("rollback evidence does not match committed policy")
+    policy_entrypoints = {
+        str(spec["argv"][0]) for spec in _policy_evidence_specs(policy)
+    }
+    if set(_evidence_pin_map(config)) != policy_entrypoints:
+        raise ContinuityError(
+            "evidence executable pins do not exactly match policy entrypoints"
+        )
+    if require_mounted_volume and not external_volume_available(
+        Path(config["external_volume"])
+    ):
+        raise ContinuityError("external volume is not mounted")
+    authority_check = strict_authority_check(
+        config_path,
+        cwd=cwd,
+        require_mounted_volume=require_mounted_volume,
+    )
+    if not authority_check.get("passed"):
+        raise ContinuityError("strict authority check failed")
     signing_key = receipt_signing_key(config)
     evidence_home = Path(config["state_root"]) / "evidence-home"
     evidence_home.mkdir(parents=True, exist_ok=True)
@@ -357,11 +430,7 @@ def create_receipt(
         "risk_tier": configured_tier,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git": state.as_dict(),
-        "authority_check": strict_authority_check(
-            config_path,
-            cwd=cwd,
-            require_mounted_volume=require_mounted_volume,
-        ),
+        "authority_check": authority_check,
         "external_inputs": external_input_digests(config, repo_root),
         "commands": [
             _execute_evidence(
@@ -396,6 +465,8 @@ def create_receipt(
         if rollback
         else {},
     }
+    if receipt["external_inputs"] != external_input_digests(config, repo_root):
+        raise ContinuityError("external inputs changed during evidence execution")
     final_state = git_state(
         cwd.resolve(), integration_ref=config.get("integration_ref")
     )
@@ -742,14 +813,20 @@ def static_validate(config_path: Path) -> list[str]:
                 _validate_closed_spec(value, allowed, f"evidence_policy {label}")
             except ContinuityError as exc:
                 errors.append(str(exc))
-    for item in config.get("evidence_executables", []):
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"path", "sha256"}
-            or not Path(str(item.get("path", ""))).is_absolute()
-            or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) is None
-        ):
-            errors.append("evidence executable pin is malformed")
+        try:
+            policy_entrypoints = {
+                str(spec["argv"][0]) for spec in _policy_evidence_specs(policy)
+            }
+        except (ContinuityError, KeyError, IndexError, TypeError) as exc:
+            errors.append(str(exc))
+    try:
+        evidence_pins = _evidence_pin_map(config)
+        if policy_entrypoints is not None and set(evidence_pins) != policy_entrypoints:
+            errors.append(
+                "evidence executable pins do not exactly match policy entrypoints"
+            )
+    except ContinuityError as exc:
+        errors.append(str(exc))
     for item in config.get("external_instructions", []):
         if (
             not isinstance(item, dict)

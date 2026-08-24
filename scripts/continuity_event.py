@@ -22,6 +22,7 @@ from continuity_common import (
     ContinuityError,
     atomic_write_json,
     compact_json,
+    external_volume_available,
     load_json,
 )
 
@@ -63,46 +64,62 @@ def _session_fingerprint(payload: dict[str, Any]) -> str | None:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
+def _turn_fingerprint(payload: dict[str, Any]) -> str | None:
+    extra = payload.get("extra")
+    value = extra.get("turn_id") if isinstance(extra, dict) else None
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
 def _adjacency_guard_path(config: dict[str, Any], session: str) -> Path:
     return Path(config["state_root"]) / "adjacency" / f"{session}.json"
 
 
 def _write_adjacency_guard(
-    config: dict[str, Any], session: str | None, *, allowed: bool
+    config: dict[str, Any], session: str | None, turn: str | None, *, allowed: bool
 ) -> None:
-    if session is None:
+    if session is None or turn is None:
         return
     atomic_write_json(
         _adjacency_guard_path(config, session),
         {
             "schema_version": 1,
             "session": session,
+            "turn": turn,
             "allowed": allowed,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
 
-def _consume_adjacency_guard(config: dict[str, Any], session: str | None) -> list[str]:
+def _check_adjacency_guard(
+    config: dict[str, Any], session: str | None, turn: str | None
+) -> list[str]:
     if session is None:
         return ["Hermes tool call has no session identity"]
+    if turn is None:
+        return ["Hermes tool call has no turn identity"]
     path = _adjacency_guard_path(config, session)
     try:
         guard = load_json(path)
     except ContinuityError:
         return ["Hermes tool call has no preceding adjacency check"]
     errors: list[str] = []
-    if guard.get("session") != session or guard.get("allowed") is not True:
-        errors.append("Hermes tool call adjacency check is blocked or already consumed")
+    if (
+        guard.get("session") != session
+        or guard.get("turn") != turn
+        or guard.get("allowed") is not True
+    ):
+        errors.append(
+            "Hermes tool call adjacency check is blocked or belongs to another turn"
+        )
     try:
         checked = datetime.fromisoformat(str(guard.get("checked_at")))
         if (datetime.now(timezone.utc) - checked).total_seconds() > 300:
             errors.append("Hermes tool call adjacency check is stale")
     except ValueError:
         errors.append("Hermes tool call adjacency check has an invalid timestamp")
-    guard["allowed"] = False
-    guard["consumed_at"] = datetime.now(timezone.utc).isoformat()
-    atomic_write_json(path, guard)
     return errors
 
 
@@ -127,23 +144,32 @@ def dispatch(
     result: dict[str, Any] = {"event": event_name, "surface": surface, "handled": True}
     preflight: dict[str, Any] | None = None
     session = _session_fingerprint(payload)
+    turn = _turn_fingerprint(payload)
     hermes_guard_errors: list[str] = []
+    storage_available = external_volume_available(Path(config["external_volume"]))
     if event_name in PREFLIGHT_EVENTS:
         tool_events = tool_events_from_payload(payload)
-        if surface == "hermes" and event_name == "pre_llm_call":
+        preflight = build_preflight(
+            config_path, cwd=Path.cwd(), tool_events=tool_events
+        )
+        if storage_available and surface == "hermes" and event_name == "pre_llm_call":
             adjacency_errors = (
                 validate_tool_adjacency(tool_events) if tool_events is not None else []
             )
             _write_adjacency_guard(
                 config,
                 session,
-                allowed=not adjacency_errors and tool_events is not None,
+                turn,
+                allowed=(
+                    not adjacency_errors
+                    and tool_events is not None
+                    and turn is not None
+                ),
             )
-        elif surface == "hermes" and event_name == "pre_tool_call":
-            hermes_guard_errors = _consume_adjacency_guard(config, session)
-        preflight = build_preflight(
-            config_path, cwd=Path.cwd(), tool_events=tool_events
-        )
+        elif (
+            storage_available and surface == "hermes" and event_name == "pre_tool_call"
+        ):
+            hermes_guard_errors = _check_adjacency_guard(config, session, turn)
         if hermes_guard_errors:
             preflight["errors"] = [*preflight.get("errors", []), *hermes_guard_errors]
             preflight["status"] = "BLOCKED"
@@ -189,13 +215,15 @@ def dispatch(
         "event": event_name,
         "surface": surface,
         "session": session,
+        "turn": turn,
         "preflight_status": preflight.get("status") if preflight else None,
         "completion_allowed": preflight.get("completion_allowed")
         if preflight
         else None,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
     }
-    _append_redacted_event(Path(config["event_log"]), audit)
+    if storage_available:
+        _append_redacted_event(Path(config["event_log"]), audit)
     return result
 
 

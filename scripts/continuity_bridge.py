@@ -77,9 +77,7 @@ def _read_beads(
             env=env,
         )
         if result.returncode != 0:
-            raise ContinuityError(
-                (result.stderr or result.stdout).strip() or "bd show failed"
-            )
+            raise ContinuityError(f"bd show exited with status {result.returncode}")
         task = _task_from_json(json.loads(result.stdout), task_id)
         if task is not None:
             return task, False, ""

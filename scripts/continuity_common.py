@@ -199,7 +199,10 @@ def external_input_digests(config: dict[str, Any], repo_root: Path) -> dict[str,
             raise ContinuityError(
                 "external instruction pins require exactly path and sha256"
             )
-        path = Path(str(item["path"])).resolve()
+        path = Path(str(item["path"]))
+        if not path.is_absolute():
+            path = repo_root / path
+        path = path.resolve()
         expected = item["sha256"]
         if not isinstance(expected, str) or len(expected) != 64:
             raise ContinuityError(f"external instruction has invalid SHA-256: {path}")
@@ -214,7 +217,10 @@ def external_input_digests(config: dict[str, Any], repo_root: Path) -> dict[str,
             raise ContinuityError(
                 "evidence executable pins require exactly path and sha256"
             )
-        path = Path(str(item["path"])).resolve()
+        path = Path(str(item["path"]))
+        if not path.is_absolute():
+            path = repo_root / path
+        path = path.resolve()
         expected = item["sha256"]
         actual = sha256_file(path)
         if not isinstance(expected, str) or not hmac.compare_digest(actual, expected):

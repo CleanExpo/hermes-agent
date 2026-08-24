@@ -76,8 +76,9 @@ hook dependency.
   variables; receipts MUST NOT persist raw argv/output; and external executables and
   instructions MUST match committed SHA-256 pins.
 - **FR-012**: Claude/Codex finalization and Hermes tool execution MUST use each host's
-  native blocking contract. Hermes MUST persist a content-free per-session adjacency
-  decision at `pre_llm_call` and consume it fail-closed at `pre_tool_call`. Hermes
+  native blocking contract. Hermes MUST persist a content-free per-session, per-turn
+  adjacency decision at `pre_llm_call` and enforce it fail-closed at every
+  `pre_tool_call` in that turn. Hermes
   ordinary prose remains outside shell-hook blocking; the gate MUST still prevent
   lifecycle promotion from advisory context alone.
 - **FR-013**: Receipt command, runtime, rollback, timeout, surface, risk-tier, and

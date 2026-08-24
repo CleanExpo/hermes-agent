@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ from continuity_gate import (
     managed_manifest_file_errors,
     manifest_membership_errors,
     promote,
+    static_validate,
     verify_receipt,
 )
 from install_continuity_adapters import (
@@ -640,6 +642,48 @@ def test_gate_executes_evidence_and_rejects_legacy_attestations(
     assert "sk-live-example" not in json.dumps(clean_env)
 
 
+def test_failed_beads_output_is_never_persisted(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "customer-token=TOP-SECRET"
+    real_run = continuity_gate.run_command
+
+    def fail_beads_show(argv, **kwargs):
+        if argv[:2] == [str(pilot["bd"]), "show"]:
+            return subprocess.CompletedProcess(argv, 9, "", sentinel)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(continuity_gate, "run_command", fail_beads_show)
+    with pytest.raises(ContinuityError, match="strict authority check failed") as exc:
+        _passing_receipt(pilot)
+    assert sentinel not in str(exc.value)
+    assert not (pilot["state"] / "receipts").exists()
+    monkeypatch.setattr(continuity_bridge, "run_command", fail_beads_show)
+    assert sentinel not in json.dumps(_preflight(pilot))
+
+
+def test_evidence_pin_coverage_is_closed(pilot: dict[str, Path]) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["evidence_executables"] = []
+    atomic_write_json(pilot["config"], config)
+    assert any(
+        "do not exactly match policy entrypoints" in error
+        for error in static_validate(pilot["config"])
+    )
+    _commit_and_rebind(pilot, "remove evidence pins for negative control")
+    with pytest.raises(
+        ContinuityError, match="do not exactly match policy entrypoints"
+    ):
+        _passing_receipt(pilot)
+
+    config["evidence_executables"] = [{"path": "unrelated", "sha256": "0" * 64}]
+    atomic_write_json(pilot["config"], config)
+    assert any(
+        "do not exactly match policy entrypoints" in error
+        for error in static_validate(pilot["config"])
+    )
+
+
 def test_pinned_inputs_invalidate_preflight_and_receipt(pilot: dict[str, Path]) -> None:
     instruction = pilot["state"] / "external-skill.md"
     instruction.write_text("v1\n", encoding="utf-8")
@@ -687,6 +731,7 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
         "hook_event_name": "pre_llm_call",
         "session_id": "interrupted-hermes",
         "extra": {
+            "turn_id": "interrupted-turn",
             "conversation_history": [
                 {
                     "role": "assistant",
@@ -695,7 +740,7 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
                 },
                 {"role": "user", "content": "interrupt"},
                 {"role": "tool", "tool_call_id": "call-1", "content": "late"},
-            ]
+            ],
         },
     }
     hermes_llm = subprocess.run(
@@ -727,13 +772,84 @@ def test_black_box_dispatch_and_host_block_shapes(pilot: dict[str, Path]) -> Non
             str(pilot["config"]),
         ],
         cwd=pilot["repo"],
-        input=json.dumps({"session_id": "interrupted-hermes"}),
+        input=json.dumps({
+            "session_id": "interrupted-hermes",
+            "extra": {"turn_id": "interrupted-turn"},
+        }),
         text=True,
         capture_output=True,
         check=False,
     )
     assert hermes_process.returncode == 2
     assert json.loads(hermes_process.stdout)["action"] == "block"
+
+    healthy_llm = subprocess.run(
+        [
+            sys.executable,
+            str(entry),
+            "pre_llm_call",
+            "--surface",
+            "hermes",
+            "--config",
+            str(pilot["config"]),
+        ],
+        cwd=pilot["repo"],
+        input=json.dumps({
+            "session_id": "healthy-hermes",
+            "extra": {
+                "turn_id": "healthy-turn",
+                "conversation_history": [{"role": "user", "content": "healthy"}],
+            },
+        }),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert healthy_llm.returncode == 0
+    for _ in range(2):
+        healthy_tool = subprocess.run(
+            [
+                sys.executable,
+                str(entry),
+                "pre_tool_call",
+                "--surface",
+                "hermes",
+                "--config",
+                str(pilot["config"]),
+            ],
+            cwd=pilot["repo"],
+            input=json.dumps({
+                "session_id": "healthy-hermes",
+                "extra": {"turn_id": "healthy-turn"},
+            }),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert healthy_tool.returncode == 0
+        assert json.loads(healthy_tool.stdout).get("action") != "block"
+
+    cross_turn = subprocess.run(
+        [
+            sys.executable,
+            str(entry),
+            "pre_tool_call",
+            "--surface",
+            "hermes",
+            "--config",
+            str(pilot["config"]),
+        ],
+        cwd=pilot["repo"],
+        input=json.dumps({
+            "session_id": "healthy-hermes",
+            "extra": {"turn_id": "other-turn"},
+        }),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert cross_turn.returncode == 2
+    assert json.loads(cross_turn.stdout)["action"] == "block"
 
     pilot["card"].unlink()
     for surface in ("claude", "codex"):
@@ -964,6 +1080,44 @@ def test_dispatcher_logs_metadata_not_payload(pilot: dict[str, Path]) -> None:
     assert "post_tool" in log
 
 
+def test_unmounted_volume_causes_no_state_writes(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import continuity_event
+
+    def forbidden_write(*_args, **_kwargs):
+        raise AssertionError("state write attempted while volume unavailable")
+
+    monkeypatch.setattr(continuity_event, "external_volume_available", lambda _p: False)
+    monkeypatch.setattr(continuity_event, "atomic_write_json", forbidden_write)
+    monkeypatch.setattr(continuity_event, "_append_redacted_event", forbidden_write)
+    dispatch(
+        "pre_llm_call",
+        "hermes",
+        pilot["config"],
+        {
+            "session_id": "unmounted",
+            "extra": {"turn_id": "unmounted-turn", "conversation_history": []},
+        },
+    )
+
+    monkeypatch.setattr(continuity_gate, "external_volume_available", lambda _p: False)
+    policy = _policy(pilot)
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        create_receipt(
+            pilot["config"],
+            cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="TESTED",
+            commands=[policy["focused_suite"]],
+            runtime_checks=policy["runtime_checks"],
+            rollback=policy["rollback_check"],
+            require_mounted_volume=True,
+        )
+    assert not (pilot["state"] / "receipt-signing.key").exists()
+    assert not (pilot["state"] / "evidence-home").exists()
+
+
 def test_committed_adapters_match_single_contract() -> None:
     for path, rendered in render_project_adapters(REPO_ROOT).items():
         assert path.read_text(encoding="utf-8") == rendered
@@ -992,4 +1146,40 @@ def test_supply_chain_manifest_membership_is_closed() -> None:
     assert any(
         "outside managed" in error
         for error in managed_manifest_file_errors({"one", "extra"}, {"one"})
+    )
+
+
+def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
+    workflow = (REPO_ROOT / ".github/workflows/continuity-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    for protected in (
+        ".agents/skills/speckit-*/**",
+        ".claude/skills/speckit-*/**",
+        "scripts/run_tests.sh",
+        "AGENTS.md",
+        ".github/workflows/continuity-gate.yml",
+        "docs/continuity-pilot.md",
+    ):
+        assert workflow.count(f"- '{protected}'") == 2
+    patterns = {
+        stripped[3:-1]
+        for line in workflow.splitlines()
+        if (stripped := line.strip()).startswith("- '") and stripped.endswith("'")
+    }
+    config = json.loads((REPO_ROOT / ".continuity/config.json").read_text())
+    protected_paths = set(config["instructions"])
+    policy = config["evidence_policy"]
+    for spec in [
+        policy["focused_suite"],
+        policy["full_suite"],
+        *policy["runtime_checks"],
+        policy["rollback_check"],
+    ]:
+        if len(spec["argv"]) > 1 and not Path(spec["argv"][1]).is_absolute():
+            protected_paths.add(spec["argv"][1])
+    for manifest_path in (REPO_ROOT / ".specify/integrations").glob("*.manifest.json"):
+        protected_paths.update(json.loads(manifest_path.read_text())["files"])
+    assert all(
+        any(fnmatch(path, pattern) for pattern in patterns) for path in protected_paths
     )
