@@ -49,19 +49,26 @@ pilot does not alter `~/.hermes`, `~/.claude`, or `~/.codex`.
 ### Native-containment platform boundary
 
 Routine preflight, adapter, and static-contract commands remain available on the
-designated macOS pilot host. Exact native host observation has a stronger boundary:
-the observer must be able to reap descendants even if a child creates a new session
-and clears its environment. Windows satisfies that contract with a kill-on-close Job
-Object and Linux uses a nested child subreaper with bounded adopted-generation
-cleanup.
+designated macOS pilot host. Receipt evidence commands and exact native host
+observation have a stronger boundary: the controller must be able to reap descendants
+even if a child creates a new session and clears its environment. Windows satisfies
+that contract with a kill-on-close Job Object and Linux uses a nested child subreaper
+with bounded adopted-generation cleanup and an explicit cleanup acknowledgement.
+
+Native Windows proof is CI-owned, not inferred from the macOS run. A Python change
+activates `.github/workflows/ci.yaml`'s OS-specific workflow, whose Windows lane runs
+the repository's `windows_only` set on a real Windows runner and fails if selection is
+empty. Until that lane passes for the pushed SHA, the Job Object contract is not
+release evidence.
 
 macOS has no equivalent supported unprivileged primitive. Process groups, process
 snapshots, environment family tokens, Seatbelt, and launchd jobs can all be escaped by
-a sufficiently fast `setsid` child. The observer therefore fails closed before
-launching Claude, Codex, or Hermes on macOS until an approved privileged helper exists.
-Consequently, `ENFORCED` promotion remains unavailable on the designated Mac rather
-than recording an observation whose cleanup guarantee cannot be proved. Ubuntu CI is
-still static evidence and is not a substitute for the missing exact-host observation.
+a sufficiently fast `setsid` child. The controller therefore fails closed before
+launching receipt evidence, Claude, Codex, or Hermes on macOS until an approved
+privileged helper exists. Consequently, `TESTED` and `ENFORCED` promotion remain
+unavailable on the designated Mac rather than recording evidence whose cleanup
+guarantee cannot be proved. Ubuntu CI is still static evidence and is not a substitute
+for the missing exact-host observation.
 
 ```bash
 python3 scripts/continuity_bridge.py --config .continuity/config.json --cwd "$PWD"
@@ -107,13 +114,14 @@ mode-`0600` pilot-local HMAC key loaded before evidence starts. `ENFORCED` uses 
 committed full-suite identity. Any commit, dirty-state change, integration-ref advance,
 executable-pin change, or external-input drift invalidates the receipt.
 
-Evidence commands run in their own process group. Native observations additionally
-require a non-escapable host primitive: a Windows Job Object or Linux child subreaper.
-Timeout or interruption reaps the whole descendant tree with bounded TERM-to-KILL
-escalation. The authenticated receipt
-also fingerprints the exact hashed requirements lock, Python launcher and executable,
-and installed distribution metadata; a lock mismatch or later resolved-environment
-change fails verification. Native runtime records bind Claude, Codex, and Hermes
+Routine support commands run in their own process group. Receipt evidence and native
+observations require a non-escapable host primitive: a Windows Job Object or Linux
+child subreaper with explicit cleanup acknowledgement. Timeout or interruption must
+reap the whole descendant tree with bounded TERM-to-KILL escalation or fail the
+evidence. The authenticated receipt also fingerprints the exact hashed requirements
+lock, Python launcher and executable, and installed distribution metadata; a lock
+mismatch or later resolved-environment change fails verification. Native runtime
+records bind Claude, Codex, and Hermes
 observations to the committed event and adapter path, every configured adapter
 artifact digest, the post-execution host executable identity, the current commit, and
 a five-minute freshness window. Missing-observation diagnostics obtain `last_success`

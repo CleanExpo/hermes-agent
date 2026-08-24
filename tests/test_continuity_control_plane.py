@@ -568,6 +568,21 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
         render_markdown_frontmatter(card_data, card_body), encoding="utf-8"
     )
     monkeypatch.setattr(continuity_gate, "CANONICAL_CONFIG_PATH", config_path)
+    if sys.platform == "darwin":
+        # Receipt-policy unit tests exercise post-spawn record validation. The
+        # production path still requests strict containment, which separately
+        # fails closed before execution on Darwin.
+        real_gate_run_command = continuity_gate.run_command
+
+        def run_receipt_fixture_without_native_boundary(*args, **kwargs):
+            kwargs["require_native_containment"] = False
+            return real_gate_run_command(*args, **kwargs)
+
+        monkeypatch.setattr(
+            continuity_gate,
+            "run_command",
+            run_receipt_fixture_without_native_boundary,
+        )
     return {
         "repo": repo,
         "state": state,
@@ -1479,6 +1494,99 @@ def test_native_history_preserves_content_block_interruptions() -> None:
         },
     ])
     assert not validate_tool_adjacency(openai_parallel)
+
+
+def test_receipt_evidence_requires_strict_native_containment(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    spec = config["evidence_policy"]["focused_suite"]
+    captured: dict[str, object] = {}
+
+    def capture_run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "1 passed\n", "")
+
+    monkeypatch.setattr(continuity_gate, "run_command", capture_run)
+
+    continuity_gate._execute_evidence(
+        spec,
+        pilot["repo"],
+        kind="command",
+        evidence_home=pilot["state"],
+        config=config,
+        index=0,
+    )
+
+    assert captured["require_native_containment"] is True
+
+
+def _detaching_receipt_spec(
+    pilot: dict[str, Path],
+) -> tuple[dict, dict, Path]:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    sentinel = pilot["state"] / "evidence-child-survived.txt"
+    script = pilot["repo"] / "scripts/receipt_detach.py"
+    leaf = (
+        "import pathlib,sys,time; time.sleep(2.0); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    script.write_text(
+        "import subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', {leaf!r}, sys.argv[1]], "
+        "start_new_session=True, env={})\n"
+        "time.sleep(0.005)\n"
+        "print('1 passed')\n",
+        encoding="utf-8",
+    )
+    spec = dict(config["evidence_policy"]["focused_suite"])
+    spec["argv"] = [sys.executable, "scripts/receipt_detach.py", str(sentinel)]
+    return config, spec, sentinel
+
+
+@pytest.mark.macos_only
+def test_receipt_evidence_detach_fails_closed_before_launch_on_macos(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, spec, sentinel = _detaching_receipt_spec(pilot)
+    monkeypatch.setattr(continuity_gate, "run_command", run_command)
+
+    with pytest.raises(
+        ContinuityError, match="native macOS descendant containment"
+    ):
+        continuity_gate._execute_evidence(
+            spec,
+            pilot["repo"],
+            kind="command",
+            evidence_home=pilot["state"],
+            config=config,
+            index=0,
+        )
+
+    assert not sentinel.exists()
+
+
+@pytest.mark.linux_only
+def test_receipt_evidence_env_clearing_detach_is_strictly_contained_on_linux(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, spec, sentinel = _detaching_receipt_spec(pilot)
+    monkeypatch.setattr(continuity_gate, "run_command", run_command)
+
+    record = continuity_gate._execute_evidence(
+        spec,
+        pilot["repo"],
+        kind="command",
+        evidence_home=pilot["state"],
+        config=config,
+        index=0,
+    )
+
+    assert record["exit_code"] == 0
+    assert record["test_count"] == 1
+    time.sleep(2.2)
+    assert not sentinel.exists()
 
 
 def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) -> None:
@@ -2717,6 +2825,149 @@ def test_linux_subreaper_reaps_multigeneration_token_scrubbed_detach(
     assert not sentinel.exists()
 
 
+@pytest.mark.linux_only
+def test_linux_subreaper_ack_preserves_target_return_code_125(
+    tmp_path: Path,
+) -> None:
+    result = run_command(
+        [sys.executable, "-c", "raise SystemExit(125)"],
+        cwd=tmp_path,
+        timeout=5,
+        env={},
+        require_native_containment=True,
+    )
+
+    assert result.returncode == 125
+
+
+@pytest.mark.linux_only
+def test_linux_subreaper_missing_cleanup_ack_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_ack_wrapper = (
+        "import os,sys; os.close(int(sys.argv[2])); raise SystemExit(0)"
+    )
+    monkeypatch.setattr(continuity_common, "_LINUX_SUBREAPER", no_ack_wrapper)
+
+    with pytest.raises(ContinuityError, match="acknowledgement is missing"):
+        run_command(
+            [sys.executable, "-c", "raise SystemExit('must not execute')"],
+            cwd=tmp_path,
+            timeout=5,
+            env={},
+            require_native_containment=True,
+        )
+
+
+@pytest.mark.linux_only
+def test_linux_subreaper_cleanup_error_125_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_error_wrapper = (
+        "import os,sys; fd=int(sys.argv[2]); "
+        "os.write(fd,b'CLEANUP_ERROR\\n'); os.close(fd); raise SystemExit(125)"
+    )
+    monkeypatch.setattr(
+        continuity_common, "_LINUX_SUBREAPER", cleanup_error_wrapper
+    )
+
+    with pytest.raises(ContinuityError, match="reported cleanup failure"):
+        run_command(
+            [sys.executable, "-c", "raise SystemExit(125)"],
+            cwd=tmp_path,
+            timeout=5,
+            env={},
+            require_native_containment=True,
+        )
+
+
+@pytest.mark.linux_only
+def test_linux_subreaper_last_resort_wrapper_kill_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hung_wrapper = (
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    monkeypatch.setattr(continuity_common, "_LINUX_SUBREAPER", hung_wrapper)
+
+    with pytest.raises(ContinuityError, match="last-resort wrapper kill"):
+        run_command(
+            [sys.executable, "-c", "raise SystemExit('must not execute')"],
+            cwd=tmp_path,
+            timeout=0.1,
+            env={},
+            require_native_containment=True,
+        )
+
+
+@pytest.mark.linux_only
+def test_linux_subreaper_hides_cleanup_capability_from_target(
+    tmp_path: Path,
+) -> None:
+    attempted = tmp_path / "wrapper-fd-attack-attempted.txt"
+    target = (
+        "import os,pathlib,sys; "
+        "path=pathlib.Path('/proc') / str(os.getppid()) / 'fd'; "
+        "pathlib.Path(sys.argv[1]).write_text('attempted', encoding='utf-8'); "
+        "\nfor name in os.listdir(path):\n"
+        " try:\n"
+        "  fd=os.open(path / name, os.O_WRONLY | os.O_NONBLOCK)\n"
+        " except (OSError, PermissionError):\n"
+        "  continue\n"
+        " try:\n"
+        "  os.write(fd, b'CLEANUP_ERROR\\n')\n"
+        " except OSError:\n"
+        "  pass\n"
+        " finally:\n"
+        "  os.close(fd)"
+    )
+
+    result = run_command(
+        [sys.executable, "-c", target, str(attempted)],
+        cwd=tmp_path,
+        timeout=5,
+        env={},
+        require_native_containment=True,
+    )
+
+    assert result.returncode == 0
+    assert attempted.exists()
+
+
+@pytest.mark.linux_only
+def test_linux_subreaper_child_signal_cleans_tree(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "poll-lock-descendant-survived.txt"
+    launched = tmp_path / "poll-lock-descendant-launched.txt"
+    leaf = (
+        "import pathlib,sys,time; time.sleep(2.0); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    target = (
+        "import os,pathlib,signal,subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {leaf!r}, sys.argv[1]], "
+        "start_new_session=True, env={}); "
+        "pathlib.Path(sys.argv[2]).write_text('launched', encoding='utf-8'); "
+        "os.kill(os.getppid(), signal.SIGTERM); "
+        "time.sleep(30)"
+    )
+
+    result = run_command(
+        [sys.executable, "-c", target, str(sentinel), str(launched)],
+        cwd=tmp_path,
+        timeout=5,
+        env={},
+        require_native_containment=True,
+    )
+
+    assert result.returncode == 128 + signal.SIGTERM
+    assert launched.exists()
+    time.sleep(2.2)
+    assert not sentinel.exists()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
 def test_linux_strict_containment_ignores_forged_ambient_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2800,9 +3051,11 @@ def test_linux_subreaper_cleans_tree_when_controller_is_sigkilled(
     )
     controller = (
         "import os,pathlib,subprocess,sys,time; "
+        "ack_read,ack_write=os.pipe(); "
         "wrapper=subprocess.Popen([sys.executable, '-I', '-c', sys.argv[1], "
-        "str(os.getpid()), sys.executable, '-c', sys.argv[2], "
-        "sys.argv[4], sys.argv[5]]); "
+        "str(os.getpid()), str(ack_write), sys.executable, '-c', sys.argv[2], "
+        "sys.argv[4], sys.argv[5]], pass_fds=(ack_write,)); "
+        "os.close(ack_write); "
         "pathlib.Path(sys.argv[3]).write_text(str(wrapper.pid), encoding='utf-8'); "
         "time.sleep(30)"
     )

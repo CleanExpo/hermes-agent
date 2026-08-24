@@ -111,15 +111,22 @@ The synchronous diagnostic requirement is present, but a hook that stops being i
 
 This merges eng-release's environment-parity finding: Ubuntu static CI remains useful but cannot substitute for an authenticated exact-HEAD observation on the designated macOS pilot host. [VERIFIED] `.github/workflows/continuity-gate.yml:48-67` and `docs/continuity-pilot.md:50-65`.
 
-[PRESCRIBED] Native observation must not launch when the host cannot provide a
-non-escapable descendant-cleanup primitive. Windows Job Objects and a Linux child
-subreaper meet the current bounded contract. Unprivileged macOS process groups,
+[PRESCRIBED] Receipt evidence and native observation must not launch when the host
+cannot provide a non-escapable descendant-cleanup primitive. Windows Job Objects and
+a Linux child subreaper with explicit cleanup acknowledgement meet the current bounded
+contract. Unprivileged macOS process groups,
 process snapshots, environment markers, Seatbelt profiles, and launchd jobs do not:
 a fast child can create a new session, clear inherited markers, and outlive the
 observer. Until an approved privileged macOS helper provides an equivalent boundary,
-the designated-host observation and therefore `ENFORCED` promotion fail closed. This
-is an explicit pilot limitation; Ubuntu evidence still cannot substitute for the
-missing exact macOS observation.
+receipt evidence, designated-host observation, and therefore `TESTED`/`ENFORCED`
+promotion fail closed. This is an explicit pilot limitation; Ubuntu evidence still
+cannot substitute for the missing exact macOS observation.
+
+[VERIFIED] Windows behavior is executed by the repository CI orchestrator rather than
+the continuity-only static workflow: `.github/workflows/ci.yaml` calls
+`.github/workflows/tests-os.yml` for every Python change, and the native Windows lane
+runs the closed `windows_only` marker set with a zero-selection hard failure. A local
+macOS skip is never sufficient evidence for the Windows Job Object claim.
 
 ## Bounded output and execution
 

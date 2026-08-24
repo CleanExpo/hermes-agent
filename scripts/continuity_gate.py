@@ -782,6 +782,7 @@ def _execute_evidence(
             external_volume=config["external_volume"],
         ),
         required_mount=(config["external_volume"], config["state_root"]),
+        require_native_containment=True,
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")

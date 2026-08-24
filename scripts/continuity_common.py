@@ -1068,13 +1068,26 @@ def _isolated_process_options(*, suspended: bool = False) -> dict[str, Any]:
 _LINUX_SUBREAPER = r"""
 import ctypes, os, signal, subprocess, sys, time
 
+expected_parent_pid = int(sys.argv[1])
+cleanup_ack_fd = int(sys.argv[2])
+
+def acknowledge(status):
+    try:
+        os.write(cleanup_ack_fd, (status + '\n').encode('ascii'))
+    except OSError:
+        pass
+    try:
+        os.close(cleanup_ack_fd)
+    except OSError:
+        pass
+
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+    acknowledge('CONTAINMENT_ERROR')
     raise SystemExit(125)
 
 child = None
-terminating = False
-expected_parent_pid = int(sys.argv[1])
+pending_signal = None
 
 def direct_children():
     found = []
@@ -1129,13 +1142,15 @@ def cleanup():
     signal_children(signal.SIGKILL)
     reap_exited()
     if direct_children():
+        acknowledge('CLEANUP_ERROR')
         raise SystemExit(125)
 
-def terminate(signum, _frame):
-    global terminating
-    if terminating:
-        return
-    terminating = True
+def request_termination(signum, _frame):
+    global pending_signal
+    if pending_signal is None:
+        pending_signal = signum
+
+def terminate(signum):
     if child is not None and child.poll() is None:
         try:
             child.terminate()
@@ -1150,28 +1165,49 @@ def terminate(signum, _frame):
                 pass
             child.wait()
     cleanup()
+    acknowledge('CLEANUP_OK')
     raise SystemExit(128 + signum)
 
-signal.signal(signal.SIGTERM, terminate)
-signal.signal(signal.SIGINT, terminate)
+signal.signal(signal.SIGTERM, request_termination)
+signal.signal(signal.SIGINT, request_termination)
 # If the controlling Hermes process is killed, retain the wrapper long enough
 # to run its bounded adopted-descendant cleanup. Check for the standard race in
 # which the parent exits between recording its PID and arming PDEATHSIG.
 if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+    acknowledge('CONTAINMENT_ERROR')
     raise SystemExit(125)
 if os.getppid() != expected_parent_pid:
-    terminate(signal.SIGTERM, None)
+    terminate(signal.SIGTERM)
+# Keep the acknowledgement capability private from the target. Linux resets
+# dumpability for an exec'd target, but the wrapper itself remains protected.
+if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+    acknowledge('CONTAINMENT_ERROR')
+    raise SystemExit(125)
+if pending_signal is not None:
+    terminate(pending_signal)
 try:
-    child = subprocess.Popen(sys.argv[2:], env=os.environ.copy())
+    child = subprocess.Popen(
+        sys.argv[3:], env=os.environ.copy(), close_fds=True
+    )
 except OSError:
+    acknowledge('CONTAINMENT_ERROR')
     raise SystemExit(126)
-returncode = child.wait()
+while child.poll() is None:
+    # The Python signal handler only records intent. It never touches Popen,
+    # so an interruption while poll() holds its waitpid lock cannot re-enter it.
+    if pending_signal is not None:
+        terminate(pending_signal)
+    time.sleep(0.05)
+returncode = child.returncode
 cleanup()
+acknowledge('CLEANUP_OK')
 raise SystemExit(returncode)
 """
 
 
-def _native_posix_containment_command(args: list[str]) -> list[str]:
+def _native_posix_containment_command(
+    args: list[str], *, cleanup_ack_fd: int | None = None
+) -> list[str]:
     system = platform.system().lower()
     if system == "darwin":
         raise ContinuityError(
@@ -1179,12 +1215,17 @@ def _native_posix_containment_command(args: list[str]) -> list[str]:
             "privileged helper"
         )
     if system == "linux" and Path("/proc").is_dir():
+        if cleanup_ack_fd is None:
+            raise ContinuityError(
+                "Linux native containment requires a cleanup acknowledgement channel"
+            )
         return [
             sys.executable,
             "-I",
             "-c",
             _LINUX_SUBREAPER,
             str(os.getpid()),
+            str(cleanup_ack_fd),
             *args,
         ]
     raise ContinuityError(
@@ -1292,6 +1333,7 @@ class _ContainedProcess:
     windows_job: int | None = None
     windows_directory_lease: ExitStack | None = None
     linux_subreaper: bool = False
+    linux_cleanup_ack_fd: int | None = None
     terminated: bool = False
     tracked_descendants: dict[tuple[int, float], psutil.Process] = field(
         default_factory=dict
@@ -1379,14 +1421,69 @@ class _ContainedProcess:
         with self.descendant_lock:
             return tuple(self.tracked_descendants.values())
 
+    def _require_linux_cleanup_ack(self, *, fallback_kill: bool) -> None:
+        descriptor = self.linux_cleanup_ack_fd
+        self.linux_cleanup_ack_fd = None
+        if descriptor is None:
+            raise ContinuityError(
+                "Linux native containment cleanup acknowledgement is unavailable"
+            )
+        if fallback_kill:
+            os.close(descriptor)
+            raise ContinuityError(
+                "Linux native containment required a last-resort wrapper kill"
+            )
+        try:
+            import select
+
+            readable, _writable, _exceptional = select.select(
+                [descriptor], [], [descriptor], 0.1
+            )
+            if not readable:
+                raise ContinuityError(
+                    "Linux native containment cleanup acknowledgement timed out"
+                )
+            acknowledgement = os.read(descriptor, 64)
+        except OSError as exc:
+            raise ContinuityError(
+                "Linux native containment cleanup acknowledgement could not be read"
+            ) from exc
+        finally:
+            os.close(descriptor)
+        if acknowledgement == b"CLEANUP_OK\n":
+            return
+        if acknowledgement in {
+            b"CLEANUP_ERROR\n",
+            b"CONTAINMENT_ERROR\n",
+        }:
+            raise ContinuityError(
+                "Linux native containment reported cleanup failure"
+            )
+        raise ContinuityError(
+            "Linux native containment cleanup acknowledgement is missing or invalid"
+        )
+
     def terminate_tree(self) -> None:
         if self.terminated:
             return
         self.terminated = True
+        try:
+            self._terminate_tree_owned()
+        finally:
+            descriptor = self.linux_cleanup_ack_fd
+            self.linux_cleanup_ack_fd = None
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _terminate_tree_owned(self) -> None:
         tracked_descendants = self._finish_descendant_monitor()
         with self.descendant_lock:
             prior_identities = set(self.tracked_descendants)
         job_error: OSError | None = None
+        linux_fallback_kill = False
         if self.windows_job is not None:
             try:
                 _close_windows_job(self.windows_job)
@@ -1396,13 +1493,17 @@ class _ContainedProcess:
         try:
             if self.linux_subreaper:
                 if self.process.poll() is None:
-                    self.process.terminate()
+                    try:
+                        self.process.terminate()
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
                     try:
                         # The wrapper reserves 0.2s for cooperative child exit
                         # and 2.2s for iterative adopted-generation cleanup.
                         # Leave scheduling margin before the last-resort kill.
                         self.process.wait(timeout=3.5)
                     except subprocess.TimeoutExpired:
+                        linux_fallback_kill = True
                         _terminate_process_tree(
                             self.process,
                             process_group=self.process_group,
@@ -1410,6 +1511,9 @@ class _ContainedProcess:
                         )
                 # A completed wrapper already reaped its adopted tree. Do not
                 # signal its released process-group number, which may be reused.
+                self._require_linux_cleanup_ack(
+                    fallback_kill=linux_fallback_kill
+                )
             else:
                 _terminate_process_tree(
                     self.process,
@@ -1456,10 +1560,25 @@ def _spawn_contained_process(
     spawn_args = args
     process_options = _isolated_process_options(suspended=suspended)
     linux_subreaper = False
+    linux_cleanup_ack_read: int | None = None
+    linux_cleanup_ack_write: int | None = None
     if os.name == "posix":
         if require_native_containment:
-            spawn_args = _native_posix_containment_command(args)
             linux_subreaper = platform.system().lower() == "linux"
+            if linux_subreaper:
+                linux_cleanup_ack_read, linux_cleanup_ack_write = os.pipe()
+                os.set_inheritable(linux_cleanup_ack_write, True)
+                process_options["pass_fds"] = (linux_cleanup_ack_write,)
+            try:
+                spawn_args = _native_posix_containment_command(
+                    args, cleanup_ack_fd=linux_cleanup_ack_write
+                )
+            except BaseException:
+                if linux_cleanup_ack_read is not None:
+                    os.close(linux_cleanup_ack_read)
+                if linux_cleanup_ack_write is not None:
+                    os.close(linux_cleanup_ack_write)
+                raise
     kwargs["env"] = spawn_env
     directory_lease: ExitStack | None = None
     if os.name == "nt":
@@ -1490,6 +1609,10 @@ def _spawn_contained_process(
             **process_options,
         )
     except BaseException as exc:
+        if linux_cleanup_ack_read is not None:
+            os.close(linux_cleanup_ack_read)
+        if linux_cleanup_ack_write is not None:
+            os.close(linux_cleanup_ack_write)
         if directory_lease is not None:
             directory_lease.close()
         if isinstance(exc, OSError):
@@ -1497,6 +1620,8 @@ def _spawn_contained_process(
                 f"command failed to start: {args[0]}: {exc}"
             ) from exc
         raise
+    if linux_cleanup_ack_write is not None:
+        os.close(linux_cleanup_ack_write)
     if os.name == "nt":
         try:
             job = _create_windows_kill_job(process)
@@ -1525,8 +1650,16 @@ def _spawn_contained_process(
         family_token=family_token,
         process_group=process.pid if os.name == "posix" else None,
         linux_subreaper=linux_subreaper,
+        linux_cleanup_ack_fd=linux_cleanup_ack_read,
     )
-    contained.start_descendant_monitor()
+    try:
+        contained.start_descendant_monitor()
+    except BaseException:
+        try:
+            contained.terminate_tree()
+        except BaseException:
+            pass
+        raise
     return contained
 
 
