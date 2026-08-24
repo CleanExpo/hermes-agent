@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import sys
@@ -13,6 +14,9 @@ from typing import Any
 import yaml
 
 from continuity_common import ContinuityError, atomic_write_text, load_json
+
+
+HERMES_MANIFEST = "continuity-adapter-manifest.json"
 
 
 CLAUDE_EVENT_NAMES = {
@@ -81,14 +85,117 @@ def render_hermes_config(
     hooks = dict(config.get("hooks") or {})
     entry = repo_root / ".specify/events.py"
     for event in contract["surfaces"]["hermes"]:
-        hooks[event] = [
-            {
-                "command": f"python3 {shlex.quote(str(entry))} {event} --surface hermes",
-                "timeout": timeout,
-            }
-        ]
+        hook = {
+            "command": f"python3 {shlex.quote(str(entry))} {event} --surface hermes",
+            "timeout": timeout,
+        }
+        if event == "pre_tool_call":
+            hook["fail_closed"] = True
+        hooks[event] = [hook]
     config["hooks"] = hooks
     return yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _load_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.is_file():
+        return {}, ""
+    text = path.read_text(encoding="utf-8")
+    loaded = yaml.safe_load(text) or {}
+    if not isinstance(loaded, dict):
+        raise ContinuityError(f"existing YAML is not a mapping: {path}")
+    return loaded, text
+
+
+def _managed_hermes_hooks(repo_root: Path) -> dict[str, Any]:
+    rendered = yaml.safe_load(render_hermes_config(repo_root)) or {}
+    return dict(rendered.get("hooks") or {})
+
+
+def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
+    target = hermes_home.resolve() / "config.yaml"
+    manifest_path = hermes_home.resolve() / HERMES_MANIFEST
+    existing, before_text = _load_yaml_mapping(target)
+    installed_hooks = _managed_hermes_hooks(repo_root)
+    hooks = dict(existing.get("hooks") or {})
+
+    if manifest_path.is_file():
+        prior = load_json(manifest_path)
+        if prior.get("status") == "INSTALLED":
+            if prior.get("repo_root") != str(repo_root):
+                raise ContinuityError("Hermes adapter is owned by another repository")
+            current = {name: hooks.get(name) for name in installed_hooks}
+            if current != prior.get("installed_hooks"):
+                raise ContinuityError("managed Hermes hooks changed after installation")
+            return {"hermes_config": str(target), "installed": True, "changed": False}
+
+    before_hooks = {name: hooks[name] for name in installed_hooks if name in hooks}
+    absent_before = sorted(name for name in installed_hooks if name not in hooks)
+    after_text = render_hermes_config(repo_root, existing)
+    manifest = {
+        "schema_version": 1,
+        "status": "INSTALLED",
+        "repo_root": str(repo_root),
+        "target": str(target),
+        "before_sha256": _sha256_text(before_text),
+        "after_sha256": _sha256_text(after_text),
+        "before_hooks": before_hooks,
+        "absent_before": absent_before,
+        "installed_hooks": installed_hooks,
+    }
+    atomic_write_text(target, after_text)
+    atomic_write_text(
+        manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    return {"hermes_config": str(target), "installed": True, "changed": True}
+
+
+def rollback_hermes_adapter(
+    repo_root: Path, hermes_home: Path, *, apply: bool
+) -> dict[str, Any]:
+    manifest_path = hermes_home.resolve() / HERMES_MANIFEST
+    manifest = load_json(manifest_path)
+    if manifest.get("repo_root") != str(repo_root):
+        raise ContinuityError("rollback manifest belongs to another repository")
+    if manifest.get("status") != "INSTALLED":
+        raise ContinuityError("Hermes adapter is not in INSTALLED state")
+    target = Path(str(manifest.get("target"))).resolve()
+    if target != hermes_home.resolve() / "config.yaml":
+        raise ContinuityError("rollback manifest target is outside Hermes home")
+    config, _ = _load_yaml_mapping(target)
+    hooks = dict(config.get("hooks") or {})
+    installed = manifest.get("installed_hooks")
+    if not isinstance(installed, dict):
+        raise ContinuityError("rollback manifest has invalid installed hooks")
+    current = {name: hooks.get(name) for name in installed}
+    if current != installed:
+        raise ContinuityError("managed Hermes hooks changed after installation")
+    if not apply:
+        return {"rollback_valid": True, "applied": False, "target": str(target)}
+
+    before_hooks = manifest.get("before_hooks")
+    absent_before = manifest.get("absent_before")
+    if not isinstance(before_hooks, dict) or not isinstance(absent_before, list):
+        raise ContinuityError("rollback manifest has invalid before-image")
+    for event in installed:
+        if event in before_hooks:
+            hooks[event] = before_hooks[event]
+        elif event in absent_before:
+            hooks.pop(event, None)
+        else:
+            raise ContinuityError(f"rollback manifest has no before-image for {event}")
+    config["hooks"] = hooks
+    restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    atomic_write_text(target, restored)
+    manifest["status"] = "ROLLED_BACK"
+    manifest["restored_sha256"] = _sha256_text(restored)
+    atomic_write_text(
+        manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    return {"rollback_valid": True, "applied": True, "target": str(target)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--hermes-home", type=Path)
     parser.add_argument("--apply-hermes", action="store_true")
+    parser.add_argument("--rollback-dry-run", action="store_true")
+    parser.add_argument("--rollback-apply", action="store_true")
     args = parser.parse_args(argv)
     repo_root = args.repo_root.resolve()
     try:
@@ -108,18 +217,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ContinuityError(
                 "generated adapters are stale: " + ", ".join(mismatches)
             )
-        if args.apply_hermes:
+        modes = sum((args.apply_hermes, args.rollback_dry_run, args.rollback_apply))
+        if modes > 1:
+            raise ContinuityError("choose only one Hermes mutation or rollback mode")
+        if modes:
             if args.hermes_home is None:
-                raise ContinuityError("--hermes-home is required with --apply-hermes")
-            target = args.hermes_home.resolve() / "config.yaml"
-            existing: dict[str, Any] = {}
-            if target.is_file():
-                loaded = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
-                if not isinstance(loaded, dict):
-                    raise ContinuityError("existing Hermes config is not a mapping")
-                existing = loaded
-            atomic_write_text(target, render_hermes_config(repo_root, existing))
-            print(json.dumps({"hermes_config": str(target), "installed": True}))
+                raise ContinuityError("--hermes-home is required for Hermes operations")
+            if args.apply_hermes:
+                result = install_hermes_adapter(repo_root, args.hermes_home)
+            else:
+                result = rollback_hermes_adapter(
+                    repo_root, args.hermes_home, apply=args.rollback_apply
+                )
+            print(json.dumps(result, sort_keys=True))
         else:
             print(json.dumps({"valid": not mismatches, "mismatches": mismatches}))
         return 0

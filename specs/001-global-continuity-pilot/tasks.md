@@ -6,5 +6,5 @@
 - [x] Implement authority preflight and tool-adjacency checks.
 - [x] Implement exact-state receipt and lifecycle promotion gate.
 - [x] Generate all host adapters from one dispatcher contract.
-- [x] Run fixture failure drills and real-path sandbox smoke tests.
-- [x] Rebind evidence to the final commit and dry-run rollback.
+- [ ] Run expanded fixture failure drills and real-path sandbox smoke tests.
+- [ ] Rebind evidence to the final commit and executed rollback dry-run.

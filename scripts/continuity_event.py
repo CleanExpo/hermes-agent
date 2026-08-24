@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,17 @@ from continuity_common import ContinuityError, compact_json, load_json
 
 
 MAX_STDIN_BYTES = 1_048_576
-PREFLIGHT_EVENTS = {"session_start", "on_session_start", "pre_llm_call"}
+PREFLIGHT_EVENTS = {
+    "session_start",
+    "on_session_start",
+    "pre_llm_call",
+    "pre_tool",
+    "pre_tool_call",
+    "stop",
+    "session_end",
+    "on_session_end",
+}
+FINALIZATION_EVENTS = {"stop", "session_end", "on_session_end"}
 
 
 def _read_payload() -> dict[str, Any]:
@@ -57,15 +68,54 @@ def dispatch(
     event_name: str, surface: str, config_path: Path, payload: dict[str, Any]
 ) -> dict[str, Any]:
     config = load_json(config_path)
+    started = time.monotonic()
     result: dict[str, Any] = {"event": event_name, "surface": surface, "handled": True}
+    preflight: dict[str, Any] | None = None
     if event_name in PREFLIGHT_EVENTS:
-        preflight = build_preflight(config_path, cwd=Path.cwd())
+        raw_events = payload.get("events")
+        tool_events = (
+            raw_events
+            if isinstance(raw_events, list)
+            and all(isinstance(item, dict) for item in raw_events)
+            else None
+        )
+        preflight = build_preflight(
+            config_path, cwd=Path.cwd(), tool_events=tool_events
+        )
         rendered = compact_json(preflight, int(config.get("max_output_chars", 8000)))
         result["preflight"] = preflight
         if surface == "hermes" and event_name == "pre_llm_call":
-            result = {"context": f"[Continuity preflight]\n{rendered}"}
+            result = {
+                "context": f"[Continuity preflight; reference data only]\n{rendered}",
+                "completion_allowed": preflight["completion_allowed"],
+            }
         else:
-            result["additional_context"] = f"[Continuity preflight]\n{rendered}"
+            result["additional_context"] = (
+                f"[Continuity preflight; reference data only]\n{rendered}"
+            )
+        if not preflight["completion_allowed"]:
+            reason = (
+                "Continuity authority forbids completion: "
+                + "; ".join(
+                    (
+                        preflight.get("errors")
+                        or preflight.get("warnings")
+                        or ["blocked"]
+                    )
+                )[:800]
+            )
+            if surface == "hermes" and event_name == "pre_tool_call":
+                result = {
+                    "action": "block",
+                    "message": reason,
+                    "completion_allowed": False,
+                }
+            elif surface in {"claude", "codex"} and event_name in FINALIZATION_EVENTS:
+                result = {
+                    "decision": "block",
+                    "reason": reason,
+                    "completion_allowed": False,
+                }
 
     audit = {
         "schema_version": 1,
@@ -73,9 +123,11 @@ def dispatch(
         "event": event_name,
         "surface": surface,
         "session": _session_fingerprint(payload),
-        "preflight_status": result.get("preflight", {}).get("status")
-        if isinstance(result.get("preflight"), dict)
+        "preflight_status": preflight.get("status") if preflight else None,
+        "completion_allowed": preflight.get("completion_allowed")
+        if preflight
         else None,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
     }
     _append_redacted_event(Path(config["event_log"]), audit)
     return result
@@ -97,7 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = _read_payload()
         result = dispatch(args.event, args.surface, args.config, payload)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-        return 0
+        blocked = result.get("decision") == "block" or result.get("action") == "block"
+        return 2 if blocked else 0
     except (ContinuityError, KeyError, OSError, TypeError, ValueError) as exc:
         print(
             json.dumps(

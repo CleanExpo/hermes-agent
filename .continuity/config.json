@@ -2,6 +2,8 @@
   "schema_version": 1,
   "project": "Hermes",
   "repo_id": "hermes-agent",
+  "integration_ref": "origin/main",
+  "toolchain_lock": ".continuity/toolchain.lock.json",
   "goal": "Pilot deterministic cross-agent continuity in Hermes",
   "expected_repo_root": "/Volumes/Storage Unit/Application-Data/Codex/worktrees/hermes-continuity-pilot-20260824",
   "external_volume": "/Volumes/Storage Unit",
@@ -16,7 +18,7 @@
     "data_dir": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/beads",
     "issues_path": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/beads/issues.jsonl",
     "active_task": "hermes-continuity-b6l",
-    "timeout_seconds": 5,
+    "timeout_seconds": 15,
     "completion_timeout_seconds": 60
   },
   "spec": {

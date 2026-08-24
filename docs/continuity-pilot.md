@@ -18,6 +18,12 @@ result `DEGRADED` and forbids completion. Missing or conflicting state is `BLOCK
 Receipt creation separately runs a live, longer-bounded `bd show` check; JSONL alone
 can never authorize a terminal lifecycle state.
 
+Claude and Codex finalization hooks return their native blocking shape when preflight
+forbids completion. Hermes `pre_tool_call` is installed `fail_closed: true`, so a
+blocked or failed preflight prevents tool side effects. Hermes shell hooks do not have
+a blocking ordinary-prose or session-end event; for that surface the exact-state gate,
+not an advisory hook, prevents `TESTED`/`ENFORCED` promotion.
+
 ## Tool pins and isolation
 
 - Basic Memory `0.22.1`
@@ -46,14 +52,24 @@ python3 scripts/install_continuity_adapters.py \
   --hermes-home "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes" \
   --apply-hermes
 HERMES_HOME="/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes" \
-  hermes hooks list --json
+  hermes hooks list
+HERMES_HOME="/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes" \
+  hermes hooks doctor
 ```
+
+After the dispatcher file changes, refresh the isolated hook approvals before relying
+on them; `hooks doctor` reports the exact stale approval and verifies each synthetic
+event, including the expected exit `2` from a blocked `pre_tool_call`.
 
 ## Receipt shape
 
-Command evidence is a JSON list containing `name`, `exit_code`, `test_count`,
-`skipped`, and `flaky`. T2/T3 receipts also require runtime checks; T3 requires a
-passed rollback proof. `TESTED` binds focused acceptance and real-path proof;
+Command evidence input is a closed manifest containing `name`, a repository-local
+`argv`, optional `scope`, and optional timeout. The gate executes each command in a
+credential-minimized environment and records exit code, parsed positive test count,
+timestamps, duration, working directory, and a SHA-256 output digest; callers cannot
+self-attest results. Runtime and rollback inputs use the same manifest pattern. T2/T3
+receipts require runtime checks; T3 requires an executed rollback dry-run. `TESTED`
+binds focused acceptance and real-path proof;
 `ENFORCED` additionally requires a passing command marked `"scope": "full"` (the
 complete repository suite or equivalent CI gate). Create a receipt only after the
 final commit because any commit or dirty-state change invalidates it.
@@ -72,17 +88,30 @@ python3 scripts/continuity_gate.py verify-receipt \
 `promote` is the only supported route to `TESTED` or `ENFORCED`. It updates the
 external card, leaving the committed active specification unchanged so promotion does
 not invalidate its own exact-state fingerprint. `ENFORCED` also closes the Beads item;
-if that update fails, the card write is rolled back.
+promotion is serialized with an external file lock. If task closure is interrupted,
+the durable journal records `RECOVERY_REQUIRED`, preflight blocks, and an idempotent
+retry with the same receipt finishes the transition.
 
 ## Rollback
 
-Rollback is recoverable and scoped:
+Validate or apply the exact Hermes-hook before-image without touching unrelated hooks:
+
+```bash
+python3 scripts/install_continuity_adapters.py \
+  --repo-root "$PWD" --hermes-home "$HERMES_HOME" --rollback-dry-run
+python3 scripts/install_continuity_adapters.py \
+  --repo-root "$PWD" --hermes-home "$HERMES_HOME" --rollback-apply
+```
+
+The installer keeps a mode-`0600` ownership manifest inside the isolated Hermes home.
+Rollback refuses to proceed if a managed hook changed after installation. Broader
+pilot retirement is recoverable and scoped:
 
 1. Verify the shared checkout and live global hook files are unchanged.
 2. Remove this isolated worktree through `git worktree remove` only after preserving
    any desired branch/receipt evidence.
-3. Move the isolated Hermes `config.yaml` and external pilot state directory into an
-   archive on the Storage Unit; do not delete them during the pilot.
+3. Apply the adapter rollback, then move the isolated external pilot state directory
+   into an archive on the Storage Unit; do not delete it during the pilot.
 4. Delete the pilot branch only after confirming no evidence is needed.
 
 Because the live host profiles are not modified, rollback does not require restoring

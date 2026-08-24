@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import platform
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -26,9 +27,12 @@ class GitState:
     dirty: bool
     changed_files: tuple[str, ...]
     fingerprint: str
+    integration_ref: str | None = None
+    integration_sha: str | None = None
+    merge_base: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "root": self.root,
             "branch": self.branch,
             "commit": self.commit,
@@ -36,6 +40,13 @@ class GitState:
             "changed_files": list(self.changed_files),
             "fingerprint": self.fingerprint,
         }
+        if self.integration_ref is not None:
+            value.update({
+                "integration_ref": self.integration_ref,
+                "integration_sha": self.integration_sha,
+                "merge_base": self.merge_base,
+            })
+        return value
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -102,6 +113,95 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ContinuityError(f"cannot hash {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def minimal_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a credential-minimized environment for authority-bearing children."""
+    allowed = {
+        "PATH",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env.setdefault("PATH", os.defpath)
+    env.setdefault("HOME", env.get("TMPDIR", "/tmp"))
+    if extra:
+        env.update(extra)
+    return env
+
+
+def verify_pinned_executable(
+    config: dict[str, Any], repo_root: Path, tool_name: str, executable: Path
+) -> str:
+    """Bind an authority-bearing executable to the committed platform digest."""
+    lock_path = repo_root / config.get(
+        "toolchain_lock", ".continuity/toolchain.lock.json"
+    )
+    lock = load_json(lock_path)
+    tool = (lock.get("tools") or {}).get(tool_name)
+    if not isinstance(tool, dict):
+        raise ContinuityError(f"toolchain lock has no {tool_name!r} entry")
+    system = platform.system().lower()
+    machine = (
+        platform
+        .machine()
+        .lower()
+        .replace("aarch64", "arm64")
+        .replace("x86_64", "amd64")
+    )
+    digest_key = f"{system}-{machine}-sha256"
+    expected = tool.get(digest_key)
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise ContinuityError(
+            f"toolchain lock has no valid {digest_key} for {tool_name}"
+        )
+    try:
+        resolved = executable.resolve(strict=True)
+    except OSError as exc:
+        raise ContinuityError(
+            f"cannot resolve pinned {tool_name} executable: {exc}"
+        ) from exc
+    state_root = Path(config["state_root"]).resolve()
+    if not resolved.is_relative_to(state_root):
+        raise ContinuityError(
+            f"{tool_name} executable escapes pilot state root: {resolved}"
+        )
+    actual = sha256_file(resolved)
+    if actual != expected:
+        raise ContinuityError(
+            f"{tool_name} executable digest mismatch: expected {expected}, got {actual}"
+        )
+    return actual
+
+
+def external_input_digests(config: dict[str, Any], repo_root: Path) -> dict[str, str]:
+    inputs: dict[str, str] = {}
+    for raw in config.get("external_instructions", []):
+        path = Path(raw).resolve()
+        inputs[str(path)] = sha256_file(path)
+    beads_path = Path(config["beads"]["binary"])
+    inputs[str(beads_path.resolve())] = verify_pinned_executable(
+        config, repo_root, "beads", beads_path
+    )
+    return dict(sorted(inputs.items()))
+
+
 def run_command(
     args: list[str],
     *,
@@ -123,7 +223,9 @@ def run_command(
         raise ContinuityError(f"command failed or timed out: {args[0]}: {exc}") from exc
 
 
-def git_state(cwd: Path, timeout: float = 10) -> GitState:
+def git_state(
+    cwd: Path, timeout: float = 10, integration_ref: str | None = None
+) -> GitState:
     def git(*args: str) -> str:
         result = run_command(["git", *args], cwd=cwd, timeout=timeout)
         if result.returncode != 0:
@@ -178,7 +280,19 @@ def git_state(cwd: Path, timeout: float = 10) -> GitState:
             )
         elif candidate.is_file():
             digest.update(candidate.read_bytes())
-    return GitState(root, branch, commit, bool(status), changed, digest.hexdigest())
+    integration_sha = git("rev-parse", integration_ref) if integration_ref else None
+    merge_base = git("merge-base", integration_ref, "HEAD") if integration_ref else None
+    return GitState(
+        root,
+        branch,
+        commit,
+        bool(status),
+        changed,
+        digest.hexdigest(),
+        integration_ref,
+        integration_sha,
+        merge_base,
+    )
 
 
 def external_volume_available(path: Path) -> bool:
@@ -205,8 +319,30 @@ def compact_json(value: dict[str, Any], max_chars: int) -> str:
 def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
     """Return every reason an exact-state receipt cannot authorize promotion."""
     errors: list[str] = []
-    if receipt.get("gate") != "hermes-continuity-gate/1":
-        errors.append("receipt was not emitted by hermes-continuity-gate/1")
+    allowed_receipt = {
+        "schema_version",
+        "gate",
+        "project",
+        "repo_id",
+        "lifecycle_target",
+        "risk_tier",
+        "created_at",
+        "git",
+        "authority_check",
+        "external_inputs",
+        "commands",
+        "runtime_checks",
+        "rollback",
+        "result",
+    }
+    unknown_receipt = sorted(set(receipt) - allowed_receipt)
+    if unknown_receipt:
+        errors.append("receipt contains unknown keys: " + ", ".join(unknown_receipt))
+    if receipt.get("gate") != "hermes-continuity-gate/2":
+        errors.append("receipt was not emitted by hermes-continuity-gate/2")
+    external_inputs = receipt.get("external_inputs")
+    if not isinstance(external_inputs, dict) or not external_inputs:
+        errors.append("receipt has no external input digests")
     target = receipt.get("lifecycle_target")
     if target not in {"TESTED", "ENFORCED"}:
         errors.append(f"invalid lifecycle target: {target!r}")
@@ -231,8 +367,33 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
             errors.append("command evidence is malformed")
             continue
         name = command.get("name", "unnamed")
+        allowed_command = {
+            "name",
+            "kind",
+            "argv",
+            "cwd",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+            "exit_code",
+            "output_sha256",
+            "scope",
+            "test_count",
+            "failed_count",
+            "skipped",
+            "flaky",
+        }
+        unknown = sorted(set(command) - allowed_command)
+        if unknown:
+            errors.append(
+                f"command contains unknown keys ({name}): {', '.join(unknown)}"
+            )
+        if command.get("kind") != "command":
+            errors.append(f"command has invalid kind: {name}")
         if command.get("exit_code") != 0:
             errors.append(f"command failed: {name}")
+        if command.get("failed_count") != 0:
+            errors.append(f"command reports failed tests: {name}")
         test_count = command.get("test_count", 0)
         skipped = command.get("skipped", 0)
         if not isinstance(test_count, int) or test_count < 0:
@@ -262,14 +423,59 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
         errors.append("runtime checks are absent for T2/T3")
         runtime_checks = []
     for check in runtime_checks or []:
-        if not isinstance(check, dict) or check.get("passed") is not True:
+        if isinstance(check, dict):
+            allowed_runtime = {
+                "name",
+                "kind",
+                "argv",
+                "cwd",
+                "started_at",
+                "completed_at",
+                "duration_ms",
+                "exit_code",
+                "output_sha256",
+                "surface",
+                "passed",
+            }
+            unknown = sorted(set(check) - allowed_runtime)
+            if unknown:
+                errors.append(
+                    f"runtime check contains unknown keys ({check.get('name', 'unnamed')}): "
+                    + ", ".join(unknown)
+                )
+        if (
+            not isinstance(check, dict)
+            or check.get("kind") != "runtime"
+            or check.get("passed") is not True
+            or check.get("exit_code") != 0
+        ):
             errors.append(
                 f"runtime check failed: {check.get('name', 'unnamed') if isinstance(check, dict) else 'malformed'}"
             )
 
     rollback = receipt.get("rollback")
     if tier == "T3" and (
-        not isinstance(rollback, dict) or rollback.get("passed") is not True
+        not isinstance(rollback, dict)
+        or rollback.get("kind") != "rollback"
+        or rollback.get("passed") is not True
+        or rollback.get("exit_code") != 0
     ):
         errors.append("rollback proof is absent or failed for T3")
+    if isinstance(rollback, dict) and rollback:
+        allowed_rollback = {
+            "name",
+            "kind",
+            "argv",
+            "cwd",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+            "exit_code",
+            "output_sha256",
+            "mode",
+            "passed",
+        }
+        unknown = sorted(set(rollback) - allowed_rollback)
+        if unknown:
+            errors.append("rollback contains unknown keys: " + ", ".join(unknown))
     return errors

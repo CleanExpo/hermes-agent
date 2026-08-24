@@ -31,8 +31,9 @@ characters, and no prompt asking for already-recorded scope.
 
 ### Refuse stale completion (P1)
 
-An agent cannot claim `TESTED` or `ENFORCED` when the card, Beads task, Spec Kit
-change, git SHA, dirty state, or command outcomes disagree.
+An agent cannot promote the work to `TESTED` or `ENFORCED` when the card, Beads task,
+Spec Kit change, git SHA, integration base, dirty state, external input digests, or
+gate-executed command outcomes disagree.
 
 **Independent test**: Change each authority and exact-state field independently and
 verify the gate refuses promotion with a named reason.
@@ -59,8 +60,9 @@ hook dependency.
   spec, or authority conflict MUST forbid completion and identify the cause.
 - **FR-005**: Tool-call envelopes MUST reject interrupted adjacency where a tool use is
   not immediately followed by its matching result.
-- **FR-006**: Only the gate MAY promote the lifecycle to `TESTED` or `ENFORCED`, and it
-  MUST require current exact-state evidence and successful required commands.
+- **FR-006**: Only the gate MAY promote the lifecycle to `TESTED` or `ENFORCED`; it
+  MUST execute required commands itself, serialize promotion, and preserve a durable
+  recoverable journal across interrupted multi-authority transitions.
 - **FR-007**: Host adapters MUST call one dispatcher and MUST NOT persist raw prompt,
   transcript, reasoning, tool input, tool output, secret, or customer-data content.
 - **FR-008**: All storage-dependent state MUST remain on the mounted external volume;
@@ -69,6 +71,11 @@ hook dependency.
   tokens), deterministic, and readable without a model.
 - **FR-010**: Rollback MUST remove only pilot adapters/state and leave the dirty shared
   checkout and pre-existing global hooks unchanged.
+- **FR-011**: Authority-bearing children MUST run without inherited credential
+  variables, and external executables/instructions MUST match pinned SHA-256 digests.
+- **FR-012**: Claude/Codex finalization and Hermes tool execution MUST use each host's
+  native blocking contract. Hermes ordinary prose remains outside shell-hook blocking;
+  the gate MUST still prevent lifecycle promotion from advisory context alone.
 
 ## Success criteria
 
@@ -86,3 +93,5 @@ hook dependency.
 - Basic Memory live Hermes capture is out of scope; the pilot writes one explicit card.
 - Beads remains the task authority, not the completion authority.
 - Native Hermes skills/configuration are proven in an isolated `HERMES_HOME` only.
+- Hermes shell hooks can block `pre_tool_call` but cannot veto ordinary final prose or
+  `on_session_end`; this pilot does not claim otherwise.

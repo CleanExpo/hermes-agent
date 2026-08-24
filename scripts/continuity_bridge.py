@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,12 +12,15 @@ from typing import Any
 from continuity_common import (
     ContinuityError,
     compact_json,
+    external_input_digests,
     external_volume_available,
     git_state,
     load_json,
+    minimal_child_env,
     read_markdown_frontmatter,
     receipt_errors,
     run_command,
+    verify_pinned_executable,
 )
 
 
@@ -60,24 +62,27 @@ def _read_beads(
 ) -> tuple[dict[str, Any], bool, str]:
     beads = config["beads"]
     task_id = beads["active_task"]
-    env = os.environ.copy()
-    env["BEADS_DIR"] = beads["data_dir"]
+    verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
+    env = minimal_child_env({
+        "BEADS_DIR": beads["data_dir"],
+        "HOME": config["state_root"],
+    })
     degraded_reason = ""
     try:
         result = run_command(
-            [beads["binary"], "ready", "--json"],
+            [beads["binary"], "show", task_id, "--json"],
             cwd=repo_root,
             timeout=float(beads.get("timeout_seconds", 5)),
             env=env,
         )
         if result.returncode != 0:
             raise ContinuityError(
-                (result.stderr or result.stdout).strip() or "bd ready failed"
+                (result.stderr or result.stdout).strip() or "bd show failed"
             )
         task = _task_from_json(json.loads(result.stdout), task_id)
         if task is not None:
             return task, False, ""
-        degraded_reason = f"bd ready did not return active task {task_id}"
+        degraded_reason = f"bd show did not return active task {task_id}"
     except (ContinuityError, json.JSONDecodeError) as exc:
         degraded_reason = str(exc)
 
@@ -130,7 +135,9 @@ def build_preflight(
     *,
     cwd: Path,
     tool_envelope: Path | None = None,
+    tool_events: list[dict[str, Any]] | None = None,
     require_mounted_volume: bool = True,
+    allow_recovery_journal: bool = False,
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -142,7 +149,7 @@ def build_preflight(
         errors.append(f"external volume is not mounted: {external_volume}")
 
     try:
-        state = git_state(cwd.resolve())
+        state = git_state(cwd.resolve(), integration_ref=config.get("integration_ref"))
     except ContinuityError as exc:
         errors.append(str(exc))
         state = None
@@ -216,8 +223,12 @@ def build_preflight(
             errors.append(
                 f"authority conflict for {label}: expected {wanted!r}, got {actual!r}"
             )
-    if task and task.get("status") not in ALLOWED_ACTIVE_STATES:
+    task_status = task.get("status") if task else None
+    terminal_task_is_valid = card.get("state") == "ENFORCED" and task_status == "closed"
+    if task and task_status not in ALLOWED_ACTIVE_STATES and not terminal_task_is_valid:
         errors.append(f"Beads task is stale or terminal: {task.get('status')!r}")
+    if task_status == "blocked":
+        errors.append("Beads task lifecycle is blocked")
     terminal_states = {"TESTED", "ENFORCED"}
     card_state = card.get("state")
     spec_state = spec.get("state")
@@ -237,6 +248,14 @@ def build_preflight(
             try:
                 receipt = load_json(Path(receipt_path))
                 errors.extend(receipt_errors(receipt, state))
+                try:
+                    current_inputs = external_input_digests(config, repo_root)
+                    if receipt.get("external_inputs") != current_inputs:
+                        errors.append(
+                            "terminal receipt external instruction or executable identity is stale"
+                        )
+                except ContinuityError as exc:
+                    errors.append(str(exc))
                 if receipt.get("lifecycle_target") != card_state:
                     errors.append(
                         "receipt lifecycle target does not match authority state"
@@ -249,13 +268,33 @@ def build_preflight(
             errors.append(f"invalid card state: {card_state!r}")
         if spec and spec_state not in allowed:
             errors.append(f"invalid spec state: {spec_state!r}")
+        if card_state == "BLOCKED":
+            errors.append("Basic Memory card lifecycle is BLOCKED")
+        if spec_state == "BLOCKED":
+            errors.append("Spec Kit change lifecycle is BLOCKED")
+
+    journal_path = Path(config["state_root"]) / "promotion.json"
+    if journal_path.is_file():
+        try:
+            journal = load_json(journal_path)
+            blocked_journals = {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
+            if journal.get("status") in blocked_journals and not (
+                allow_recovery_journal and journal.get("status") == "RECOVERY_REQUIRED"
+            ):
+                errors.append(
+                    f"promotion journal requires recovery: {journal.get('status')}"
+                )
+        except ContinuityError as exc:
+            errors.append(str(exc))
 
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
             errors.append(f"native instruction is missing: {relative}")
-    for absolute in config.get("external_instructions", []):
-        if not Path(absolute).is_file():
-            errors.append(f"external native instruction is missing: {absolute}")
+    try:
+        external_digests = external_input_digests(config, repo_root)
+    except ContinuityError as exc:
+        errors.append(str(exc))
+        external_digests = {}
 
     if tool_envelope is not None:
         try:
@@ -268,6 +307,18 @@ def build_preflight(
             errors.extend(validate_tool_adjacency(events))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             errors.append(f"invalid tool envelope: {exc}")
+    if tool_events is not None:
+        errors.extend(validate_tool_adjacency(tool_events))
+
+    if state is not None:
+        try:
+            final_state = git_state(
+                cwd.resolve(), integration_ref=config.get("integration_ref")
+            )
+            if final_state.as_dict() != state.as_dict():
+                errors.append("repository state changed while preflight was running")
+        except ContinuityError as exc:
+            errors.append(f"cannot revalidate repository state: {exc}")
 
     status = "BLOCKED" if errors else ("DEGRADED" if degraded else "AVAILABLE")
     completion_allowed = not errors and not degraded
@@ -285,6 +336,7 @@ def build_preflight(
         "next_action": card.get("next_action"),
         "blockers": card.get("blockers", []),
         "git": state.as_dict() if state else None,
+        "external_inputs": external_digests,
         "errors": errors,
         "warnings": warnings,
     }
