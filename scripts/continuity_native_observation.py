@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from install_continuity_adapters import (
     HERMES_MANIFEST,
     _managed_hermes_hooks,
     render_project_adapters,
+    validate_hermes_manifest,
 )
 
 
@@ -152,31 +154,51 @@ def _run_host_until_native_event(
             text=True,
             start_new_session=os.name == "posix",
         )
-        deadline = time.monotonic() + timeout
-        last_error: ContinuityError | None = None
-        while time.monotonic() < deadline:
+        handled_signals = (signal.SIGTERM, signal.SIGINT)
+        prior_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
+
+        def terminate_nested_host(signum: int, _frame: object) -> None:
+            if process.poll() is None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:  # pragma: no cover - Windows pilot is not releasable
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+            raise SystemExit(128 + signum)
+
+        for sig in handled_signals:
+            signal.signal(sig, terminate_nested_host)
+        try:
+            deadline = time.monotonic() + timeout
+            last_error: ContinuityError | None = None
+            while time.monotonic() < deadline:
+                stdout_handle.flush()
+                stderr_handle.flush()
+                output = stdout_path.read_text(
+                    encoding="utf-8"
+                ) + stderr_path.read_text(encoding="utf-8")
+                try:
+                    _require_native_event(checkpoint, surface, output)
+                except ContinuityError as exc:
+                    last_error = exc
+                else:
+                    if process.poll() is None:
+                        _terminate_process_tree(process)
+                    else:
+                        process.communicate()
+                    return output
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if process.poll() is None:
+                _terminate_process_tree(process)
             stdout_handle.flush()
             stderr_handle.flush()
-            output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
-                encoding="utf-8"
-            )
-            try:
-                _require_native_event(checkpoint, surface, output)
-            except ContinuityError as exc:
-                last_error = exc
-            else:
-                if process.poll() is None:
-                    _terminate_process_tree(process)
-                else:
-                    process.communicate()
-                return output
-            if process.poll() is not None:
-                break
-            time.sleep(0.1)
-        if process.poll() is None:
-            _terminate_process_tree(process)
-        stdout_handle.flush()
-        stderr_handle.flush()
+        finally:
+            for sig, handler in prior_handlers.items():
+                signal.signal(sig, handler)
     output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
         encoding="utf-8"
     )
@@ -306,6 +328,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
     ):
         raise ContinuityError("Hermes runtime policy does not bind installed config")
     manifest = load_json(hermes_home / HERMES_MANIFEST)
+    validate_hermes_manifest(repo_root, hermes_home, manifest)
     manifest_digest = sha256_file(hermes_home / HERMES_MANIFEST)
     target_digest = sha256_file(target)
     installed_hooks = manifest.get("installed_hooks")

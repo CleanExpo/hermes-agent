@@ -549,7 +549,7 @@ def _native_observation_errors(
         if not receipt_dir.is_dir():
             return "none"
         latest: tuple[datetime, str] | None = None
-        for path in sorted(receipt_dir.glob("*.json"))[-100:]:
+        for path in receipt_dir.glob("*.json"):
             try:
                 candidate = load_json(path)
                 if (

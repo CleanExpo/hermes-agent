@@ -102,11 +102,15 @@ only from a prior authenticated PASS receipt. Hermes observation executes `hooks
 list`, `hooks doctor`, and the native `hooks test pre_llm_call` admission path; its
 installed hooks must equal the current generated contract, and both external
 `config.yaml` and its ownership manifest are rehashed after execution and during
-receipt verification. Claude and Codex observations launch the digest-pinned native
+receipt verification. The ownership manifest itself has a closed schema and HMAC,
+binds the complete generated hook set and exact before-image partition, and is
+validated by install, observation, dry-run, and rollback. Claude and Codex observations launch the digest-pinned native
 host CLIs with tools disabled, require the host-created session identity to match the
 redacted `SessionStart` audit record, and stop the credential-free host after that
 admission evidence appears instead of waiting on a downstream model request. Both the
-host and the complete project adapter surface are then rehashed. Codex uses a
+host and the complete project adapter surface are then rehashed. Observer interruption
+forwards a hard stop to the host's isolated process group before the observer exits.
+Codex uses a
 temporary, external-state-root home that trusts only the exact project for the
 observation; the vetted hook source is still required to match the committed generated
 adapter. Every generated dispatcher command uses the repository's locked `.venv`

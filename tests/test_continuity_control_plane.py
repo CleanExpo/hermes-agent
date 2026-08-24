@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -88,6 +89,31 @@ def _interrupt_tree_worker(ready_path: str, sentinel_path: str) -> None:
         )
     except KeyboardInterrupt:
         pass
+
+
+def _native_observer_interrupt_worker(
+    state_dir: str, ready_path: str, sentinel_path: str
+) -> None:
+    state = Path(state_dir)
+    host = state / "nested-native-host.py"
+    host.write_text(
+        "import os,pathlib,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(0.2)\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(1.2)\n"
+        "pathlib.Path(sys.argv[2]).write_text('survived')\n",
+        encoding="utf-8",
+    )
+    continuity_native_observation._run_host_until_native_event(
+        [sys.executable, str(host), ready_path, sentinel_path],
+        cwd=state,
+        env=os.environ.copy(),
+        checkpoint=(state / "events.jsonl", 0, None),
+        surface="claude",
+        output_dir=state,
+        timeout=30,
+    )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1010,8 +1036,13 @@ def test_missing_native_observation_reports_authenticated_prior_success(
 ) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     prior = _passing_receipt(pilot, target="ENFORCED")
-    prior_path = pilot["state"] / "receipts" / "prior.json"
+    prior_path = pilot["state"] / "receipts" / "000-prior.json"
     atomic_write_json(prior_path, prior)
+    for index in range(101):
+        atomic_write_json(
+            pilot["state"] / "receipts" / f"z-{index:03d}.json",
+            {"unrelated": True},
+        )
     observed_at = prior["runtime_checks"][0]["native_observation"]["observed_at"]
 
     missing = _passing_receipt(pilot, target="ENFORCED")
@@ -1576,10 +1607,34 @@ def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
     })
     atomic_write_json(pilot["config"], policy)
 
-    with pytest.raises(ContinuityError, match="ownership manifest is stale"):
+    with pytest.raises(ContinuityError, match="manifest"):
         continuity_native_observation.observe_hermes_hook(
             pilot["repo"], pilot["config"], hermes_home
         )
+
+
+def test_hermes_manifest_rejects_authenticated_forged_rollback_authority(
+    tmp_path: Path,
+) -> None:
+    hermes_home = tmp_path / "forged-rollback-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"hooks": {"pre_tool_call": [{"command": "original"}]}}),
+        encoding="utf-8",
+    )
+    install_hermes_adapter(REPO_ROOT, hermes_home)
+    manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["before_hooks"] = {}
+    manifest["absent_before"] = []
+    manifest["auth"] = sign_receipt(
+        json.loads((REPO_ROOT / ".continuity/config.json").read_text()), manifest
+    )
+    atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(ContinuityError, match="before-image is malformed"):
+        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=False)
 
 
 def test_hermes_adapter_has_owned_reversible_before_image(
@@ -1769,6 +1824,40 @@ def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
 
     assert worker.exitcode == 0
     time.sleep(1.0)
+    assert not sentinel.exists()
+
+
+def test_interrupted_native_observer_reaps_isolated_host_group(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "native-host-ready.txt"
+    sentinel = tmp_path / "native-host-survived.txt"
+    context = multiprocessing.get_context("fork")
+    worker = context.Process(
+        target=_native_observer_interrupt_worker,
+        args=(str(tmp_path), str(ready), str(sentinel)),
+    )
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()
+    nested_pid = int(ready.read_text(encoding="utf-8"))
+
+    os.kill(worker.pid, signal.SIGTERM)
+    worker.join(5)
+    time.sleep(1.5)
+
+    try:
+        os.kill(nested_pid, 0)
+    except ProcessLookupError:
+        nested_alive = False
+    else:
+        nested_alive = True
+        if os.name == "posix":
+            os.killpg(nested_pid, signal.SIGKILL)
+    assert worker.exitcode == 128 + signal.SIGTERM
+    assert not nested_alive
     assert not sentinel.exists()
 
 

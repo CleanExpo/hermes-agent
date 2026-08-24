@@ -13,10 +13,28 @@ from typing import Any
 
 import yaml
 
-from continuity_common import ContinuityError, atomic_write_text, load_json
+from continuity_common import (
+    ContinuityError,
+    atomic_write_text,
+    load_json,
+    receipt_signature_errors,
+    sign_receipt,
+)
 
 
 HERMES_MANIFEST = "continuity-adapter-manifest.json"
+HERMES_MANIFEST_BASE_KEYS = {
+    "schema_version",
+    "status",
+    "repo_root",
+    "target",
+    "before_sha256",
+    "after_sha256",
+    "before_hooks",
+    "absent_before",
+    "installed_hooks",
+    "auth",
+}
 
 
 CLAUDE_EVENT_NAMES = {
@@ -142,6 +160,75 @@ def _before_hook_projection(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_hermes_manifest(
+    repo_root: Path, hermes_home: Path, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Authenticate and semantically validate the complete rollback authority."""
+    status = manifest.get("status")
+    allowed_keys = set(HERMES_MANIFEST_BASE_KEYS)
+    if status == "ROLLED_BACK":
+        allowed_keys.add("restored_sha256")
+    if set(manifest) != allowed_keys or manifest.get("schema_version") != 1:
+        raise ContinuityError("Hermes adapter manifest has an invalid closed schema")
+    config = load_json(repo_root / ".continuity/config.json")
+    if receipt_signature_errors(config, manifest):
+        raise ContinuityError("Hermes adapter manifest authentication failed")
+    target = hermes_home.resolve() / "config.yaml"
+    if (
+        status not in {"PREPARED", "INSTALLED", "ROLLED_BACK"}
+        or manifest.get("repo_root") != str(repo_root)
+        or manifest.get("target") != str(target)
+    ):
+        raise ContinuityError("Hermes adapter manifest ownership is stale")
+    for key in ("before_sha256", "after_sha256"):
+        digest = manifest.get(key)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ContinuityError("Hermes adapter manifest digest is malformed")
+    installed = manifest.get("installed_hooks")
+    before = manifest.get("before_hooks")
+    absent = manifest.get("absent_before")
+    expected = _managed_hermes_hooks(repo_root)
+    if (
+        not isinstance(installed, dict)
+        or installed != expected
+        or not isinstance(before, dict)
+        or not isinstance(absent, list)
+        or not all(isinstance(name, str) and name for name in absent)
+        or len(set(absent)) != len(absent)
+        or set(before) & set(absent)
+        or set(before) | set(absent) != set(installed)
+    ):
+        raise ContinuityError("Hermes adapter manifest before-image is malformed")
+    current_text = target.read_text(encoding="utf-8")
+    current_digest = _sha256_text(current_text)
+    current_config = yaml.safe_load(current_text) or {}
+    current_hooks = (
+        current_config.get("hooks") if isinstance(current_config, dict) else None
+    )
+    current_projection = (
+        {name: current_hooks.get(name) for name in installed}
+        if isinstance(current_hooks, dict)
+        else {}
+    )
+    before_projection = _before_hook_projection(manifest)
+    if (
+        status == "INSTALLED"
+        and current_digest != manifest["after_sha256"]
+        and current_projection != before_projection
+    ):
+        raise ContinuityError("installed Hermes configuration digest is stale")
+    if status == "PREPARED" and current_digest not in {
+        manifest["before_sha256"],
+        manifest["after_sha256"],
+    }:
+        raise ContinuityError("prepared Hermes configuration digest is stale")
+    if status == "ROLLED_BACK":
+        restored = manifest.get("restored_sha256")
+        if not isinstance(restored, str) or len(restored) != 64:
+            raise ContinuityError("rolled-back Hermes configuration digest is stale")
+    return manifest
+
+
 def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
     target = hermes_home.resolve() / "config.yaml"
     manifest_path = hermes_home.resolve() / HERMES_MANIFEST
@@ -152,10 +239,7 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
     if manifest_path.is_file():
         prior = load_json(manifest_path)
         if prior.get("status") in {"PREPARED", "INSTALLED"}:
-            if prior.get("repo_root") != str(repo_root) or prior.get("target") != str(
-                target
-            ):
-                raise ContinuityError("Hermes adapter is owned by another repository")
+            validate_hermes_manifest(repo_root, hermes_home, prior)
             installed_hooks = prior.get("installed_hooks")
             if not isinstance(installed_hooks, dict):
                 raise ContinuityError("Hermes adapter manifest is malformed")
@@ -170,6 +254,9 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
             else:
                 if prior.get("status") == "PREPARED":
                     prior["status"] = "INSTALLED"
+                    prior["auth"] = sign_receipt(
+                        load_json(repo_root / ".continuity/config.json"), prior
+                    )
                     atomic_write_text(
                         manifest_path,
                         json.dumps(prior, indent=2, sort_keys=True) + "\n",
@@ -194,11 +281,17 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
         "absent_before": absent_before,
         "installed_hooks": installed_hooks,
     }
+    manifest["auth"] = sign_receipt(
+        load_json(repo_root / ".continuity/config.json"), manifest
+    )
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
     atomic_write_text(target, after_text)
     manifest["status"] = "INSTALLED"
+    manifest["auth"] = sign_receipt(
+        load_json(repo_root / ".continuity/config.json"), manifest
+    )
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -210,8 +303,7 @@ def rollback_hermes_adapter(
 ) -> dict[str, Any]:
     manifest_path = hermes_home.resolve() / HERMES_MANIFEST
     manifest = load_json(manifest_path)
-    if manifest.get("repo_root") != str(repo_root):
-        raise ContinuityError("rollback manifest belongs to another repository")
+    validate_hermes_manifest(repo_root, hermes_home, manifest)
     status = manifest.get("status")
     if status not in {"PREPARED", "INSTALLED", "ROLLED_BACK"}:
         raise ContinuityError("Hermes adapter is not in INSTALLED state")
@@ -265,6 +357,9 @@ def rollback_hermes_adapter(
         restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     manifest["status"] = "ROLLED_BACK"
     manifest["restored_sha256"] = _sha256_text(restored)
+    manifest["auth"] = sign_receipt(
+        load_json(repo_root / ".continuity/config.json"), manifest
+    )
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
