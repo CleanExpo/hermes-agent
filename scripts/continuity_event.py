@@ -137,16 +137,54 @@ def _append_redacted_event(path: Path, event: dict[str, Any]) -> None:
 
 
 def _model_safe_preflight(preflight: dict[str, Any]) -> dict[str, Any]:
-    """Replace untrusted card prose with a small non-imperative signal schema."""
-    safe = dict(preflight)
-    next_action = safe.pop("next_action", None)
-    blockers = safe.pop("blockers", None)
-    safe["card_signals"] = {
-        "next_action_recorded": isinstance(next_action, str)
-        and bool(next_action.strip()),
-        "blocker_count": len(blockers) if isinstance(blockers, list) else None,
+    """Reduce authority data to a closed, non-imperative model signal schema."""
+    next_action = preflight.get("next_action")
+    blockers = preflight.get("blockers")
+    errors = preflight.get("errors")
+    warnings = preflight.get("warnings")
+    git = preflight.get("git")
+    external_inputs = preflight.get("external_inputs")
+    lifecycle = preflight.get("lifecycle")
+    task_status = preflight.get("task_status")
+    return {
+        "schema_version": 1,
+        "status": preflight.get("status")
+        if preflight.get("status") in {"AVAILABLE", "DEGRADED", "BLOCKED"}
+        else "BLOCKED",
+        "completion_allowed": preflight.get("completion_allowed") is True,
+        "lifecycle": lifecycle
+        if lifecycle
+        in {"PROPOSED", "ACTIVE", "IMPLEMENTED", "TESTED", "ENFORCED", "BLOCKED"}
+        else "INVALID",
+        "task_status": task_status
+        if task_status in {"open", "in_progress", "blocked", "closed"}
+        else "INVALID",
+        "card_words": preflight.get("card_words")
+        if isinstance(preflight.get("card_words"), int)
+        else None,
+        "card_signals": {
+            "next_action_recorded": isinstance(next_action, str)
+            and bool(next_action.strip()),
+            "blocker_count": len(blockers) if isinstance(blockers, list) else None,
+        },
+        "authority_signals": {
+            "error_count": len(errors) if isinstance(errors, list) else None,
+            "warning_count": len(warnings) if isinstance(warnings, list) else None,
+            "external_input_count": len(external_inputs)
+            if isinstance(external_inputs, dict)
+            else None,
+        },
+        "git_signals": {
+            "available": isinstance(git, dict),
+            "dirty": git.get("dirty") is True if isinstance(git, dict) else None,
+            "changed_file_count": len(git.get("changed_files"))
+            if isinstance(git, dict) and isinstance(git.get("changed_files"), list)
+            else None,
+            "integration_matches": git.get("merge_base") == git.get("integration_sha")
+            if isinstance(git, dict)
+            else None,
+        },
     }
-    return safe
 
 
 def dispatch(
@@ -202,15 +240,12 @@ def dispatch(
                 f"[Continuity preflight; reference data only]\n{rendered}"
             )
         if not preflight["completion_allowed"]:
+            authority_signals = model_preflight["authority_signals"]
             reason = (
-                "Continuity authority forbids completion: "
-                + "; ".join(
-                    (
-                        preflight.get("errors")
-                        or preflight.get("warnings")
-                        or ["blocked"]
-                    )
-                )[:800]
+                "Continuity authority forbids completion "
+                f"({authority_signals['error_count'] or 0} errors, "
+                f"{authority_signals['warning_count'] or 0} warnings); "
+                "consult the human preflight output."
             )
             if surface == "hermes" and event_name == "pre_tool_call":
                 result = {

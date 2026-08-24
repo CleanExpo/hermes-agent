@@ -323,9 +323,15 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
                 break
             try:
                 process.communicate(timeout=0.75)
-                return
             except subprocess.TimeoutExpired:
+                pass
+            if sig == signal.SIGTERM:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return
                 continue
+            return
     elif os.name == "nt":
         try:
             subprocess.run(
@@ -660,8 +666,7 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
                 not isinstance(observation, dict)
                 or set(observation) != observation_keys
                 or any(
-                    not isinstance(observation.get(key), str)
-                    or not observation[key]
+                    not isinstance(observation.get(key), str) or not observation[key]
                     for key in observation_keys
                 )
             ):

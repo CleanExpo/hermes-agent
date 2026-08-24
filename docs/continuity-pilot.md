@@ -18,9 +18,11 @@ result `DEGRADED` and forbids completion. Missing or conflicting state is `BLOCK
 Receipt creation separately runs a live, longer-bounded `bd show` check; JSONL alone
 can never authorize a terminal lifecycle state.
 
-The human CLI preflight retains the card's next action and blockers. Host adapters do
-not place that free-form prose into model context: the dispatcher replaces it with only
-`next_action_recorded` and `blocker_count`, so card text cannot become tool authority.
+The human CLI preflight retains the card's next action, blockers, and exact diagnostic
+values. Host adapters never place those strings into model context. The dispatcher
+builds a closed signal-only projection containing counts, booleans, and allowlisted
+lifecycle values; invalid card, task, path, branch, and error strings cannot become
+model or tool authority.
 
 Claude and Codex finalization hooks return their native blocking shape when preflight
 forbids completion. Hermes `pre_llm_call` validates native conversation history and
@@ -95,7 +97,19 @@ and installed distribution metadata; a lock mismatch or later resolved-environme
 change fails verification. Native runtime records bind Claude, Codex, and Hermes
 observations to the current commit, adapter digest, event, and a five-minute freshness
 window. Hermes observation executes `hooks list`, `hooks doctor`, and the native
-`hooks test pre_llm_call` admission path.
+`hooks test pre_llm_call` admission path, and binds the installed external
+`config.yaml` plus its ownership manifest. Claude and Codex observations launch the
+digest-pinned native host CLIs with tools disabled, require the host-created session
+identity to match the redacted `SessionStart` audit record, and fail if the host stops
+loading the project hook or returns a blocked admission. Codex uses a temporary,
+external-state-root home that trusts only the exact project for the observation; the
+vetted hook source is still required to match the committed generated adapter.
+
+Codex resolves project hooks from the root checkout of a linked Git worktree. A
+worktree-only hardening commit therefore cannot satisfy the Codex native deadman until
+it is integrated into that trusted root checkout (or exercised from a standalone
+exact-head clone). This is an intentional promotion blocker, not a fallback to the
+direct dispatcher path.
 
 ```bash
 python3 scripts/continuity_gate.py create-receipt \

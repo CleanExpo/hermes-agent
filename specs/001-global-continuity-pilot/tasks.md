@@ -10,6 +10,6 @@
 - [x] Reap complete evidence process trees on timeout and interruption.
 - [x] Make adapter rollback replay-safe after lost acknowledgement.
 - [x] Remove untrusted card prose from model context and prove cross-surface privacy.
-- [x] Bind fresh native host observations to commit and adapter identity.
+- [x] Bind fresh native host invocations to commit, installed adapter, and host identity.
 - [x] Authenticate the resolved dependency environment against the hashed lock.
 - [ ] Rebind evidence to the final commit and executed rollback dry-run.

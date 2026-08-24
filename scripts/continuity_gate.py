@@ -66,6 +66,23 @@ CANONICAL_CONFIG_PATH = (
 )
 
 
+def _native_adapter_path(
+    config: dict[str, Any], repo_root: Path, adapter_token: str, *, require_exists: bool
+) -> Path:
+    candidate = Path(adapter_token)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        allowed_root = Path(config["state_root"]).resolve()
+    else:
+        resolved = (repo_root / candidate).resolve()
+        allowed_root = repo_root.resolve()
+    if not resolved.is_relative_to(allowed_root):
+        raise ContinuityError("native observation adapter escapes its allowed root")
+    if require_exists and not resolved.is_file():
+        raise ContinuityError("native observation adapter is missing")
+    return resolved
+
+
 def _task_from_value(value: Any, task_id: str) -> dict[str, Any] | None:
     candidates = value if isinstance(value, list) else [value]
     return next(
@@ -308,9 +325,7 @@ def _python_venv_context(spec: dict[str, Any], repo_root: Path) -> dict[str, str
     return context
 
 
-def _dependency_identity(
-    config: dict[str, Any], repo_root: Path
-) -> dict[str, Any]:
+def _dependency_identity(config: dict[str, Any], repo_root: Path) -> dict[str, Any]:
     """Fingerprint the lock policy and resolved Python distribution environment."""
     policy = config.get("dependency_identity")
     if not isinstance(policy, dict) or set(policy) != {
@@ -329,7 +344,10 @@ def _dependency_identity(
     if not python_path.is_absolute():
         python_path = (repo_root / python_path).absolute()
     requirements_path = (repo_root / requirements_token).resolve()
-    if not requirements_path.is_relative_to(repo_root) or not requirements_path.is_file():
+    if (
+        not requirements_path.is_relative_to(repo_root)
+        or not requirements_path.is_file()
+    ):
         raise ContinuityError("dependency identity requirements lock is missing")
     if not python_path.exists():
         raise ContinuityError("dependency identity Python is missing")
@@ -341,7 +359,9 @@ def _dependency_identity(
     try:
         requirements_text = requirements_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ContinuityError("dependency identity requirements lock is unreadable") from exc
+        raise ContinuityError(
+            "dependency identity requirements lock is unreadable"
+        ) from exc
     logical_requirements = requirements_text.replace("\\\n", " ")
     locked: dict[str, str] = {}
     requirement_pattern = re.compile(
@@ -363,7 +383,7 @@ def _dependency_identity(
     if not locked:
         raise ContinuityError("dependency identity requirements lock is empty")
 
-    probe = r'''
+    probe = r"""
 import hashlib
 import importlib.metadata
 import json
@@ -384,7 +404,7 @@ for distribution in importlib.metadata.distributions():
     records.append(record)
 records.sort(key=lambda item: (item["name"], item["version"], item["METADATA"]))
 print(json.dumps({"python_version": sys.version, "packages": records}, separators=(",", ":")))
-'''
+"""
     result = run_command(
         [str(python_path), "-I", "-c", probe],
         cwd=repo_root,
@@ -396,7 +416,9 @@ print(json.dumps({"python_version": sys.version, "packages": records}, separator
     try:
         resolved = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise ContinuityError("dependency identity probe returned invalid JSON") from exc
+        raise ContinuityError(
+            "dependency identity probe returned invalid JSON"
+        ) from exc
     packages = resolved.get("packages") if isinstance(resolved, dict) else None
     version = resolved.get("python_version") if isinstance(resolved, dict) else None
     if not isinstance(packages, list) or not packages or not isinstance(version, str):
@@ -437,6 +459,7 @@ def _native_observation_errors(
     if not isinstance(policy, dict) or set(policy) != {
         "required_surfaces",
         "max_age_seconds",
+        "hosts",
     }:
         return ["native observation policy is absent or malformed"]
     required = policy.get("required_surfaces")
@@ -454,35 +477,80 @@ def _native_observation_errors(
     errors: list[str] = []
     observations: dict[str, dict[str, Any]] = {}
     for check in receipt.get("runtime_checks") or []:
-        observation = check.get("native_observation") if isinstance(check, dict) else None
+        observation = (
+            check.get("native_observation") if isinstance(check, dict) else None
+        )
         if isinstance(observation, dict) and isinstance(
             observation.get("surface"), str
         ):
             surface = observation["surface"]
             if surface in observations:
-                errors.append(f"native observation is duplicated for surface: {surface}")
+                errors.append(
+                    f"native observation is duplicated for surface: {surface}"
+                )
             observations[surface] = observation
     repo_root = Path(current.root).resolve()
+    runtime_specs = {
+        item.get("surface"): item
+        for item in (config.get("evidence_policy") or {}).get("runtime_checks", [])
+        if isinstance(item, dict) and isinstance(item.get("surface"), str)
+    }
+
+    def expectation(surface: str, observation: dict[str, Any] | None) -> str:
+        spec = runtime_specs.get(surface) or {}
+        event = spec.get("event") or "unknown"
+        digest = "missing"
+        adapter_token = spec.get("adapter_path")
+        if isinstance(adapter_token, str):
+            try:
+                adapter = _native_adapter_path(
+                    config, repo_root, adapter_token, require_exists=True
+                )
+                digest = sha256_file(adapter)
+            except ContinuityError:
+                pass
+        last_success = (
+            observation.get("observed_at")
+            if isinstance(observation, dict) and observation.get("observed_at")
+            else "none"
+        )
+        return (
+            f"surface={surface}; expected_event={event}; "
+            f"expected_adapter_sha256={digest}; last_success={last_success}"
+        )
+
     for surface in required:
         observation = observations.get(surface)
         if observation is None:
-            errors.append(f"native observation is missing for surface: {surface}")
+            errors.append(
+                "native observation is missing: " + expectation(surface, observation)
+            )
             continue
         if observation.get("commit") != current.commit:
-            errors.append(f"native observation commit is stale for surface: {surface}")
+            errors.append(
+                "native observation commit is stale: "
+                + expectation(surface, observation)
+            )
         adapter_path = observation.get("adapter_path")
         if not isinstance(adapter_path, str):
-            errors.append(f"native observation adapter is invalid for surface: {surface}")
+            errors.append(
+                "native observation adapter is invalid: "
+                + expectation(surface, observation)
+            )
         else:
-            resolved_adapter = (repo_root / adapter_path).resolve()
-            if (
-                not resolved_adapter.is_relative_to(repo_root)
-                or not resolved_adapter.is_file()
-                or observation.get("adapter_sha256")
-                != sha256_file(resolved_adapter)
-            ):
+            try:
+                resolved_adapter = _native_adapter_path(
+                    config, repo_root, adapter_path, require_exists=True
+                )
+                digest_matches = observation.get("adapter_sha256") == sha256_file(
+                    resolved_adapter
+                )
+            except ContinuityError:
+                digest_matches = False
+            if not digest_matches:
                 errors.append(
-                    f"native observation adapter digest is stale for surface: {surface}"
+                    "native observation adapter digest is stale: "
+                    + expectation(surface, observation)
                 )
         try:
             observed_at = datetime.fromisoformat(str(observation.get("observed_at")))
@@ -490,9 +558,14 @@ def _native_observation_errors(
                 raise ValueError("timestamp is not timezone-aware")
             age = (datetime.now(timezone.utc) - observed_at).total_seconds()
             if age < -60 or age > max_age:
-                errors.append(f"native observation is stale for surface: {surface}")
+                errors.append(
+                    "native observation is stale: " + expectation(surface, observation)
+                )
         except (TypeError, ValueError):
-            errors.append(f"native observation timestamp is invalid for surface: {surface}")
+            errors.append(
+                "native observation timestamp is invalid: "
+                + expectation(surface, observation)
+            )
     return errors
 
 
@@ -545,9 +618,9 @@ def _execute_evidence(
         adapter_token = spec.get("adapter_path")
         if not isinstance(adapter_token, str) or not adapter_token:
             raise ContinuityError("native runtime evidence adapter is invalid")
-        adapter_path = (repo_root / adapter_token).resolve()
-        if not adapter_path.is_relative_to(repo_root) or not adapter_path.is_file():
-            raise ContinuityError("native runtime evidence adapter is missing")
+        adapter_path = _native_adapter_path(
+            config, repo_root, adapter_token, require_exists=True
+        )
         adapter_digest = sha256_file(adapter_path)
     if kind == "rollback" and spec.get("mode") != "dry-run":
         raise ContinuityError("receipt rollback evidence must use dry-run mode")
@@ -1080,12 +1153,14 @@ def static_validate(config_path: Path) -> list[str]:
     if not isinstance(native_policy, dict) or set(native_policy) != {
         "required_surfaces",
         "max_age_seconds",
+        "hosts",
     }:
         errors.append("native observation policy has an invalid closed schema")
         required_native_surfaces: set[str] = set()
     else:
         surfaces = native_policy.get("required_surfaces")
         max_age = native_policy.get("max_age_seconds")
+        hosts = native_policy.get("hosts")
         if (
             not isinstance(surfaces, list)
             or not surfaces
@@ -1094,6 +1169,17 @@ def static_validate(config_path: Path) -> list[str]:
             or not isinstance(max_age, int)
             or max_age < 1
             or max_age > 3600
+            or not isinstance(hosts, dict)
+            or any(
+                not isinstance(surface, str)
+                or not isinstance(identity, dict)
+                or set(identity) != {"path", "sha256"}
+                or not isinstance(identity.get("path"), str)
+                or not identity["path"]
+                or not isinstance(identity.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None
+                for surface, identity in (hosts or {}).items()
+            )
         ):
             errors.append("native observation policy is invalid")
             required_native_surfaces = set()
@@ -1117,9 +1203,10 @@ def static_validate(config_path: Path) -> list[str]:
             or not requirements_path.is_file()
         ):
             errors.append("dependency identity requirements lock is missing")
-        if not isinstance(dependency_policy.get("python"), str) or not dependency_policy[
-            "python"
-        ]:
+        if (
+            not isinstance(dependency_policy.get("python"), str)
+            or not dependency_policy["python"]
+        ):
             errors.append("dependency identity Python is invalid")
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
@@ -1169,8 +1256,16 @@ def static_validate(config_path: Path) -> list[str]:
             ):
                 errors.append("runtime check is not a valid native observation")
                 continue
-            adapter_path = (repo_root / adapter_token).resolve()
-            if not adapter_path.is_relative_to(repo_root) or not adapter_path.is_file():
+            try:
+                adapter_path = _native_adapter_path(
+                    config,
+                    repo_root,
+                    adapter_token,
+                    require_exists=not Path(adapter_token).is_absolute(),
+                )
+            except ContinuityError:
+                adapter_path = None
+            if adapter_path is None:
                 errors.append(f"native observation adapter is missing: {surface}")
             native_runtime_surfaces.add(surface)
         if native_runtime_surfaces != required_native_surfaces:

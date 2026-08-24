@@ -38,7 +38,17 @@
   },
   "native_observation_policy": {
     "required_surfaces": ["claude", "codex", "hermes"],
-    "max_age_seconds": 300
+    "max_age_seconds": 300,
+    "hosts": {
+      "claude": {
+        "path": "/Users/phill-mac/.local/bin/claude",
+        "sha256": "1495eb7c42d3b4451f5f1cd38b6d498d22a4a38c802bc2be5c1cf1795e64820d"
+      },
+      "codex": {
+        "path": "/Users/phill-mac/.local/bin/codex",
+        "sha256": "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02"
+      }
+    }
   },
   "evidence_policy": {
     "focused_suite": {
@@ -105,7 +115,7 @@
         ],
         "surface": "hermes",
         "event": "hooks-list-doctor-and-fresh-session",
-        "adapter_path": ".continuity/adapters.json",
+        "adapter_path": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes/config.yaml",
         "native": true,
         "timeout_seconds": 300
       }

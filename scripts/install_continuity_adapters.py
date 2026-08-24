@@ -73,6 +73,11 @@ def render_project_adapters(repo_root: Path) -> dict[Path, str]:
         + "\n",
         repo_root / ".codex/hooks.json": json.dumps(codex, indent=2, sort_keys=True)
         + "\n",
+        repo_root / ".codex/config.toml": (
+            "# Materialize the project config layer so Codex discovers hooks.json.\n"
+            "[features]\n"
+            "hooks = true\n"
+        ),
     }
 
 
