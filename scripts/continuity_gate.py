@@ -244,10 +244,11 @@ def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
         raise ContinuityError("evidence argv contains a secret-bearing argument name")
     first = Path(argv[0])
     if not first.is_absolute():
-        first = (repo_root / first).resolve()
+        invocation = (repo_root / first).absolute()
     else:
-        first = first.resolve()
-    if first == Path(sys.executable).resolve():
+        invocation = first.absolute()
+    resolved = invocation.resolve()
+    if resolved == Path(sys.executable).resolve():
         if len(argv) < 2 or argv[1].startswith("-"):
             raise ContinuityError(
                 "Python evidence commands require a repository script"
@@ -257,23 +258,23 @@ def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
             raise ContinuityError(
                 "Python evidence script must be a repository .py file"
             )
-        argv[0] = str(first)
+        argv[0] = str(invocation)
         argv[1] = str(script)
         return argv
-    if first == Path("/bin/bash").resolve():
+    if resolved == Path("/bin/bash").resolve():
         if len(argv) < 2 or argv[1].startswith("-"):
             raise ContinuityError("Bash evidence commands require a repository script")
         script = (repo_root / argv[1]).resolve()
         if not script.is_relative_to(repo_root) or script.suffix != ".sh":
             raise ContinuityError("Bash evidence script must be a repository .sh file")
-        argv[0] = str(first)
+        argv[0] = str(invocation)
         argv[1] = str(script)
         return argv
-    if not first.is_relative_to(repo_root):
-        raise ContinuityError(f"evidence executable escapes repository: {first}")
-    if not first.is_file():
-        raise ContinuityError(f"evidence executable is missing: {first}")
-    argv[0] = str(first)
+    if not resolved.is_relative_to(repo_root):
+        raise ContinuityError(f"evidence executable escapes repository: {resolved}")
+    if not resolved.is_file():
+        raise ContinuityError(f"evidence executable is missing: {resolved}")
+    argv[0] = str(invocation)
     return argv
 
 

@@ -450,6 +450,23 @@ def test_beads_mutation_failure_redacts_child_output(
     assert sentinel not in str(exc.value)
 
 
+def test_python_evidence_keeps_virtualenv_invocation_path(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    python = repo / ".venv/bin/python"
+    script = repo / "scripts/evidence.py"
+    python.parent.mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    script.write_text("print('ok')\n", encoding="utf-8")
+
+    argv = continuity_gate._resolved_argv(
+        {"argv": [".venv/bin/python", "scripts/evidence.py"]}, repo
+    )
+
+    assert argv == [str(python), str(script)]
+    assert Path(argv[0]).resolve() == Path(sys.executable).resolve()
+
+
 def test_interrupted_tool_adjacency_is_rejected() -> None:
     events = [
         {"type": "server_tool_use", "id": "call-1"},
