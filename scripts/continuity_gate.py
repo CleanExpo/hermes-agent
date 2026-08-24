@@ -258,7 +258,7 @@ def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
             raise ContinuityError(
                 "Python evidence script must be a repository .py file"
             )
-        argv[0] = str(invocation)
+        argv[0] = str(resolved)
         argv[1] = str(script)
         return argv
     if resolved == Path("/bin/bash").resolve():
@@ -276,6 +276,28 @@ def _resolved_argv(spec: dict[str, Any], repo_root: Path) -> list[str]:
         raise ContinuityError(f"evidence executable is missing: {resolved}")
     argv[0] = str(invocation)
     return argv
+
+
+def _python_venv_context(spec: dict[str, Any], repo_root: Path) -> dict[str, str]:
+    """Preserve venv imports without executing through a mutable launcher link."""
+    token = Path(str(spec["argv"][0]))
+    invocation = (
+        token.absolute() if token.is_absolute() else (repo_root / token).absolute()
+    )
+    resolved = invocation.resolve()
+    if resolved != Path(sys.executable).resolve() or invocation == resolved:
+        return {}
+    venv_root = invocation.parent.parent
+    candidates = [
+        venv_root / "Lib/site-packages",
+        venv_root
+        / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages",
+    ]
+    site_packages = [str(path) for path in candidates if path.is_dir()]
+    context = {"__PYVENV_LAUNCHER__": str(invocation)}
+    if site_packages:
+        context["PYTHONPATH"] = os.pathsep.join(site_packages)
+    return context
 
 
 def _test_summary(output: str) -> tuple[int, int, int]:
@@ -326,15 +348,17 @@ def _execute_evidence(
         raise ContinuityError(f"{kind} evidence timeout is outside 1..7200 seconds")
     started = datetime.now(timezone.utc)
     monotonic_start = time.monotonic()
+    child_env = {
+        "HOME": str(evidence_home),
+        "PYTHONHASHSEED": "0",
+        "TZ": "UTC",
+    }
+    child_env.update(_python_venv_context(spec, repo_root))
     result = run_command(
         argv,
         cwd=repo_root,
         timeout=timeout,
-        env=minimal_child_env({
-            "HOME": str(evidence_home),
-            "PYTHONHASHSEED": "0",
-            "TZ": "UTC",
-        }),
+        env=minimal_child_env(child_env),
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")

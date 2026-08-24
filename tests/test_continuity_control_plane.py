@@ -450,21 +450,38 @@ def test_beads_mutation_failure_redacts_child_output(
     assert sentinel not in str(exc.value)
 
 
-def test_python_evidence_keeps_virtualenv_invocation_path(tmp_path: Path) -> None:
+def test_python_evidence_resolves_binary_but_keeps_virtualenv_imports(
+    tmp_path: Path,
+) -> None:
     repo = tmp_path / "repo"
     python = repo / ".venv/bin/python"
     script = repo / "scripts/evidence.py"
+    site_packages = repo / (
+        f".venv/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
     python.parent.mkdir(parents=True)
     script.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
     python.symlink_to(sys.executable)
-    script.write_text("print('ok')\n", encoding="utf-8")
+    (site_packages / "venv_probe.py").write_text(
+        "VALUE = 'venv-ok'\n", encoding="utf-8"
+    )
+    script.write_text("import venv_probe\nprint(venv_probe.VALUE)\n", encoding="utf-8")
+    spec = {"argv": [".venv/bin/python", "scripts/evidence.py"]}
 
-    argv = continuity_gate._resolved_argv(
-        {"argv": [".venv/bin/python", "scripts/evidence.py"]}, repo
+    argv = continuity_gate._resolved_argv(spec, repo)
+    child_env = continuity_gate.minimal_child_env(
+        continuity_gate._python_venv_context(spec, repo)
+    )
+    python.unlink()
+    python.symlink_to("/bin/sh")
+    result = subprocess.run(
+        argv, cwd=repo, env=child_env, text=True, capture_output=True, check=False
     )
 
-    assert argv == [str(python), str(script)]
-    assert Path(argv[0]).resolve() == Path(sys.executable).resolve()
+    assert argv == [str(Path(sys.executable).resolve()), str(script)]
+    assert result.returncode == 0
+    assert result.stdout.strip() == "venv-ok"
 
 
 def test_interrupted_tool_adjacency_is_rejected() -> None:
