@@ -18,6 +18,7 @@ import yaml
 
 from continuity_common import (
     ContinuityError,
+    _isolated_process_options,
     _terminate_process_tree,
     load_json,
     minimal_child_env,
@@ -44,12 +45,12 @@ def _host_executable(config: dict, surface: str) -> Path:
     return executable
 
 
-def _require_codex_discovery_checkout(repo_root: Path) -> None:
+def _require_codex_discovery_checkout(repo_root: Path, state_root: Path) -> None:
     result = run_command(
         ["git", "rev-parse", "--git-common-dir"],
         cwd=repo_root,
         timeout=30,
-        env=minimal_child_env(),
+        env=minimal_child_env(state_root=state_root),
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise ContinuityError("cannot resolve Codex hook discovery checkout")
@@ -145,9 +146,30 @@ def _run_host_until_native_event(
         stderr_path.open("w", encoding="utf-8") as stderr_handle,
     ):
         handled_signals = (signal.SIGTERM, signal.SIGINT)
+        prior_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
+        lifecycle: dict[str, object] = {
+            "process": None,
+            "pending_signal": None,
+            "terminating": False,
+        }
+
+        def terminate_nested_host(signum: int, _frame: object) -> None:
+            if lifecycle["terminating"]:
+                return
+            process = lifecycle["process"]
+            if process is None:
+                lifecycle["pending_signal"] = signum
+                return
+            lifecycle["terminating"] = True
+            _terminate_process_tree(process)
+            raise SystemExit(128 + signum)
+
         prior_mask: set[signal.Signals] | None = None
         if os.name == "posix":
             prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        for sig in handled_signals:
+            signal.signal(sig, terminate_nested_host)
+        mask_is_blocked = prior_mask is not None
         try:
             process = subprocess.Popen(
                 command,
@@ -157,24 +179,15 @@ def _run_host_until_native_event(
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 text=True,
-                start_new_session=os.name == "posix",
+                **_isolated_process_options(),
             )
-        except BaseException:
+            lifecycle["process"] = process
             if prior_mask is not None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-            raise
-        prior_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
-
-        def terminate_nested_host(signum: int, _frame: object) -> None:
-            if process.poll() is None:
-                _terminate_process_tree(process)
-            raise SystemExit(128 + signum)
-
-        for sig in handled_signals:
-            signal.signal(sig, terminate_nested_host)
-        if prior_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-        try:
+                mask_is_blocked = False
+            pending_signal = lifecycle["pending_signal"]
+            if isinstance(pending_signal, int):
+                terminate_nested_host(pending_signal, None)
             deadline = time.monotonic() + timeout
             last_error: ContinuityError | None = None
             while time.monotonic() < deadline:
@@ -188,19 +201,17 @@ def _run_host_until_native_event(
                 except ContinuityError as exc:
                     last_error = exc
                 else:
-                    if process.poll() is None:
-                        _terminate_process_tree(process)
-                    else:
-                        process.communicate()
+                    _terminate_process_tree(process)
                     return output
                 if process.poll() is not None:
                     break
                 time.sleep(0.1)
-            if process.poll() is None:
-                _terminate_process_tree(process)
+            _terminate_process_tree(process)
             stdout_handle.flush()
             stderr_handle.flush()
         finally:
+            if mask_is_blocked and prior_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
             for sig, handler in prior_handlers.items():
                 signal.signal(sig, handler)
     output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
@@ -262,14 +273,15 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
     if target.read_text(encoding="utf-8") != rendered[target]:
         raise ContinuityError(f"{surface} project hook adapter is stale")
     if surface == "codex":
-        _require_codex_discovery_checkout(repo_root)
+        _require_codex_discovery_checkout(repo_root, Path(config["state_root"]))
         codex_config = repo_root / ".codex/config.toml"
         if codex_config.read_text(encoding="utf-8") != rendered[codex_config]:
             raise ContinuityError("codex project config layer is stale")
     executable = _host_executable(config, surface)
     checkpoint = _event_log_checkpoint(config)
-    temp_root = Path(config["state_root"]) / "tmp"
-    temp_root.mkdir(parents=True, exist_ok=True)
+    confined_env = minimal_child_env(state_root=config["state_root"])
+    state_root = Path(confined_env["HOME"])
+    temp_root = Path(confined_env["TMPDIR"])
     with tempfile.TemporaryDirectory(
         prefix=f"continuity-{surface}-host-", dir=temp_root
     ) as temp:
@@ -279,6 +291,10 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
             "OPENAI_API_KEY": "native-observation-not-a-credential",
             "OPENAI_BASE_URL": "http://127.0.0.1:1",
             "CONTINUITY_OBSERVATION_CONFIG": str(config_path),
+            "HOME": temp,
+            "TMPDIR": temp,
+            "TEMP": temp,
+            "TMP": temp,
         }
         if surface == "codex":
             codex_home = Path(temp) / ".codex"
@@ -294,7 +310,7 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
         _run_host_until_native_event(
             _project_host_command(executable, surface),
             cwd=repo_root,
-            env=minimal_child_env(extra_env),
+            env=minimal_child_env(extra_env, state_root=state_root),
             checkpoint=checkpoint,
             surface=surface,
             output_dir=Path(temp),
@@ -353,7 +369,9 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
     ):
         raise ContinuityError("installed Hermes hook config drifted from its manifest")
     executable = _host_executable(config, "hermes")
-    env = minimal_child_env({"HERMES_HOME": str(hermes_home)})
+    env = minimal_child_env(
+        {"HERMES_HOME": str(hermes_home)}, state_root=config["state_root"]
+    )
     commands = (
         ("list", ["hooks", "list"]),
         ("doctor", ["hooks", "doctor"]),

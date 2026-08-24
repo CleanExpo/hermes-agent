@@ -160,7 +160,7 @@ def _require_committed_config(
         ["git", "show", "HEAD:.continuity/config.json"],
         cwd=repo_root,
         timeout=30,
-        env=minimal_child_env(),
+        env=minimal_child_env(state_root=config["state_root"]),
     )
     try:
         committed_config = (
@@ -192,10 +192,9 @@ def strict_authority_check(
     errors = list(preflight.get("errors") or [])
     beads = config["beads"]
     verify_pinned_executable(config, cwd.resolve(), "beads", Path(beads["binary"]))
-    env = minimal_child_env({
-        "BEADS_DIR": beads["data_dir"],
-        "HOME": config["state_root"],
-    })
+    env = minimal_child_env(
+        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+    )
     try:
         result = run_command(
             [beads["binary"], "show", beads["active_task"], "--json"],
@@ -457,7 +456,7 @@ print(json.dumps({"python_version": sys.version, "packages": records}, separator
         [str(python_path), "-I", "-c", probe],
         cwd=repo_root,
         timeout=60,
-        env=minimal_child_env({"HOME": str(config["state_root"])}),
+        env=minimal_child_env(state_root=config["state_root"]),
     )
     if result.returncode != 0:
         raise ContinuityError("dependency identity probe failed")
@@ -759,7 +758,7 @@ def _execute_evidence(
         argv,
         cwd=repo_root,
         timeout=timeout,
-        env=minimal_child_env(child_env),
+        env=minimal_child_env(child_env, state_root=config["state_root"]),
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")
@@ -1009,10 +1008,9 @@ def verify_receipt(
 def _run_beads(config: dict[str, Any], arguments: list[str], repo_root: Path) -> None:
     beads = config["beads"]
     verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
-    env = minimal_child_env({
-        "BEADS_DIR": beads["data_dir"],
-        "HOME": config["state_root"],
-    })
+    env = minimal_child_env(
+        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+    )
     result = run_command(
         [beads["binary"], *arguments, "--json"],
         cwd=repo_root,
@@ -1030,10 +1028,9 @@ def _beads_status(config: dict[str, Any], repo_root: Path) -> str | None:
         [beads["binary"], "show", beads["active_task"], "--json"],
         cwd=repo_root,
         timeout=float(beads.get("completion_timeout_seconds", 60)),
-        env=minimal_child_env({
-            "BEADS_DIR": beads["data_dir"],
-            "HOME": config["state_root"],
-        }),
+        env=minimal_child_env(
+            {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+        ),
     )
     if result.returncode != 0:
         raise ContinuityError("Beads verification query failed")

@@ -15,6 +15,7 @@ on:
       - 'scripts/run_tests.sh'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
+      - 'tests/test_continuity_spec_completeness.py'
       - '.github/workflows/continuity-gate.yml'
       - '.github/actions/retry/**'
       - 'pyproject.toml'
@@ -34,6 +35,7 @@ on:
       - 'scripts/run_tests.sh'
       - 'specs/**'
       - 'tests/test_continuity_control_plane.py'
+      - 'tests/test_continuity_spec_completeness.py'
       - '.github/workflows/continuity-gate.yml'
       - '.github/actions/retry/**'
       - 'pyproject.toml'
@@ -64,4 +66,7 @@ jobs:
           command: uv sync --locked --python 3.11 --extra dev
       - run: .venv/bin/python scripts/install_continuity_adapters.py --repo-root "$PWD" --check
       - run: .venv/bin/python scripts/continuity_gate.py static --config .continuity/config.json
-      - run: scripts/run_tests.sh tests/test_continuity_control_plane.py
+      - run: >-
+          scripts/run_tests.sh
+          tests/test_continuity_control_plane.py
+          tests/test_continuity_spec_completeness.py

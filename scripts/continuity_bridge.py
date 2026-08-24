@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ REQUIRED_SPEC_FIELDS = {
     "change_id",
     "folder",
 }
+SPEC_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / ".specify/templates/spec-template.md"
+SPEC_TEMPLATE_TEXT_MARKERS = ('User description: "$ARGUMENTS"', "ACTION REQUIRED:")
 
 
 def _task_from_json(value: Any, task_id: str) -> dict[str, Any] | None:
@@ -64,10 +67,9 @@ def _read_beads(
     beads = config["beads"]
     task_id = beads["active_task"]
     verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
-    env = minimal_child_env({
-        "BEADS_DIR": beads["data_dir"],
-        "HOME": config["state_root"],
-    })
+    env = minimal_child_env(
+        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+    )
     degraded_reason = ""
     try:
         result = run_command(
@@ -209,6 +211,44 @@ def _required(mapping: dict[str, Any], fields: set[str], authority: str) -> list
     ]
 
 
+def _balanced_bracket_markers(text: str) -> set[str]:
+    """Return all balanced, possibly nested bracket spans from template text."""
+    markers: set[str] = set()
+    for line in text.splitlines():
+        starts: list[int] = []
+        for index, character in enumerate(line):
+            if character == "[":
+                starts.append(index)
+            elif character == "]" and starts:
+                for start in starts:
+                    markers.add(line[start : index + 1])
+                starts.clear()
+    return markers
+
+
+def _spec_template_markers() -> tuple[str, ...]:
+    template = SPEC_TEMPLATE_PATH.read_text(encoding="utf-8")
+    markers = _balanced_bracket_markers(template)
+    markers.update(SPEC_TEMPLATE_TEXT_MARKERS)
+    return tuple(sorted(markers))
+
+
+def validate_spec_body(body: str) -> list[str]:
+    """Return named completeness errors for the human-readable spec body."""
+    without_comments = re.sub(r"<!--[\s\S]*?-->", "", body).strip()
+    if not without_comments:
+        return ["Spec Kit change body is incomplete: no substantive content"]
+
+    markers = [marker for marker in _spec_template_markers() if marker in without_comments]
+    if markers:
+        return [
+            "Spec Kit change body is incomplete: unresolved template marker "
+            + repr(marker)
+            for marker in markers
+        ]
+    return []
+
+
 def build_preflight(
     config_path: Path,
     *,
@@ -264,8 +304,9 @@ def build_preflight(
 
     try:
         spec_path = repo_root / config["spec"]["path"]
-        spec, _ = read_markdown_frontmatter(spec_path)
+        spec, spec_body = read_markdown_frontmatter(spec_path)
         errors.extend(_required(spec, REQUIRED_SPEC_FIELDS, "Spec Kit change"))
+        errors.extend(validate_spec_body(spec_body))
     except ContinuityError as exc:
         errors.append(str(exc))
         spec = {}

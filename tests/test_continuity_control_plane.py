@@ -12,6 +12,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
+import psutil
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,10 @@ def _lock_worker(config_path: str, marker_path: str, label: str) -> None:
 
 
 def _interrupt_tree_worker(ready_path: str, sentinel_path: str) -> None:
+    def raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
     grandchild = (
         "import pathlib,sys,time; "
         "time.sleep(0.8); "
@@ -132,8 +137,10 @@ def _native_observer_spawn_race_worker(
 
     def interrupt_immediately_after_spawn(*args, **kwargs):
         child = real_popen(*args, **kwargs)
+        if os.name == "nt":
+            assert kwargs.get("creationflags", 0) & subprocess.CREATE_NEW_PROCESS_GROUP
         Path(child_pid_path).write_text(str(child.pid), encoding="utf-8")
-        os.kill(os.getpid(), signal.SIGTERM)
+        signal.raise_signal(signal.SIGINT)
         return child
 
     continuity_native_observation.subprocess.Popen = interrupt_immediately_after_spawn
@@ -714,10 +721,13 @@ def test_python_evidence_resolves_binary_but_keeps_virtualenv_imports(
     )
     script.write_text("import venv_probe\nprint(venv_probe.VALUE)\n", encoding="utf-8")
     spec = {"argv": [".venv/bin/python", "scripts/evidence.py"]}
+    state_root = tmp_path / "state"
+    state_root.mkdir()
 
     argv = continuity_gate._resolved_argv(spec, repo)
     child_env = continuity_gate.minimal_child_env(
-        continuity_gate._python_venv_context(spec, repo)
+        continuity_gate._python_venv_context(spec, repo),
+        state_root=state_root,
     )
     python.unlink()
     python.symlink_to("/bin/sh")
@@ -728,6 +738,44 @@ def test_python_evidence_resolves_binary_but_keeps_virtualenv_imports(
     assert argv == [str(Path(sys.executable).resolve()), str(script)]
     assert result.returncode == 0
     assert result.stdout.strip() == "venv-ok"
+
+
+def test_minimal_child_env_confines_all_storage_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient = tmp_path / "ambient"
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    for name in ("HOME", "TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(ambient))
+    monkeypatch.setenv("TOP_SECRET", "must-not-pass")
+
+    child_env = continuity_gate.minimal_child_env(state_root=state_root)
+
+    assert "TOP_SECRET" not in child_env
+    assert Path(child_env["HOME"]).resolve() == state_root.resolve()
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        path = Path(child_env[name]).resolve()
+        assert path == (state_root / "tmp").resolve()
+        assert path.is_relative_to(state_root.resolve())
+
+
+def test_minimal_child_env_rejects_storage_override_escape(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    with pytest.raises(ContinuityError, match="child HOME escapes pilot state root"):
+        continuity_gate.minimal_child_env(
+            {"HOME": str(tmp_path / "ambient")}, state_root=state_root
+        )
+
+
+def test_minimal_child_env_never_recreates_missing_state_root(tmp_path: Path) -> None:
+    missing = tmp_path / "unmounted-volume" / "state"
+
+    with pytest.raises(ContinuityError, match="pilot state root is unavailable"):
+        continuity_gate.minimal_child_env(state_root=missing)
+
+    assert not missing.exists()
 
 
 def test_interrupted_tool_adjacency_is_rejected() -> None:
@@ -1521,6 +1569,46 @@ def test_native_project_observer_uses_generated_adapter_and_admission_path(
     }
 
 
+def test_native_project_observer_confines_child_temp_environment(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, str] = {}
+    ambient_temp = pilot["repo"] / "ambient-temp"
+    ambient_temp.mkdir()
+    for name in ("HOME", "TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(ambient_temp))
+
+    def capture_environment(
+        _command: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        checkpoint: tuple[Path, int, int | None],
+        surface: str,
+        output_dir: Path,
+        timeout: float,
+    ) -> str:
+        del cwd, checkpoint, surface, timeout
+        captured.update(env)
+        assert output_dir.is_relative_to(pilot["state"].resolve())
+        return ""
+
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "_run_host_until_native_event",
+        capture_environment,
+    )
+    continuity_native_observation.observe_project_hook(
+        pilot["repo"], pilot["config"], "claude"
+    )
+
+    confined = {
+        Path(captured[name]).resolve() for name in ("HOME", "TMPDIR", "TEMP", "TMP")
+    }
+    assert len(confined) == 1
+    assert confined.pop().is_relative_to(pilot["state"].resolve())
+
+
 def test_native_project_observer_fails_when_host_does_not_invoke_hook(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
@@ -1565,7 +1653,9 @@ def test_codex_native_observer_rejects_linked_worktree_provenance(
     _git(pilot["repo"], "worktree", "add", "-b", "native-linked", str(linked))
 
     with pytest.raises(ContinuityError, match="canonical common checkout"):
-        continuity_native_observation._require_codex_discovery_checkout(linked)
+        continuity_native_observation._require_codex_discovery_checkout(
+            linked, pilot["state"]
+        )
 
 
 def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
@@ -1661,7 +1751,10 @@ def test_hermes_manifest_rejects_authenticated_forged_rollback_authority(
     manifest["before_hooks"] = {}
     manifest["absent_before"] = []
     manifest["auth"] = sign_receipt(
-        json.loads((REPO_ROOT / ".continuity/config.json").read_text()), manifest
+        json.loads(
+            (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
+        ),
+        manifest,
     )
     atomic_write_json(manifest_path, manifest)
 
@@ -1838,6 +1931,33 @@ def test_timed_out_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     assert not sentinel.exists()
 
 
+@pytest.mark.windows_only
+def test_windows_timed_out_evidence_reaps_delayed_grandchild(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "windows-grandchild-survived.txt"
+    grandchild = (
+        "import pathlib,sys,time; "
+        "time.sleep(1.0); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[1]]); "
+        "time.sleep(30)"
+    )
+
+    with pytest.raises(ContinuityError, match="command timed out"):
+        run_command(
+            [sys.executable, "-c", parent, str(sentinel)],
+            cwd=tmp_path,
+            timeout=0.2,
+        )
+    time.sleep(1.2)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal-delivery semantics")
 def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     ready = tmp_path / "interrupt-ready.txt"
     sentinel = tmp_path / "interrupt-grandchild-survived.txt"
@@ -1851,7 +1971,7 @@ def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
         time.sleep(0.02)
     assert ready.exists()
 
-    os.kill(worker.pid, 2)
+    os.kill(worker.pid, signal.SIGTERM)
     worker.join(5)
 
     assert worker.exitcode == 0
@@ -1859,6 +1979,7 @@ def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     assert not sentinel.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
 def test_interrupted_native_observer_reaps_isolated_host_group(
     tmp_path: Path,
 ) -> None:
@@ -1880,19 +2001,44 @@ def test_interrupted_native_observer_reaps_isolated_host_group(
     worker.join(5)
     time.sleep(1.5)
 
-    try:
-        os.kill(nested_pid, 0)
-    except ProcessLookupError:
-        nested_alive = False
-    else:
-        nested_alive = True
-        if os.name == "posix":
-            os.killpg(nested_pid, signal.SIGKILL)
+    nested_alive = psutil.pid_exists(nested_pid)
+    if nested_alive:
+        psutil.Process(nested_pid).kill()
     assert worker.exitcode == 128 + signal.SIGTERM
     assert not nested_alive
     assert not sentinel.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX repeated-signal semantics")
+def test_native_observer_repeated_signal_cleanup_is_non_reentrant(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "repeated-signal-host-ready.txt"
+    sentinel = tmp_path / "repeated-signal-host-survived.txt"
+    context = multiprocessing.get_context("fork")
+    worker = context.Process(
+        target=_native_observer_interrupt_worker,
+        args=(str(tmp_path), str(ready), str(sentinel)),
+    )
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()
+    nested_pid = int(ready.read_text(encoding="utf-8"))
+
+    os.kill(worker.pid, signal.SIGTERM)
+    time.sleep(0.1)
+    os.kill(worker.pid, signal.SIGINT)
+    worker.join(5)
+    time.sleep(1.5)
+
+    assert worker.exitcode == 128 + signal.SIGTERM
+    assert not psutil.pid_exists(nested_pid)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fork test; Windows proof follows")
 def test_native_observer_blocks_termination_across_spawn_handler_race(
     tmp_path: Path,
 ) -> None:
@@ -1909,16 +2055,33 @@ def test_native_observer_blocks_termination_across_spawn_handler_race(
     nested_pid = int(child_pid_path.read_text(encoding="utf-8"))
     time.sleep(1.5)
 
-    try:
-        os.kill(nested_pid, 0)
-    except ProcessLookupError:
-        nested_alive = False
-    else:
-        nested_alive = True
-        if os.name == "posix":
-            os.killpg(nested_pid, signal.SIGKILL)
-    assert worker.exitcode == 128 + signal.SIGTERM
+    nested_alive = psutil.pid_exists(nested_pid)
+    if nested_alive:
+        psutil.Process(nested_pid).kill()
+    assert worker.exitcode == 128 + signal.SIGINT
     assert not nested_alive
+    assert not sentinel.exists()
+
+
+@pytest.mark.windows_only
+def test_windows_native_observer_closes_spawn_to_handler_race(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "windows-spawned-child-pid.txt"
+    sentinel = tmp_path / "windows-spawn-race-host-survived.txt"
+    context = multiprocessing.get_context("spawn")
+    worker = context.Process(
+        target=_native_observer_spawn_race_worker,
+        args=(str(tmp_path), str(child_pid_path), str(sentinel)),
+    )
+    worker.start()
+    worker.join(10)
+    assert child_pid_path.exists()
+    nested_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    time.sleep(1.5)
+
+    assert worker.exitcode == 128 + signal.SIGINT
+    assert not psutil.pid_exists(nested_pid)
     assert not sentinel.exists()
 
 
@@ -1937,7 +2100,9 @@ def test_promotion_recovers_prepared_and_card_written_stages(
     monkeypatch.setattr(continuity_gate, "atomic_write_text", interrupt_card)
     with pytest.raises(OSError, match="card interruption"):
         promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
-    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    journal = json.loads(
+        (pilot["state"] / "promotion.json").read_text(encoding="utf-8")
+    )
     assert journal["status"] == "PREPARED"
 
     monkeypatch.setattr(continuity_gate, "atomic_write_text", real_card_write)
@@ -1951,7 +2116,9 @@ def test_promotion_recovers_prepared_and_card_written_stages(
     monkeypatch.setattr(continuity_gate, "atomic_write_json", interrupt_card_written)
     with pytest.raises(KeyboardInterrupt, match="process death"):
         promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
-    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    journal = json.loads(
+        (pilot["state"] / "promotion.json").read_text(encoding="utf-8")
+    )
     assert journal["status"] == "CARD_WRITTEN"
 
     monkeypatch.setattr(continuity_gate, "atomic_write_json", real_journal_write)
@@ -1967,7 +2134,9 @@ def test_enforced_promotion_verifies_beads_close_effect(
     monkeypatch.setattr(continuity_gate, "_run_beads", lambda *_args, **_kwargs: None)
     with pytest.raises(ContinuityError, match="did not reach closed"):
         promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
-    journal = json.loads((pilot["state"] / "promotion.json").read_text())
+    journal = json.loads(
+        (pilot["state"] / "promotion.json").read_text(encoding="utf-8")
+    )
     assert journal["status"] == "RECOVERY_REQUIRED"
 
 
@@ -2289,13 +2458,16 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
     assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in workflow
     assert "uv sync --locked --python 3.11 --extra dev" in workflow
     assert ".venv/bin/python scripts/continuity_gate.py static" in workflow
-    assert "scripts/run_tests.sh tests/test_continuity_control_plane.py" in workflow
+    folded_workflow = " ".join(workflow.split())
+    assert "scripts/run_tests.sh tests/test_continuity_control_plane.py" in folded_workflow
     patterns = {
         stripped[3:-1]
         for line in workflow.splitlines()
         if (stripped := line.strip()).startswith("- '") and stripped.endswith("'")
     }
-    config = json.loads((REPO_ROOT / ".continuity/config.json").read_text())
+    config = json.loads(
+        (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
+    )
     protected_paths = set(config["instructions"])
     policy = config["evidence_policy"]
     for spec in [
@@ -2307,7 +2479,9 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
         if len(spec["argv"]) > 1 and not Path(spec["argv"][1]).is_absolute():
             protected_paths.add(spec["argv"][1])
     for manifest_path in (REPO_ROOT / ".specify/integrations").glob("*.manifest.json"):
-        protected_paths.update(json.loads(manifest_path.read_text())["files"])
+        protected_paths.update(
+            json.loads(manifest_path.read_text(encoding="utf-8"))["files"]
+        )
     assert all(
         any(fnmatch(path, pattern) for pattern in patterns) for path in protected_paths
     )

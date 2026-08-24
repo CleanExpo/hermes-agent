@@ -9,13 +9,14 @@ import os
 import platform
 import re
 import secrets
-import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 import yaml
 
 
@@ -128,11 +129,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def minimal_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Return a credential-minimized environment for authority-bearing children."""
+def minimal_child_env(
+    extra: dict[str, str] | None = None,
+    *,
+    state_root: str | Path,
+) -> dict[str, str]:
+    """Return a credential-minimized, state-confined child environment."""
     allowed = {
         "PATH",
-        "TMPDIR",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
@@ -143,10 +147,37 @@ def minimal_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         "WINDIR",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
-    env["PATH"] = "/usr/bin:/bin"
-    env.setdefault("HOME", env.get("TMPDIR", "/tmp"))
+    env["PATH"] = os.defpath
+    requested_state = Path(state_root)
+    if not requested_state.is_dir():
+        raise ContinuityError(
+            f"pilot state root is unavailable or not a directory: {requested_state}"
+        )
+    resolved_state = requested_state.resolve(strict=True)
+    temp_root = resolved_state / "tmp"
+    try:
+        temp_root.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise ContinuityError(f"cannot prepare child temp root: {exc}") from exc
+    temp_root = temp_root.resolve()
+    if not temp_root.is_relative_to(resolved_state):
+        raise ContinuityError(
+            f"child temp root escapes pilot state root: {temp_root}"
+        )
+    env.update({
+        "HOME": str(resolved_state),
+        "TMPDIR": str(temp_root),
+        "TEMP": str(temp_root),
+        "TMP": str(temp_root),
+    })
     if extra:
         env.update(extra)
+    for name in ("HOME", "TMPDIR", "TEMP", "TMP"):
+        path = Path(env[name]).resolve()
+        if not path.is_relative_to(resolved_state):
+            raise ContinuityError(
+                f"child {name} escapes pilot state root: {path}"
+            )
     return env
 
 
@@ -315,41 +346,66 @@ def receipt_signature_errors(
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    """Boundedly terminate a command and every descendant it spawned."""
-    if os.name == "posix":
-        force_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
-        for sig in (signal.SIGTERM, force_kill):
-            try:
-                os.killpg(process.pid, sig)  # windows-footgun: ok — POSIX-only branch
-            except ProcessLookupError:
-                break
-            try:
-                process.communicate(timeout=0.75)
-            except subprocess.TimeoutExpired:
-                pass
-            if sig == signal.SIGTERM:
-                try:
-                    os.killpg(process.pid, 0)  # windows-footgun: ok — POSIX-only branch
-                except ProcessLookupError:
-                    return
-                continue
-            return
-    elif os.name == "nt":
+    """Boundedly terminate a command and its snapshotted descendants.
+
+    ``psutil.Process`` retains the process identity (PID plus creation time),
+    so the escalation pass cannot accidentally target a recycled PID.  Walk
+    children before the parent to prevent a live parent from replacing exited
+    descendants while cleanup is in progress.  This is the repository's
+    cross-platform process-tree primitive; it avoids both POSIX-only
+    ``killpg`` and the unbounded pipe behaviour of spawning ``taskkill``.
+    """
+    try:
+        parent = psutil.Process(process.pid)
+        descendants = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        descendants = []
+        parent = None
+    except (psutil.AccessDenied, OSError):
+        descendants = []
+        parent = None
+
+    def is_alive(target: psutil.Process) -> bool:
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                text=True,
-                capture_output=True,
-                timeout=2,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            return target.is_running() and target.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    descendants.reverse()
+    for target in descendants:
+        try:
+            target.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             pass
+    # Escalate descendants before stopping the parent.  Once the parent exits,
+    # its live children are reparented and can no longer be rediscovered by a
+    # process-tree walk.
+    for target in descendants:
+        if not is_alive(target):
+            continue
+        try:
+            target.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+    if parent is not None:
+        try:
+            parent.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+        deadline = time.monotonic() + 0.75
+        while time.monotonic() < deadline and is_alive(parent):
+            time.sleep(0.025)
+        if is_alive(parent):
+            try:
+                parent.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
 
     if process.poll() is None:
         try:
             process.kill()
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError, OSError):
             pass
     try:
         process.communicate(timeout=0.75)
@@ -359,6 +415,15 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _isolated_process_options() -> dict[str, Any]:
+    """Return host-native options that isolate a spawned command."""
+    if os.name == "posix":
+        return {"start_new_session": True}
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
+
+
 def run_command(
     args: list[str],
     *,
@@ -366,11 +431,6 @@ def run_command(
     timeout: float,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    popen_options: dict[str, Any] = {}
-    if os.name == "posix":
-        popen_options["start_new_session"] = True
-    elif os.name == "nt":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
             args,
@@ -379,7 +439,7 @@ def run_command(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            **popen_options,
+            **_isolated_process_options(),
         )
     except OSError as exc:
         raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
