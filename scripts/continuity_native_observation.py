@@ -19,6 +19,8 @@ import yaml
 from continuity_common import (
     ContinuityError,
     _spawn_contained_process,
+    confined_file_checkpoint,
+    confined_read_range,
     load_json,
     minimal_child_env,
     run_command,
@@ -69,12 +71,18 @@ def _require_codex_discovery_checkout(repo_root: Path, config: dict) -> None:
         )
 
 
-def _event_log_checkpoint(config: dict) -> tuple[Path, int, int | None]:
+MAX_EVENT_EVIDENCE_BYTES = 1_048_576
+
+
+def _event_log_checkpoint(
+    config: dict,
+) -> tuple[Path, int, tuple[int, int] | None, dict]:
     path = Path(config["event_log"])
-    if not path.exists():
-        return path, 0, None
-    stat = path.stat()
-    return path, stat.st_size, stat.st_ino
+    try:
+        size, identity = confined_file_checkpoint(config, path)
+    except FileNotFoundError:
+        return path, 0, None, config
+    return path, size, identity, config
 
 
 def _session_ids(output: str) -> set[str]:
@@ -94,12 +102,22 @@ def _session_ids(output: str) -> set[str]:
 
 
 def _require_native_event(
-    checkpoint: tuple[Path, int, int | None], surface: str, output: str
+    checkpoint: tuple[Path, int, tuple[int, int] | None, dict],
+    surface: str,
+    output: str,
 ) -> None:
-    path, offset, inode = checkpoint
-    if not path.is_file():
+    path, offset, prior_identity = checkpoint[:3]
+    config = checkpoint[3]
+    try:
+        appended_bytes, _size, identity = confined_read_range(
+            config,
+            path,
+            offset=offset,
+            max_bytes=MAX_EVENT_EVIDENCE_BYTES,
+        )
+    except FileNotFoundError:
         raise ContinuityError(f"{surface} host produced no continuity event log")
-    if inode is not None and path.stat().st_ino != inode:
+    if prior_identity is not None and identity != prior_identity:
         raise ContinuityError("continuity event log rotated during native observation")
     identities = _session_ids(output)
     fingerprints = {
@@ -108,18 +126,20 @@ def _require_native_event(
     }
     if not fingerprints:
         raise ContinuityError(f"{surface} host exposed no session identity")
-    with path.open("r", encoding="utf-8") as handle:
-        handle.seek(offset)
-        values = []
-        for line in handle:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ContinuityError(
-                    "native observation found malformed event evidence"
-                ) from exc
-            if isinstance(value, dict):
-                values.append(value)
+    try:
+        appended = appended_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContinuityError("native observation event evidence is not UTF-8") from exc
+    values = []
+    for line in appended.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ContinuityError(
+                "native observation found malformed event evidence"
+            ) from exc
+        if isinstance(value, dict):
+            values.append(value)
     matched = any(
         value.get("surface") == surface
         and value.get("event") == "session_start"
@@ -138,7 +158,7 @@ def _run_host_until_native_event(
     *,
     cwd: Path,
     env: dict[str, str],
-    checkpoint: tuple[Path, int, int | None],
+    checkpoint: tuple[Path, int, tuple[int, int] | None, dict],
     surface: str,
     output_dir: Path,
     timeout: float,

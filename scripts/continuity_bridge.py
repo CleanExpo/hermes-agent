@@ -13,11 +13,14 @@ from typing import Any
 from continuity_common import (
     ContinuityError,
     compact_json,
+    confined_load_json,
+    confined_read_text,
     external_input_digests,
     external_volume_available,
     git_state,
     load_json,
     minimal_child_env,
+    parse_markdown_frontmatter,
     read_markdown_frontmatter,
     receipt_errors,
     receipt_signature_errors,
@@ -92,12 +95,12 @@ def _read_beads(
 
     issues_path = Path(beads["issues_path"])
     try:
-        lines = issues_path.read_text(encoding="utf-8").splitlines()
+        lines = confined_read_text(config, issues_path).splitlines()
         for line in lines:
             task = _task_from_json(json.loads(line), task_id)
             if task is not None:
                 return task, True, degraded_reason or "Beads CLI unavailable"
-    except (OSError, json.JSONDecodeError) as exc:
+    except (ContinuityError, FileNotFoundError, json.JSONDecodeError) as exc:
         raise ContinuityError(
             f"cannot read Beads task or JSONL fallback: {exc}"
         ) from exc
@@ -281,8 +284,9 @@ def build_preflight(
         )
 
     try:
-        card, card_body = read_markdown_frontmatter(
-            Path(config["basic_memory"]["card_path"])
+        card_path = Path(config["basic_memory"]["card_path"])
+        card, card_body = parse_markdown_frontmatter(
+            confined_read_text(config, card_path), card_path
         )
         errors.extend(_required(card, REQUIRED_CARD_FIELDS, "Basic Memory card"))
         if not isinstance(card.get("next_action"), str):
@@ -292,6 +296,10 @@ def build_preflight(
         card_word_count = len((json.dumps(card, default=str) + " " + card_body).split())
         if card_word_count > 1200:
             errors.append(f"Basic Memory card exceeds 1,200 words: {card_word_count}")
+    except FileNotFoundError:
+        errors.append("Basic Memory card is unavailable")
+        card = {}
+        card_word_count = None
     except ContinuityError as exc:
         errors.append(str(exc))
         card = {}
@@ -379,7 +387,7 @@ def build_preflight(
             errors.append("terminal lifecycle has no gate receipt")
         elif state:
             try:
-                receipt = load_json(Path(receipt_path))
+                receipt = confined_load_json(config, Path(receipt_path))
                 errors.extend(receipt_signature_errors(config, receipt))
                 errors.extend(receipt_errors(receipt, state))
                 try:
@@ -394,6 +402,8 @@ def build_preflight(
                     errors.append(
                         "receipt lifecycle target does not match authority state"
                     )
+            except FileNotFoundError:
+                errors.append("terminal receipt is unavailable")
             except ContinuityError as exc:
                 errors.append(str(exc))
     else:
@@ -408,18 +418,21 @@ def build_preflight(
             errors.append("Spec Kit change lifecycle is BLOCKED")
 
     journal_path = Path(config["state_root"]) / "promotion.json"
-    if journal_path.is_file():
-        try:
-            journal = load_json(journal_path)
-            blocked_journals = {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
-            if journal.get("status") in blocked_journals and not (
-                allow_recovery_journal and journal.get("status") in blocked_journals
-            ):
-                errors.append(
-                    f"promotion journal requires recovery: {journal.get('status')}"
-                )
-        except ContinuityError as exc:
-            errors.append(str(exc))
+    try:
+        journal = confined_load_json(config, journal_path)
+    except FileNotFoundError:
+        journal = None
+    except ContinuityError as exc:
+        errors.append(str(exc))
+        journal = None
+    if journal is not None:
+        blocked_journals = {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
+        if journal.get("status") in blocked_journals and not (
+            allow_recovery_journal and journal.get("status") in blocked_journals
+        ):
+            errors.append(
+                f"promotion journal requires recovery: {journal.get('status')}"
+            )
 
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():

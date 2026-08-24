@@ -13,9 +13,10 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -250,6 +251,116 @@ def _windows_reject_reparse_target(path: Path) -> None:
         raise ContinuityError(f"state target is a reparse point: {path}")
 
 
+@contextmanager
+def _windows_hold_directory_chain(
+    path: Path, root: Path
+) -> Iterator[None]:
+    """Retain non-delete-shared handles so checked directories cannot be swapped."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid = ctypes.c_void_p(-1).value
+    relative = path.relative_to(root)
+    candidates = (
+        root,
+        *(
+            root / Path(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    handles: list[int] = []
+    try:
+        for candidate in candidates:
+            handle = kernel32.CreateFileW(
+                str(candidate),
+                0x0080,  # FILE_READ_ATTRIBUTES
+                0x0001 | 0x0002,  # share read/write, deliberately not delete
+                None,
+                3,  # OPEN_EXISTING
+                0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                None,
+            )
+            if handle == invalid:
+                raise ContinuityError(
+                    "cannot retain checked Windows state directory: "
+                    f"{candidate}: {ctypes.get_last_error()}"
+                )
+            handles.append(int(handle))
+        _windows_require_plain_path(path, root)
+        yield
+    finally:
+        for handle in reversed(handles):
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _windows_open_regular_fd(path: Path, *, append: bool = False) -> int:
+    """Open a Windows leaf itself, never its reparse target."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+    kernel32.GetFileType.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid = ctypes.c_void_p(-1).value
+    desired_access = 0x0004 if append else 0x80000000
+    disposition = 4 if append else 3  # OPEN_ALWAYS or OPEN_EXISTING
+    handle = kernel32.CreateFileW(
+        str(path),
+        desired_access,
+        0x0001 | 0x0002,
+        None,
+        disposition,
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == invalid:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(error, "Windows state target is unavailable", path)
+        raise ContinuityError(f"cannot open Windows state target safely: {error}")
+    try:
+        attributes = kernel32.GetFileAttributesW(str(path))
+        if attributes == 0xFFFFFFFF or attributes & 0x400:
+            raise ContinuityError(f"state target is a reparse point: {path}")
+        if attributes & 0x10 or kernel32.GetFileType(handle) != 0x0001:
+            raise ContinuityError(f"state target is not a regular file: {path}")
+        flags = (os.O_APPEND | os.O_WRONLY) if append else os.O_RDONLY
+        descriptor = msvcrt.open_osfhandle(int(handle), flags)
+        handle = None
+        return descriptor
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
+
+
 def _secure_dirfd_available() -> bool:
     return (
         os.open in os.supports_dir_fd
@@ -280,12 +391,12 @@ def confined_parent(
                 "secure confined state access requires directory descriptor support"
             )
         parent = normalized.parent
-        _windows_require_plain_path(parent, state)
-        if parent.resolve(strict=True) != parent:
-            raise ContinuityError(f"state path parent is not direct: {parent}")
-        _windows_reject_reparse_target(normalized)
-        validate_state_storage(config["external_volume"], config["state_root"])
-        yield None, normalized
+        with _windows_hold_directory_chain(parent, state):
+            if parent.resolve(strict=True) != parent:
+                raise ContinuityError(f"state path parent is not direct: {parent}")
+            _windows_reject_reparse_target(normalized)
+            validate_state_storage(config["external_volume"], config["state_root"])
+            yield None, normalized
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -377,6 +488,43 @@ def confined_atomic_write_json(
     )
 
 
+def confined_append_text(config: dict[str, Any], path: Path, content: str) -> None:
+    data = content.encode("utf-8")
+    with confined_parent(config, path) as (parent_fd, target):
+        flags = (
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = (
+                _windows_open_regular_fd(Path(target), append=True)
+                if parent_fd is None and os.name == "nt"
+                else os.open(target, flags, 0o600)
+                if parent_fd is None
+                else os.open(target, flags, 0o600, dir_fd=parent_fd)
+            )
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot open confined append file {path}: {exc}"
+            ) from exc
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ContinuityError(
+                    f"confined append target is not a regular file: {path}"
+                )
+            _write_all(descriptor, data)
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot append confined state file {path}: {exc}"
+            ) from exc
+        finally:
+            os.close(descriptor)
+
+
 def confined_read_bytes(config: dict[str, Any], path: Path) -> bytes:
     with confined_parent(config, path) as (parent_fd, target):
         flags = (
@@ -386,7 +534,9 @@ def confined_read_bytes(config: dict[str, Any], path: Path) -> bytes:
         )
         try:
             descriptor = (
-                os.open(target, flags)
+                _windows_open_regular_fd(Path(target))
+                if parent_fd is None and os.name == "nt"
+                else os.open(target, flags)
                 if parent_fd is None
                 else os.open(target, flags, dir_fd=parent_fd)
             )
@@ -411,6 +561,98 @@ def confined_read_bytes(config: dict[str, Any], path: Path) -> bytes:
             os.close(descriptor)
 
 
+def confined_file_checkpoint(
+    config: dict[str, Any], path: Path
+) -> tuple[int, tuple[int, int]]:
+    with confined_parent(config, path) as (parent_fd, target):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = (
+                _windows_open_regular_fd(Path(target))
+                if parent_fd is None and os.name == "nt"
+                else os.open(target, flags)
+                if parent_fd is None
+                else os.open(target, flags, dir_fd=parent_fd)
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot checkpoint confined state file {path}: {exc}"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ContinuityError(
+                    f"confined state file is not a regular file: {path}"
+                )
+            return metadata.st_size, (metadata.st_dev, metadata.st_ino)
+        finally:
+            os.close(descriptor)
+
+
+def confined_read_range(
+    config: dict[str, Any], path: Path, *, offset: int, max_bytes: int
+) -> tuple[bytes, int, tuple[int, int]]:
+    if offset < 0 or max_bytes < 1:
+        raise ContinuityError("confined read range is invalid")
+    with confined_parent(config, path) as (parent_fd, target):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = (
+                _windows_open_regular_fd(Path(target))
+                if parent_fd is None and os.name == "nt"
+                else os.open(target, flags)
+                if parent_fd is None
+                else os.open(target, flags, dir_fd=parent_fd)
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot open confined state range {path}: {exc}"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ContinuityError(
+                    f"confined state file is not a regular file: {path}"
+                )
+            if metadata.st_size < offset:
+                raise ContinuityError("confined state file was truncated")
+            available = metadata.st_size - offset
+            if available > max_bytes:
+                raise ContinuityError(
+                    f"confined state range exceeds {max_bytes} bytes"
+                )
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = available
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ContinuityError(
+                        "confined state file changed during ranged read"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return (
+                b"".join(chunks),
+                metadata.st_size,
+                (metadata.st_dev, metadata.st_ino),
+            )
+        finally:
+            os.close(descriptor)
+
+
 def _require_regular_leaf(
     parent_fd: int | None, target: str | Path, *, missing_ok: bool
 ) -> None:
@@ -421,7 +663,9 @@ def _require_regular_leaf(
     )
     try:
         descriptor = (
-            os.open(target, flags)
+            _windows_open_regular_fd(Path(target))
+            if parent_fd is None and os.name == "nt"
+            else os.open(target, flags)
             if parent_fd is None
             else os.open(target, flags, dir_fd=parent_fd)
         )
@@ -467,17 +711,19 @@ def confined_ensure_dir(config: dict[str, Any], name: str) -> Path:
                 "secure confined state directory creation requires directory descriptor support"
             )
         target = state / name
-        _windows_reject_reparse_target(target)
-        validate_state_storage(config["external_volume"], config["state_root"])
-        try:
-            os.mkdir(target, mode=0o700)
-        except FileExistsError:
-            pass
-        _windows_require_plain_path(target, state)
-        if not target.is_dir():
-            raise ContinuityError(
-                f"state directory is not a confined direct directory: {target}"
-            )
+        with _windows_hold_directory_chain(state, state):
+            _windows_reject_reparse_target(target)
+            validate_state_storage(config["external_volume"], config["state_root"])
+            try:
+                os.mkdir(target, mode=0o700)
+            except FileExistsError:
+                pass
+            with _windows_hold_directory_chain(target, state):
+                if not target.is_dir():
+                    raise ContinuityError(
+                        "state directory is not a confined direct directory: "
+                        f"{target}"
+                    )
         return target
     try:
         descriptor = os.open(
@@ -645,7 +891,9 @@ def _load_receipt_key(config: dict[str, Any], *, create: bool) -> bytes:
         )
         try:
             descriptor = (
-                os.open(target, read_flags)
+                _windows_open_regular_fd(Path(target))
+                if parent_fd is None and os.name == "nt"
+                else os.open(target, read_flags)
                 if parent_fd is None
                 else os.open(target, read_flags, dir_fd=parent_fd)
             )
@@ -715,7 +963,10 @@ def receipt_signature_errors(
 
 
 def _terminate_process_tree(
-    process: subprocess.Popen[str], *, process_group: int | None = None
+    process: subprocess.Popen[str],
+    *,
+    process_group: int | None = None,
+    tracked_descendants: tuple[psutil.Process, ...] = (),
 ) -> None:
     """Boundedly terminate a command and its snapshotted descendants.
 
@@ -727,36 +978,22 @@ def _terminate_process_tree(
     additionally covers descendants after their leader exits; Windows callers
     use a kill-on-close Job Object established before the child is resumed.
     """
+    try:
+        parent = psutil.Process(process.pid)
+        current_descendants = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        current_descendants = []
+        parent = None
+    except (psutil.AccessDenied, OSError):
+        current_descendants = []
+        parent = None
+    descendants = list(dict.fromkeys((*tracked_descendants, *current_descendants)))
+
     if process_group is not None and os.name == "posix":
         try:
             os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok -- POSIX gate
         except (ProcessLookupError, PermissionError, OSError):
             pass
-
-        deadline = time.monotonic() + 0.2
-        while time.monotonic() < deadline and process.poll() is None:
-            time.sleep(0.025)
-        try:
-            os.killpg(  # windows-footgun: ok -- POSIX gate
-                process_group, getattr(signal, "SIGKILL", signal.SIGTERM)
-            )
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            process.communicate(timeout=0.75)
-        except subprocess.TimeoutExpired:
-            pass
-        return
-
-    try:
-        parent = psutil.Process(process.pid)
-        descendants = parent.children(recursive=True)
-    except psutil.NoSuchProcess:
-        descendants = []
-        parent = None
-    except (psutil.AccessDenied, OSError):
-        descendants = []
-        parent = None
 
     def is_alive(target: psutil.Process) -> bool:
         try:
@@ -798,6 +1035,13 @@ def _terminate_process_tree(
     if process.poll() is None:
         try:
             process.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if process_group is not None and os.name == "posix":
+        try:
+            os.killpg(  # windows-footgun: ok -- POSIX gate
+                process_group, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
         except (ProcessLookupError, PermissionError, OSError):
             pass
     try:
@@ -915,14 +1159,93 @@ def _close_windows_job(handle: int) -> None:
 @dataclass
 class _ContainedProcess:
     process: subprocess.Popen[str]
+    family_token: str
     process_group: int | None = None
     windows_job: int | None = None
+    windows_directory_lease: ExitStack | None = None
     terminated: bool = False
+    tracked_descendants: dict[tuple[int, float], psutil.Process] = field(
+        default_factory=dict
+    )
+    descendant_lock: threading.Lock = field(default_factory=threading.Lock)
+    monitor_stop: threading.Event = field(default_factory=threading.Event)
+    monitor_thread: threading.Thread | None = None
+
+    def start_descendant_monitor(self) -> None:
+        if os.name != "posix":
+            return
+        self.snapshot_descendants()
+        self.monitor_thread = threading.Thread(
+            target=self._monitor_descendants,
+            name=f"continuity-descendants-{self.process.pid}",
+            daemon=True,
+        )
+        self.monitor_thread.start()
+
+    def _monitor_descendants(self) -> None:
+        while not self.monitor_stop.wait(5.0):
+            self.snapshot_descendants()
+            if self.process.poll() is not None:
+                return
+
+    def snapshot_process_family(self) -> None:
+        for candidate in psutil.process_iter(["pid"]):
+            if candidate.pid in {os.getpid(), self.process.pid}:
+                continue
+            try:
+                candidate_environment = candidate.environ()
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                OSError,
+                PermissionError,
+                SystemError,
+            ):
+                continue
+            if (
+                candidate_environment.get("CONTINUITY_PROCESS_FAMILY")
+                != self.family_token
+            ):
+                continue
+            try:
+                identity = (candidate.pid, candidate.create_time())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+            with self.descendant_lock:
+                self.tracked_descendants[identity] = candidate
+
+    def snapshot_descendants(self) -> None:
+        try:
+            descendants = psutil.Process(self.process.pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return
+        with self.descendant_lock:
+            for descendant in descendants:
+                try:
+                    identity = (descendant.pid, descendant.create_time())
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    continue
+                self.tracked_descendants[identity] = descendant
+
+    def _finish_descendant_monitor(self) -> tuple[psutil.Process, ...]:
+        self.snapshot_descendants()
+        self.monitor_stop.set()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join(timeout=0.1)
+            self.monitor_thread = None
+        self.snapshot_descendants()
+        if os.name == "posix":
+            self.snapshot_process_family()
+        with self.descendant_lock:
+            return tuple(self.tracked_descendants.values())
 
     def terminate_tree(self) -> None:
         if self.terminated:
             return
         self.terminated = True
+        tracked_descendants = self._finish_descendant_monitor()
+        with self.descendant_lock:
+            prior_identities = set(self.tracked_descendants)
         job_error: OSError | None = None
         if self.windows_job is not None:
             try:
@@ -930,7 +1253,29 @@ class _ContainedProcess:
             except OSError as exc:
                 job_error = exc
             self.windows_job = None
-        _terminate_process_tree(self.process, process_group=self.process_group)
+        try:
+            _terminate_process_tree(
+                self.process,
+                process_group=self.process_group,
+                tracked_descendants=tracked_descendants,
+            )
+            if os.name == "posix":
+                self.snapshot_process_family()
+                with self.descendant_lock:
+                    late_descendants = tuple(
+                        candidate
+                        for identity, candidate in self.tracked_descendants.items()
+                        if identity not in prior_identities
+                    )
+                if late_descendants:
+                    _terminate_process_tree(
+                        self.process,
+                        tracked_descendants=late_descendants,
+                    )
+        finally:
+            if self.windows_directory_lease is not None:
+                self.windows_directory_lease.close()
+                self.windows_directory_lease = None
         if job_error is not None:
             raise ContinuityError(
                 f"Windows process containment could not be released: {job_error}"
@@ -943,14 +1288,47 @@ def _spawn_contained_process(
     """Spawn only after durable platform containment can be established."""
     suspended = os.name == "nt"
     factory = popen_factory or subprocess.Popen
+    family_token = secrets.token_hex(16)
+    requested_env = kwargs.get("env")
+    spawn_env = dict(os.environ if requested_env is None else requested_env)
+    spawn_env["CONTINUITY_PROCESS_FAMILY"] = family_token
+    kwargs["env"] = spawn_env
+    directory_lease: ExitStack | None = None
+    if os.name == "nt":
+        directory_lease = ExitStack()
+        try:
+            env = kwargs.get("env")
+            if isinstance(env, dict):
+                directory_paths = {
+                    Path(os.path.abspath(value))
+                    for name, value in env.items()
+                    if name in {"HOME", "TMPDIR", "TEMP", "TMP"}
+                    and isinstance(value, str)
+                    and value
+                }
+                for directory in sorted(directory_paths, key=str):
+                    directory_lease.enter_context(
+                        _windows_hold_directory_chain(
+                            directory, Path(directory.anchor)
+                        )
+                    )
+        except BaseException:
+            directory_lease.close()
+            raise
     try:
         process = factory(
             args,
             **kwargs,
             **_isolated_process_options(suspended=suspended),
         )
-    except OSError as exc:
-        raise ContinuityError(f"command failed to start: {args[0]}: {exc}") from exc
+    except BaseException as exc:
+        if directory_lease is not None:
+            directory_lease.close()
+        if isinstance(exc, OSError):
+            raise ContinuityError(
+                f"command failed to start: {args[0]}: {exc}"
+            ) from exc
+        raise
     if os.name == "nt":
         try:
             job = _create_windows_kill_job(process)
@@ -963,14 +1341,24 @@ def _spawn_contained_process(
                 process.communicate(timeout=0.75)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if directory_lease is not None:
+                directory_lease.close()
             raise ContinuityError(
                 f"command containment failed before start: {args[0]}: {exc}"
             ) from exc
-        return _ContainedProcess(process=process, windows_job=job)
-    return _ContainedProcess(
+        return _ContainedProcess(
+            process=process,
+            family_token=family_token,
+            windows_job=job,
+            windows_directory_lease=directory_lease,
+        )
+    contained = _ContainedProcess(
         process=process,
+        family_token=family_token,
         process_group=process.pid if os.name == "posix" else None,
     )
+    contained.start_descendant_monitor()
+    return contained
 
 
 def run_command(

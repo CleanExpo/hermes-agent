@@ -6,8 +6,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -59,6 +61,15 @@ from install_continuity_adapters import (
 GOAL = "Pilot deterministic cross-agent continuity in Hermes"
 TASK_ID = "hermes-continuity-b6l"
 CHANGE_ID = "001-global-continuity-pilot"
+
+
+def _test_event_checkpoint(path: Path) -> tuple[Path, int, None, dict[str, str]]:
+    return (
+        path,
+        0,
+        None,
+        {"external_volume": str(Path(path.anchor)), "state_root": str(path.parent)},
+    )
 
 
 def _lock_worker(config_path: str, marker_path: str, label: str) -> None:
@@ -115,7 +126,7 @@ def _native_observer_interrupt_worker(
         [sys.executable, str(host), ready_path, sentinel_path],
         cwd=state,
         env=os.environ.copy(),
-        checkpoint=(state / "events.jsonl", 0, None),
+        checkpoint=_test_event_checkpoint(state / "events.jsonl"),
         surface="claude",
         output_dir=state,
         timeout=30,
@@ -149,27 +160,33 @@ def _native_observer_spawn_race_worker(
         [sys.executable, str(host), sentinel_path],
         cwd=state,
         env=os.environ.copy(),
-        checkpoint=(state / "events.jsonl", 0, None),
+        checkpoint=_test_event_checkpoint(state / "events.jsonl"),
         surface="claude",
         output_dir=state,
         timeout=30,
     )
 
 
-def _assert_native_observer_reaps_after_root_exit(tmp_path: Path) -> None:
-    child_pid_path = tmp_path / "root-exit-child-pid.txt"
-    sentinel = tmp_path / "root-exit-child-survived.txt"
+def _assert_native_observer_reaps_after_root_exit(
+    tmp_path: Path, *, detached: bool
+) -> None:
+    mode = "detached" if detached else "plain"
+    child_pid_path = tmp_path / f"root-exit-{mode}-child-pid.txt"
+    sentinel = tmp_path / f"root-exit-{mode}-child-survived.txt"
     host = tmp_path / "root-exit-native-host.py"
     grandchild = (
-        "import pathlib,sys,time; "
+        "import pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
         "time.sleep(1.0); "
         "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
     )
     host.write_text(
-        "import pathlib,subprocess,sys\n"
+        "import pathlib,subprocess,sys,time\n"
         f"child = subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[2]], "
-        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n",
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+        "start_new_session=(sys.argv[3] == 'detached'))\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(0.25)\n",
         encoding="utf-8",
     )
 
@@ -177,10 +194,16 @@ def _assert_native_observer_reaps_after_root_exit(tmp_path: Path) -> None:
         ContinuityError, match="native host exited or timed out before evidence"
     ):
         continuity_native_observation._run_host_until_native_event(
-            [sys.executable, str(host), str(child_pid_path), str(sentinel)],
+            [
+                sys.executable,
+                str(host),
+                str(child_pid_path),
+                str(sentinel),
+                mode,
+            ],
             cwd=tmp_path,
             env=os.environ.copy(),
-            checkpoint=(tmp_path / "events.jsonl", 0, None),
+            checkpoint=_test_event_checkpoint(tmp_path / "events.jsonl"),
             surface="claude",
             output_dir=tmp_path,
             timeout=5,
@@ -677,7 +700,8 @@ def test_stale_task_missing_card_and_incomplete_spec_block(
 
     pilot["card"].unlink()
     assert any(
-        "cannot read authority" in error for error in _preflight(pilot)["errors"]
+        "Basic Memory card is unavailable" in error
+        for error in _preflight(pilot)["errors"]
     )
 
     pilot["card"].write_text("---\nproject: [unterminated\n---\n", encoding="utf-8")
@@ -943,6 +967,27 @@ def test_windows_confined_state_fallback_rejects_reparse_child(
         continuity_common.confined_ensure_dir(config, "evidence-home")
 
 
+@pytest.mark.windows_only
+def test_windows_child_environment_rejects_reparse_tmp_before_spawn(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    sibling = state / "sibling"
+    sibling.mkdir()
+    temp_link = state / "tmp"
+    try:
+        temp_link.symlink_to(sibling, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Windows symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ContinuityError, match="confined direct directory"):
+        continuity_common.minimal_child_env(
+            state_root=state,
+            external_volume=Path(tmp_path.anchor),
+        )
+
+
 def test_cli_rejects_receipt_output_escape_before_evidence(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1110,7 +1155,10 @@ def test_native_observer_terminates_tree_when_required_mount_disappears(
             [sys.executable, "-c", parent, str(sentinel)],
             cwd=pilot["repo"],
             env=os.environ.copy(),
-            checkpoint=(pilot["events"], 0, None),
+            checkpoint=(pilot["events"], 0, None, {
+                "external_volume": "/",
+                "state_root": str(pilot["state"]),
+            }),
             surface="claude",
             output_dir=pilot["state"],
             timeout=10,
@@ -1119,6 +1167,159 @@ def test_native_observer_terminates_tree_when_required_mount_disappears(
 
     time.sleep(1.0)
     assert not sentinel.exists()
+
+
+def _replace_authority_leaf(
+    path: Path, tmp_path: Path, kind: str, content: str
+) -> Path | None:
+    path.unlink(missing_ok=True)
+    if kind == "fifo":
+        if os.name == "nt":
+            pytest.skip("POSIX FIFO semantics")
+        os.mkfifo(path)
+        return None
+    outside = tmp_path / f"outside-{path.name}"
+    outside.write_text(content, encoding="utf-8")
+    path.symlink_to(outside)
+    return outside
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_adjacency_authority_read_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    session = "adjacency-confined"
+    turn = "turn-confined"
+    continuity_event._write_adjacency_guard(
+        config, session, turn, allowed=True
+    )
+    assert continuity_event._check_adjacency_guard(config, session, turn) == []
+    guard_path = continuity_event._adjacency_guard_path(config, session)
+    outside = _replace_authority_leaf(
+        guard_path,
+        tmp_path,
+        kind,
+        json.dumps({
+            "schema_version": 1,
+            "session": session,
+            "turn": turn,
+            "allowed": True,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }),
+    )
+
+    assert continuity_event._check_adjacency_guard(config, session, turn) == [
+        "Hermes tool call has no preceding adjacency check"
+    ]
+    if outside is not None:
+        assert outside.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_event_audit_append_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    outside = _replace_authority_leaf(
+        pilot["events"], tmp_path, kind, "outside-audit\n"
+    )
+
+    with pytest.raises(ContinuityError, match="regular|confined|safely"):
+        continuity_event._append_redacted_event(config, {"safe": True})
+
+    if outside is not None:
+        assert outside.read_text(encoding="utf-8") == "outside-audit\n"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_basic_memory_authority_read_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    _replace_authority_leaf(pilot["card"], tmp_path, kind, "---\nstate: ACTIVE\n---\n")
+
+    result = _preflight(pilot)
+
+    assert any("confined state file" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_beads_fallback_authority_read_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    _replace_authority_leaf(
+        pilot["issues"],
+        tmp_path,
+        kind,
+        json.dumps({"id": TASK_ID, "status": "in_progress"}) + "\n",
+    )
+    monkeypatch.setattr(
+        continuity_bridge,
+        "run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 2, "", ""),
+    )
+
+    with pytest.raises(ContinuityError, match="Beads task or JSONL fallback"):
+        continuity_bridge._read_beads(config, pilot["repo"])
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_promotion_journal_authority_read_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    journal = pilot["state"] / "promotion.json"
+    _replace_authority_leaf(journal, tmp_path, kind, '{"status":"COMMITTED"}\n')
+
+    result = _preflight(pilot)
+
+    assert any("confined state file" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_terminal_receipt_authority_read_rejects_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    receipt = _passing_receipt(pilot)
+    receipt_path = pilot["state"] / "receipts/terminal-authority.json"
+    outside = _replace_authority_leaf(
+        receipt_path, tmp_path, kind, json.dumps(receipt) + "\n"
+    )
+    card, card_body = read_markdown_frontmatter(pilot["card"])
+    card["state"] = "TESTED"
+    card["evidence"]["receipt"] = str(receipt_path)
+    pilot["card"].write_text(
+        render_markdown_frontmatter(card, card_body), encoding="utf-8"
+    )
+    spec, spec_body = read_markdown_frontmatter(pilot["spec"])
+    spec["state"] = "TESTED"
+    pilot["spec"].write_text(
+        render_markdown_frontmatter(spec, spec_body), encoding="utf-8"
+    )
+
+    result = _preflight(pilot)
+
+    assert any("confined state file" in error for error in result["errors"])
+    if outside is not None:
+        assert outside.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_native_event_authority_reads_reject_escaped_or_special_leaf(
+    pilot: dict[str, Path], tmp_path: Path, kind: str
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    _replace_authority_leaf(
+        pilot["events"], tmp_path, kind, '{"event":"session_start"}\n'
+    )
+
+    with pytest.raises(ContinuityError, match="regular|confined|safely"):
+        continuity_native_observation._event_log_checkpoint(config)
+    with pytest.raises(ContinuityError, match="regular|confined|safely"):
+        continuity_native_observation._require_native_event(
+            (pilot["events"], 0, None, config), "claude", "{}"
+        )
 
 
 def test_interrupted_tool_adjacency_is_rejected() -> None:
@@ -1926,7 +2127,7 @@ def test_native_project_observer_confines_child_temp_environment(
         *,
         cwd: Path,
         env: dict[str, str],
-        checkpoint: tuple[Path, int, int | None],
+        checkpoint: tuple[Path, int, tuple[int, int] | None, dict],
         surface: str,
         output_dir: Path,
         timeout: float,
@@ -2301,18 +2502,115 @@ def test_windows_timed_out_evidence_reaps_delayed_grandchild(
     assert not sentinel.exists()
 
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
 def test_native_observer_reaps_descendant_after_root_exits(tmp_path: Path) -> None:
-    _assert_native_observer_reaps_after_root_exit(tmp_path)
+    _assert_native_observer_reaps_after_root_exit(tmp_path, detached=False)
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session semantics")
+def test_native_observer_reaps_detached_descendant_after_root_exits(
+    tmp_path: Path,
+) -> None:
+    _assert_native_observer_reaps_after_root_exit(tmp_path, detached=True)
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session semantics")
+def test_fast_spawn_detach_exit_stress_reaps_every_descendant(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "fast-detach-host.py"
+    grandchild = (
+        "import pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(0.6); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    host.write_text(
+        "import subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[1]], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        "time.sleep(0.005)\n",
+        encoding="utf-8",
+    )
+    sentinels = [tmp_path / f"fast-detached-{index}.txt" for index in range(12)]
+
+    for sentinel in sentinels:
+        with pytest.raises(
+            ContinuityError, match="native host exited or timed out before evidence"
+        ):
+            continuity_native_observation._run_host_until_native_event(
+                [sys.executable, str(host), str(sentinel)],
+                cwd=tmp_path,
+                env=os.environ.copy(),
+                checkpoint=_test_event_checkpoint(tmp_path / "events.jsonl"),
+                surface="claude",
+                output_dir=tmp_path,
+                timeout=2,
+            )
+
+    time.sleep(0.8)
+    assert not any(sentinel.exists() for sentinel in sentinels)
+
+
+def test_fast_commands_leave_no_descendant_monitor_threads(tmp_path: Path) -> None:
+    prefix = "continuity-descendants-"
+    before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith(prefix)
+    }
+
+    for _index in range(30):
+        result = run_command(
+            [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+        )
+        assert result.returncode == 0
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and any(
+        thread.name.startswith(prefix) for thread in threading.enumerate()
+    ):
+        time.sleep(0.01)
+    after = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith(prefix)
+    }
+    assert after == before
+
+
+def test_empty_child_environment_does_not_inherit_ambient_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CONTINUITY_AMBIENT_SECRET", "must-not-pass")
+
+    result = run_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ.get('CONTINUITY_AMBIENT_SECRET', 'absent'))",
+        ],
+        cwd=tmp_path,
+        timeout=5,
+        env={},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "absent"
 
 
 @pytest.mark.windows_only
 def test_windows_native_observer_job_reaps_descendant_after_root_exits(
     tmp_path: Path,
 ) -> None:
-    _assert_native_observer_reaps_after_root_exit(tmp_path)
+    _assert_native_observer_reaps_after_root_exit(tmp_path, detached=False)
 
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signal-delivery semantics")
 def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     ready = tmp_path / "interrupt-ready.txt"
@@ -2770,15 +3068,15 @@ def test_event_append_rechecks_storage_after_preflight(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     checks = iter((True, False))
-    monkeypatch.chdir(pilot["repo"])
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     monkeypatch.setattr(
-        continuity_event,
+        continuity_common,
         "external_volume_available",
         lambda _path: next(checks),
     )
 
     with pytest.raises(ContinuityError, match="external volume is not mounted"):
-        dispatch("session_start", "codex", pilot["config"], {})
+        continuity_event._append_redacted_event(config, {"safe": True})
 
     assert not pilot["events"].exists()
 
@@ -2786,23 +3084,20 @@ def test_event_append_rechecks_storage_after_preflight(
 def test_adjacency_write_rechecks_storage_after_preflight(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    checks = iter((True, True, False))
-    monkeypatch.chdir(pilot["repo"])
+    checks = iter((True, False))
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     monkeypatch.setattr(
-        continuity_event,
+        continuity_common,
         "external_volume_available",
         lambda _path: next(checks),
     )
 
     with pytest.raises(ContinuityError, match="external volume is not mounted"):
-        dispatch(
-            "pre_llm_call",
-            "hermes",
-            pilot["config"],
-            {
-                "session_id": "adjacency-race",
-                "extra": {"turn_id": "turn-race", "conversation_history": []},
-            },
+        continuity_event._write_adjacency_guard(
+            config,
+            "adjacency-race",
+            "turn-race",
+            allowed=True,
         )
 
     assert not (pilot["state"] / "adjacency").exists()
@@ -2850,7 +3145,7 @@ def test_event_append_rejects_log_outside_state_root(
     atomic_write_json(pilot["config"], config)
 
     with pytest.raises(
-        ContinuityError, match="continuity event path escapes pilot state root"
+        ContinuityError, match="state path escapes pilot state root"
     ):
         dispatch("post_tool_call", "hermes", pilot["config"], {})
 
@@ -2865,7 +3160,7 @@ def test_event_append_never_recreates_missing_parent(
     config["event_log"] = str(missing_parent / "events.jsonl")
     atomic_write_json(pilot["config"], config)
 
-    with pytest.raises(ContinuityError, match="event storage is unavailable"):
+    with pytest.raises(ContinuityError, match="cannot open confined state parent"):
         dispatch("post_tool_call", "hermes", pilot["config"], {})
 
     assert not missing_parent.exists()
