@@ -533,6 +533,39 @@ def test_native_history_preserves_content_block_interruptions() -> None:
     ])
     assert not validate_tool_adjacency(ordered_parallel)
 
+    openai_single = native_events([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "result payload",
+        },
+    ])
+    assert not validate_tool_adjacency(openai_single)
+
+    openai_parallel = native_events([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1"}, {"id": "call-2"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "first result payload",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "second result payload",
+        },
+    ])
+    assert not validate_tool_adjacency(openai_parallel)
+
 
 def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))

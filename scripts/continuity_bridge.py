@@ -160,6 +160,12 @@ def tool_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]] | 
         return None
     normalized: list[dict[str, Any]] = []
     for message in history:
+        if message.get("role") == "tool" and message.get("tool_call_id") is not None:
+            normalized.append({
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id"),
+            })
+            continue
         emitted = False
         calls = message.get("tool_calls")
         if isinstance(calls, list):
@@ -189,12 +195,6 @@ def tool_events_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]] | 
                     emitted = True
         elif content not in (None, ""):
             normalized.append({"type": "content"})
-            emitted = True
-        if message.get("role") == "tool":
-            normalized.append({
-                "type": "tool_result",
-                "tool_use_id": message.get("tool_call_id"),
-            })
             emitted = True
         if not emitted:
             normalized.append({"type": str(message.get("role") or "message")})
