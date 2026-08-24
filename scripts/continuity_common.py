@@ -317,9 +317,10 @@ def receipt_signature_errors(
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
     """Boundedly terminate a command and every descendant it spawned."""
     if os.name == "posix":
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        force_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for sig in (signal.SIGTERM, force_kill):
             try:
-                os.killpg(process.pid, sig)
+                os.killpg(process.pid, sig)  # windows-footgun: ok — POSIX-only branch
             except ProcessLookupError:
                 break
             try:
@@ -328,7 +329,7 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
                 pass
             if sig == signal.SIGTERM:
                 try:
-                    os.killpg(process.pid, 0)
+                    os.killpg(process.pid, 0)  # windows-footgun: ok — POSIX-only branch
                 except ProcessLookupError:
                     return
                 continue

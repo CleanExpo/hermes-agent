@@ -167,13 +167,7 @@ def _run_host_until_native_event(
 
         def terminate_nested_host(signum: int, _frame: object) -> None:
             if process.poll() is None:
-                try:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:  # pragma: no cover - Windows pilot is not releasable
-                        process.kill()
-                except ProcessLookupError:
-                    pass
+                _terminate_process_tree(process)
             raise SystemExit(128 + signum)
 
         for sig in handled_signals:
