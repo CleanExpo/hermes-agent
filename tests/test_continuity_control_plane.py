@@ -3270,6 +3270,64 @@ def test_native_observer_defers_signal_cleanup_until_poll_lock_is_released(
     assert contained.termination_calls == 1
 
 
+@pytest.mark.linux_only
+def test_native_observer_consumes_signal_caught_during_handler_restoration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CompletedProcess:
+        def poll(self) -> int:
+            return 0
+
+    class IdempotentContainment:
+        def __init__(self) -> None:
+            self.process = CompletedProcess()
+            self.terminated = False
+
+        def terminate_tree(self) -> None:
+            self.terminated = True
+
+    contained = IdempotentContainment()
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "_spawn_contained_process",
+        lambda *_args, **_kwargs: contained,
+    )
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "_require_native_event",
+        lambda *_args, **_kwargs: None,
+    )
+    real_signal = signal.signal
+    signal_calls = 0
+
+    def signal_during_first_restoration(signum: int, handler: object) -> object:
+        nonlocal signal_calls
+        signal_calls += 1
+        if signal_calls == 3:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(
+        continuity_native_observation.signal,
+        "signal",
+        signal_during_first_restoration,
+    )
+
+    with pytest.raises(SystemExit) as interrupted:
+        continuity_native_observation._run_host_until_native_event(
+            ["native-host"],
+            cwd=tmp_path,
+            env={},
+            checkpoint=(tmp_path / "events.jsonl", 0, None, {}),
+            surface="hermes",
+            output_dir=tmp_path,
+            timeout=5,
+        )
+
+    assert interrupted.value.code == 128 + signal.SIGTERM
+    assert contained.terminated is True
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fork test; Windows proof follows")
 def test_native_observer_blocks_termination_across_spawn_handler_race(
     tmp_path: Path,

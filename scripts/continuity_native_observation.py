@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -177,17 +178,20 @@ def _run_host_until_native_event(
         lifecycle: dict[str, object] = {
             "contained": None,
             "pending_signal": None,
+            "signal_consumed": False,
         }
 
         def request_nested_host_termination(signum: int, _frame: object) -> None:
             if lifecycle["pending_signal"] is None:
                 lifecycle["pending_signal"] = signum
 
-        def terminate_for_pending_signal(contained: object) -> None:
+        def terminate_for_pending_signal(contained: Any | None) -> None:
             pending_signal = lifecycle["pending_signal"]
-            if not isinstance(pending_signal, int):
+            if not isinstance(pending_signal, int) or lifecycle["signal_consumed"]:
                 return
-            contained.terminate_tree()
+            lifecycle["signal_consumed"] = True
+            if contained is not None:
+                contained.terminate_tree()
             raise SystemExit(128 + pending_signal)
 
         prior_mask: set[signal.Signals] | None = None
@@ -254,6 +258,10 @@ def _run_host_until_native_event(
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
             for sig, handler in prior_handlers.items():
                 signal.signal(sig, handler)
+            # A signal delivered while handlers were being restored was still
+            # owned by our passive handler. Consume that recorded intent after
+            # the complete handoff so it cannot be silently returned past.
+            terminate_for_pending_signal(lifecycle["contained"])
     output = stdout_path.read_text(encoding="utf-8") + stderr_path.read_text(
         encoding="utf-8"
     )
