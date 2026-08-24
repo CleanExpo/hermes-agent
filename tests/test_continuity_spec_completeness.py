@@ -75,22 +75,20 @@ def preflight_fixture(
     config_path = repo / ".continuity/config.json"
     config_path.parent.mkdir()
     config_path.write_text(
-        json.dumps(
-            {
-                "project": "Hermes",
-                "goal": GOAL,
-                "expected_repo_root": str(repo),
-                "external_volume": str(tmp_path),
-                "state_root": str(state_root),
-                "basic_memory": {"card_path": str(card_path)},
-                "beads": {"active_task": TASK_ID},
-                "spec": {
-                    "path": str(spec_path.relative_to(repo)),
-                    "change_id": CHANGE_ID,
-                },
-                "instructions": [],
-            }
-        ),
+        json.dumps({
+            "project": "Hermes",
+            "goal": GOAL,
+            "expected_repo_root": str(repo),
+            "external_volume": str(tmp_path),
+            "state_root": str(state_root),
+            "basic_memory": {"card_path": str(card_path)},
+            "beads": {"active_task": TASK_ID},
+            "spec": {
+                "path": str(spec_path.relative_to(repo)),
+                "change_id": CHANGE_ID,
+            },
+            "instructions": [],
+        }),
         encoding="utf-8",
     )
     git = GitState(
@@ -149,8 +147,7 @@ def test_every_canonical_template_placeholder_is_rejected() -> None:
     assert "[DATE]" in markers
     assert "[Brief Title]" in markers
     clarification = (
-        "[NEEDS CLARIFICATION: auth method not specified - "
-        "email/password, SSO, OAuth?]"
+        "[NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]"
     )
     assert clarification in markers
     for marker in markers:
@@ -178,6 +175,6 @@ def test_preflight_blocks_empty_spec_body_with_named_cause(
 
     assert result["status"] == "BLOCKED"
     assert result["completion_allowed"] is False
-    assert "Spec Kit change body is incomplete: no substantive content" in result[
-        "errors"
-    ]
+    assert (
+        "Spec Kit change body is incomplete: no substantive content" in result["errors"]
+    )

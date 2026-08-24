@@ -52,7 +52,9 @@ REQUIRED_SPEC_FIELDS = {
     "change_id",
     "folder",
 }
-SPEC_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / ".specify/templates/spec-template.md"
+SPEC_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[1] / ".specify/templates/spec-template.md"
+)
 SPEC_TEMPLATE_TEXT_MARKERS = ('User description: "$ARGUMENTS"', "ACTION REQUIRED:")
 
 
@@ -245,7 +247,9 @@ def validate_spec_body(body: str) -> list[str]:
     if not without_comments:
         return ["Spec Kit change body is incomplete: no substantive content"]
 
-    markers = [marker for marker in _spec_template_markers() if marker in without_comments]
+    markers = [
+        marker for marker in _spec_template_markers() if marker in without_comments
+    ]
     if markers:
         return [
             "Spec Kit change body is incomplete: unresolved template marker "
