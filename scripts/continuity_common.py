@@ -969,9 +969,8 @@ def _terminate_process_tree(
 
     if process_group is not None and os.name == "posix":
         try:
-            os.killpg(
-                process_group, signal.SIGTERM
-            )  # windows-footgun: ok -- POSIX gate
+            kill_process_group = os.killpg  # windows-footgun: ok -- POSIX gate
+            kill_process_group(process_group, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
