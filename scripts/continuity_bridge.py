@@ -68,7 +68,9 @@ def _read_beads(
     task_id = beads["active_task"]
     verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
     env = minimal_child_env(
-        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+        {"BEADS_DIR": beads["data_dir"]},
+        state_root=config["state_root"],
+        external_volume=config["external_volume"],
     )
     degraded_reason = ""
     try:
@@ -77,6 +79,7 @@ def _read_beads(
             cwd=repo_root,
             timeout=float(beads.get("timeout_seconds", 5)),
             env=env,
+            required_mount=(config["external_volume"], config["state_root"]),
         )
         if result.returncode != 0:
             raise ContinuityError(f"bd show exited with status {result.returncode}")

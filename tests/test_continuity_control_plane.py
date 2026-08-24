@@ -20,6 +20,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import continuity_bridge
+import continuity_common
 import continuity_event
 import continuity_gate
 import continuity_native_observation
@@ -256,6 +257,8 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     state = tmp_path / "state"
     repo.mkdir()
     state.mkdir()
+    (state / "tmp").mkdir()
+    (state / "receipts").mkdir()
     _git(repo, "init", "-b", "pilot")
     _git(repo, "config", "user.email", "pilot@example.invalid")
     _git(repo, "config", "user.name", "Pilot")
@@ -711,7 +714,8 @@ def test_beads_mutation_uses_completion_timeout(
 ) -> None:
     captured: dict[str, float] = {}
 
-    def capture_run(argv, *, cwd, timeout, env):
+    def capture_run(argv, *, cwd, timeout, env, required_mount):
+        del required_mount
         captured["timeout"] = timeout
         return subprocess.CompletedProcess(argv, 0, "[]", "")
 
@@ -758,11 +762,13 @@ def test_python_evidence_resolves_binary_but_keeps_virtualenv_imports(
     spec = {"argv": [".venv/bin/python", "scripts/evidence.py"]}
     state_root = tmp_path / "state"
     state_root.mkdir()
+    (state_root / "tmp").mkdir()
 
     argv = continuity_gate._resolved_argv(spec, repo)
     child_env = continuity_gate.minimal_child_env(
         continuity_gate._python_venv_context(spec, repo),
         state_root=state_root,
+        external_volume="/",
     )
     python.unlink()
     python.symlink_to("/bin/sh")
@@ -781,11 +787,14 @@ def test_minimal_child_env_confines_all_storage_paths(
     ambient = tmp_path / "ambient"
     state_root = tmp_path / "state"
     state_root.mkdir()
+    (state_root / "tmp").mkdir()
     for name in ("HOME", "TMPDIR", "TEMP", "TMP"):
         monkeypatch.setenv(name, str(ambient))
     monkeypatch.setenv("TOP_SECRET", "must-not-pass")
 
-    child_env = continuity_gate.minimal_child_env(state_root=state_root)
+    child_env = continuity_gate.minimal_child_env(
+        state_root=state_root, external_volume="/"
+    )
 
     assert "TOP_SECRET" not in child_env
     assert Path(child_env["HOME"]).resolve() == state_root.resolve()
@@ -798,19 +807,318 @@ def test_minimal_child_env_confines_all_storage_paths(
 def test_minimal_child_env_rejects_storage_override_escape(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     state_root.mkdir()
+    (state_root / "tmp").mkdir()
     with pytest.raises(ContinuityError, match="child HOME escapes pilot state root"):
         continuity_gate.minimal_child_env(
-            {"HOME": str(tmp_path / "ambient")}, state_root=state_root
+            {"HOME": str(tmp_path / "ambient")},
+            state_root=state_root,
+            external_volume="/",
         )
 
 
 def test_minimal_child_env_never_recreates_missing_state_root(tmp_path: Path) -> None:
     missing = tmp_path / "unmounted-volume" / "state"
 
-    with pytest.raises(ContinuityError, match="pilot state root is unavailable"):
-        continuity_gate.minimal_child_env(state_root=missing)
+    with pytest.raises(ContinuityError, match="pilot state storage is unavailable"):
+        continuity_gate.minimal_child_env(state_root=missing, external_volume="/")
 
     assert not missing.exists()
+
+
+def test_minimal_child_env_rejects_existing_non_mount_shadow(tmp_path: Path) -> None:
+    shadow_volume = tmp_path / "Storage Unit"
+    state_root = shadow_volume / "state"
+    state_root.mkdir(parents=True)
+
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        continuity_gate.minimal_child_env(
+            state_root=state_root, external_volume=shadow_volume
+        )
+
+    assert not (state_root / "tmp").exists()
+
+
+def test_confined_write_rechecks_mount_before_mutation(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    target = pilot["state"] / "mid-unmount.json"
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        continuity_common, "external_volume_available", lambda _path: next(checks)
+    )
+
+    with pytest.raises(ContinuityError, match="external volume is not mounted"):
+        continuity_common.confined_atomic_write_json(config, target, {"unsafe": True})
+
+    assert not target.exists()
+
+
+def test_confined_directory_rejects_existing_symlink_child(
+    pilot: dict[str, Path]
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    sibling = pilot["state"] / "sibling"
+    sibling.mkdir()
+    evidence_home = pilot["state"] / "evidence-home"
+    evidence_home.symlink_to(sibling, target_is_directory=True)
+
+    with pytest.raises(
+        ContinuityError, match="not a confined direct directory"
+    ):
+        continuity_common.confined_ensure_dir(config, "evidence-home")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows has a validated path fallback")
+def test_storage_capability_gate_precedes_authority_work(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def forbidden_authority(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("authority work must not start")
+
+    monkeypatch.setattr(continuity_common.os, "supports_dir_fd", set())
+    monkeypatch.setattr(
+        continuity_gate, "_require_committed_config", forbidden_authority
+    )
+    policy = _policy(pilot)
+
+    with pytest.raises(ContinuityError, match="unavailable on this platform"):
+        create_receipt(
+            pilot["config"],
+            cwd=pilot["repo"],
+            risk_tier="T3",
+            lifecycle_target="TESTED",
+            commands=[policy["focused_suite"]],
+            runtime_checks=policy["runtime_checks"],
+            rollback=policy["rollback_check"],
+        )
+
+    assert called is False
+
+
+@pytest.mark.windows_only
+def test_windows_confined_state_fallback_reads_writes_and_creates_direct_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "tmp").mkdir()
+    config = {
+        "external_volume": str(Path(tmp_path.anchor)),
+        "state_root": str(state),
+    }
+    monkeypatch.setattr(continuity_common.os, "supports_dir_fd", set())
+    receipt = state / "receipt.json"
+
+    continuity_common.confined_atomic_write_json(config, receipt, {"valid": True})
+
+    assert continuity_common.confined_load_json(config, receipt) == {"valid": True}
+    assert continuity_common.confined_ensure_dir(config, "evidence-home").is_dir()
+
+
+@pytest.mark.windows_only
+def test_windows_confined_state_fallback_rejects_reparse_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    sibling = state / "sibling"
+    sibling.mkdir()
+    link = state / "evidence-home"
+    try:
+        link.symlink_to(sibling, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Windows symlink creation is unavailable: {exc}")
+    config = {
+        "external_volume": str(Path(tmp_path.anchor)),
+        "state_root": str(state),
+    }
+    monkeypatch.setattr(continuity_common.os, "supports_dir_fd", set())
+
+    with pytest.raises(ContinuityError, match="reparse point"):
+        continuity_common.confined_ensure_dir(config, "evidence-home")
+
+
+def test_cli_rejects_receipt_output_escape_before_evidence(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def forbidden_create(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("evidence must not execute")
+
+    monkeypatch.setattr(continuity_gate, "create_receipt", forbidden_create)
+    result = continuity_gate.main([
+        "create-receipt",
+        "--config",
+        str(pilot["config"]),
+        "--cwd",
+        str(pilot["repo"]),
+        "--risk-tier",
+        "T3",
+        "--target",
+        "TESTED",
+        "--output",
+        str(pilot["state"] / "escaped.json"),
+    ])
+
+    assert result == 2
+    assert called is False
+
+
+def test_verify_rejects_receipt_path_outside_configured_directory(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    escaped = tmp_path / "escaped-receipt.json"
+    atomic_write_json(escaped, _passing_receipt(pilot))
+
+    with pytest.raises(
+        ContinuityError, match="receipt output escapes configured receipt directory"
+    ):
+        verify_receipt(pilot["config"], escaped, cwd=pilot["repo"])
+
+
+def test_promotion_lock_rejects_symlink_leaf(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.lock"
+    outside.write_text("outside\n", encoding="utf-8")
+    (pilot["state"] / "promotion.lock").symlink_to(outside)
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+
+    with pytest.raises(ContinuityError, match="cannot open promotion lock safely"):
+        with continuity_gate._promotion_lock(config):
+            pytest.fail("symlinked promotion lock must never be acquired")
+
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
+def test_confined_state_rejects_special_file_leaves_without_blocking(
+    pilot: dict[str, Path]
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    receipt_fifo = pilot["state"] / "receipts/special.json"
+    key_fifo = pilot["state"] / "receipt-signing.key"
+    lock_fifo = pilot["state"] / "promotion.lock"
+    for path in (receipt_fifo, key_fifo, lock_fifo):
+        os.mkfifo(path)
+
+    with pytest.raises(ContinuityError, match="not a regular file"):
+        continuity_common.confined_read_bytes(config, receipt_fifo)
+    with pytest.raises(ContinuityError, match="not a regular file"):
+        continuity_common.confined_atomic_write_json(config, receipt_fifo, {})
+    with pytest.raises(ContinuityError, match="regular file"):
+        continuity_common.receipt_signing_key(config)
+    with pytest.raises(ContinuityError, match="promotion lock is not a regular file"):
+        with continuity_gate._promotion_lock(config):
+            pytest.fail("FIFO promotion lock must never be acquired")
+
+
+def test_promotion_lock_capability_gate_precedes_authority_work(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def forbidden_authority(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("authority work must not start")
+
+    monkeypatch.setattr(continuity_gate, "fcntl", None)
+    monkeypatch.setattr(
+        continuity_gate, "_require_committed_config", forbidden_authority
+    )
+
+    with pytest.raises(ContinuityError, match="locking is unavailable"):
+        promote(
+            pilot["config"],
+            pilot["state"] / "receipts/not-read.json",
+            cwd=pilot["repo"],
+            target="TESTED",
+        )
+
+    assert called is False
+
+
+def test_run_command_terminates_tree_when_required_mount_disappears(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = pilot["state"] / "mount-loss-child-survived.txt"
+    child = (
+        "import pathlib,sys,time; time.sleep(0.8); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]]); "
+        "time.sleep(30)"
+    )
+    checks = iter((True, True, False))
+    monkeypatch.setattr(
+        continuity_common,
+        "external_volume_available",
+        lambda _path: next(checks, False),
+    )
+
+    with pytest.raises(ContinuityError, match="became unavailable during command"):
+        run_command(
+            [sys.executable, "-c", parent, str(sentinel)],
+            cwd=pilot["repo"],
+            timeout=10,
+            required_mount=("/", pilot["state"]),
+        )
+
+    time.sleep(1.0)
+    assert not sentinel.exists()
+
+
+def test_native_observer_terminates_tree_when_required_mount_disappears(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = pilot["state"] / "native-mount-loss-child-survived.txt"
+    child = (
+        "import pathlib,sys,time; time.sleep(0.8); "
+        "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]]); "
+        "time.sleep(30)"
+    )
+    checks = iter((True, True, False))
+    monkeypatch.setattr(
+        continuity_native_observation,
+        "validate_state_storage",
+        lambda *_args: (
+            pilot["state"]
+            if next(checks, False)
+            else (_ for _ in ()).throw(ContinuityError("external volume is not mounted"))
+        ),
+    )
+
+    with pytest.raises(
+        ContinuityError, match="became unavailable during claude native observation"
+    ):
+        continuity_native_observation._run_host_until_native_event(
+            [sys.executable, "-c", parent, str(sentinel)],
+            cwd=pilot["repo"],
+            env=os.environ.copy(),
+            checkpoint=(pilot["events"], 0, None),
+            surface="claude",
+            output_dir=pilot["state"],
+            timeout=10,
+            required_mount=("/", pilot["state"]),
+        )
+
+    time.sleep(1.0)
+    assert not sentinel.exists()
 
 
 def test_interrupted_tool_adjacency_is_rejected() -> None:
@@ -962,7 +1270,7 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
     atomic_write_json(pilot["config"], config)
     _commit_and_rebind(pilot, "restore passing evidence fixture")
 
-    receipt_path = pilot["state"] / "receipt.json"
+    receipt_path = pilot["state"] / "receipts/receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     assert verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"]) == []
     (pilot["repo"] / "seed.txt").write_text("changed\n", encoding="utf-8")
@@ -978,7 +1286,7 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
 
 
 def test_signed_receipt_rejects_forged_evidence(pilot: dict[str, Path]) -> None:
-    receipt_path = pilot["state"] / "signed.json"
+    receipt_path = pilot["state"] / "receipts/signed.json"
     receipt = _passing_receipt(pilot)
     atomic_write_json(receipt_path, receipt)
     assert verify_receipt(pilot["config"], receipt_path, cwd=pilot["repo"]) == []
@@ -993,7 +1301,7 @@ def test_signed_receipt_rejects_forged_evidence(pilot: dict[str, Path]) -> None:
 def test_resolved_dependency_identity_drift_invalidates_receipt(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    receipt_path = pilot["state"] / "dependency-identity.json"
+    receipt_path = pilot["state"] / "receipts/dependency-identity.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     actual = continuity_gate._dependency_identity(
         json.loads(pilot["config"].read_text(encoding="utf-8")), pilot["repo"]
@@ -1029,7 +1337,7 @@ def test_enforced_receipt_requires_fresh_native_surface_coverage(
     pilot: dict[str, Path],
 ) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
-    receipt_path = pilot["state"] / "native-deadman.json"
+    receipt_path = pilot["state"] / "receipts/native-deadman.json"
     receipt = _passing_receipt(pilot, target="ENFORCED")
     assert receipt["result"] == "PASS", continuity_gate._native_observation_errors(
         config, receipt, git_state(pilot["repo"])
@@ -1067,7 +1375,7 @@ def test_native_observation_is_bound_to_policy_artifacts_event_and_host(
     pilot: dict[str, Path],
 ) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
-    receipt_path = pilot["state"] / "native-binding.json"
+    receipt_path = pilot["state"] / "receipts/native-binding.json"
     receipt = _passing_receipt(pilot, target="ENFORCED")
     observation = receipt["runtime_checks"][0]["native_observation"]
 
@@ -1163,7 +1471,7 @@ def test_missing_native_observation_reports_authenticated_prior_success(
     missing = _passing_receipt(pilot, target="ENFORCED")
     missing["runtime_checks"] = []
     missing["auth"] = sign_receipt(config, missing)
-    missing_path = pilot["state"] / "missing-native.json"
+    missing_path = pilot["state"] / "receipts/missing-native.json"
     atomic_write_json(missing_path, missing)
 
     errors = verify_receipt(pilot["config"], missing_path, cwd=pilot["repo"])
@@ -1213,7 +1521,7 @@ def test_full_suite_identity_and_integration_ancestry_are_gate_owned(
 def test_only_gate_promotes_terminal_state(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    receipt_path = pilot["state"] / "receipt.json"
+    receipt_path = pilot["state"] / "receipts/receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="TESTED")
     result = _preflight(pilot)
@@ -1347,7 +1655,7 @@ def test_failed_beads_output_is_never_persisted(
     with pytest.raises(ContinuityError, match="strict authority check failed") as exc:
         _passing_receipt(pilot)
     assert sentinel not in str(exc.value)
-    assert not (pilot["state"] / "receipts").exists()
+    assert list((pilot["state"] / "receipts").iterdir()) == []
     monkeypatch.setattr(continuity_bridge, "run_command", fail_beads_show)
     assert sentinel not in json.dumps(_preflight(pilot))
 
@@ -1396,7 +1704,7 @@ def test_pinned_inputs_invalidate_preflight_and_receipt(pilot: dict[str, Path]) 
     ]
     atomic_write_json(pilot["config"], config)
     _commit_and_rebind(pilot, "bind external instruction fixture")
-    receipt_path = pilot["state"] / "receipt.json"
+    receipt_path = pilot["state"] / "receipts/receipt.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot))
     instruction.write_text("v2\n", encoding="utf-8")
     assert any(
@@ -1622,8 +1930,9 @@ def test_native_project_observer_confines_child_temp_environment(
         surface: str,
         output_dir: Path,
         timeout: float,
+        required_mount: tuple[str | Path, str | Path],
     ) -> str:
-        del cwd, checkpoint, surface, timeout
+        del cwd, checkpoint, surface, timeout, required_mount
         captured.update(env)
         assert output_dir.is_relative_to(pilot["state"].resolve())
         return ""
@@ -1689,7 +1998,7 @@ def test_codex_native_observer_rejects_linked_worktree_provenance(
 
     with pytest.raises(ContinuityError, match="canonical common checkout"):
         continuity_native_observation._require_codex_discovery_checkout(
-            linked, pilot["state"]
+            linked, json.loads(pilot["config"].read_text(encoding="utf-8"))
         )
 
 
@@ -2135,16 +2444,18 @@ def test_windows_native_observer_closes_spawn_to_handler_race(
 def test_promotion_recovers_prepared_and_card_written_stages(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    receipt_path = pilot["state"] / "enforced-stages.json"
+    receipt_path = pilot["state"] / "receipts/enforced-stages.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot, target="ENFORCED"))
-    real_card_write = continuity_gate.atomic_write_text
+    real_card_write = continuity_gate.confined_atomic_write_text
 
-    def interrupt_card(path: Path, content: str) -> None:
+    def interrupt_card(config: dict, path: Path, content: str) -> None:
         if path == pilot["card"]:
             raise OSError("simulated card interruption")
-        real_card_write(path, content)
+        real_card_write(config, path, content)
 
-    monkeypatch.setattr(continuity_gate, "atomic_write_text", interrupt_card)
+    monkeypatch.setattr(
+        continuity_gate, "confined_atomic_write_text", interrupt_card
+    )
     with pytest.raises(OSError, match="card interruption"):
         promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
     journal = json.loads(
@@ -2152,15 +2463,19 @@ def test_promotion_recovers_prepared_and_card_written_stages(
     )
     assert journal["status"] == "PREPARED"
 
-    monkeypatch.setattr(continuity_gate, "atomic_write_text", real_card_write)
-    real_journal_write = continuity_gate.atomic_write_json
+    monkeypatch.setattr(
+        continuity_gate, "confined_atomic_write_text", real_card_write
+    )
+    real_journal_write = continuity_gate.confined_atomic_write_json
 
-    def interrupt_card_written(path: Path, value: dict) -> None:
-        real_journal_write(path, value)
+    def interrupt_card_written(config: dict, path: Path, value: dict) -> None:
+        real_journal_write(config, path, value)
         if path.name == "promotion.json" and value.get("status") == "CARD_WRITTEN":
             raise KeyboardInterrupt("simulated process death")
 
-    monkeypatch.setattr(continuity_gate, "atomic_write_json", interrupt_card_written)
+    monkeypatch.setattr(
+        continuity_gate, "confined_atomic_write_json", interrupt_card_written
+    )
     with pytest.raises(KeyboardInterrupt, match="process death"):
         promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
     journal = json.loads(
@@ -2168,7 +2483,9 @@ def test_promotion_recovers_prepared_and_card_written_stages(
     )
     assert journal["status"] == "CARD_WRITTEN"
 
-    monkeypatch.setattr(continuity_gate, "atomic_write_json", real_journal_write)
+    monkeypatch.setattr(
+        continuity_gate, "confined_atomic_write_json", real_journal_write
+    )
     promote(pilot["config"], receipt_path, cwd=pilot["repo"], target="ENFORCED")
     assert _preflight(pilot)["status"] == "AVAILABLE"
 
@@ -2176,7 +2493,7 @@ def test_promotion_recovers_prepared_and_card_written_stages(
 def test_enforced_promotion_verifies_beads_close_effect(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    receipt_path = pilot["state"] / "enforced-noop.json"
+    receipt_path = pilot["state"] / "receipts/enforced-noop.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot, target="ENFORCED"))
     monkeypatch.setattr(continuity_gate, "_run_beads", lambda *_args, **_kwargs: None)
     with pytest.raises(ContinuityError, match="did not reach closed"):
@@ -2216,7 +2533,7 @@ def test_promotion_lock_serializes_processes(pilot: dict[str, Path]) -> None:
 def test_enforced_promotion_closes_task_and_recovers_interruption(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    receipt_path = pilot["state"] / "enforced.json"
+    receipt_path = pilot["state"] / "receipts/enforced.json"
     atomic_write_json(receipt_path, _passing_receipt(pilot, target="ENFORCED"))
     real_run_beads = continuity_gate._run_beads
     monkeypatch.setattr(
@@ -2422,6 +2739,9 @@ def test_unmounted_volume_causes_no_state_writes(
     )
 
     monkeypatch.setattr(continuity_gate, "external_volume_available", lambda _p: False)
+    monkeypatch.setattr(
+        continuity_common, "external_volume_available", lambda _p: False
+    )
     policy = _policy(pilot)
     with pytest.raises(ContinuityError, match="external volume is not mounted"):
         create_receipt(

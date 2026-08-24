@@ -23,6 +23,7 @@ from continuity_common import (
     minimal_child_env,
     run_command,
     sha256_file,
+    validate_state_storage,
 )
 from install_continuity_adapters import (
     HERMES_MANIFEST,
@@ -44,12 +45,16 @@ def _host_executable(config: dict, surface: str) -> Path:
     return executable
 
 
-def _require_codex_discovery_checkout(repo_root: Path, state_root: Path) -> None:
+def _require_codex_discovery_checkout(repo_root: Path, config: dict) -> None:
     result = run_command(
         ["git", "rev-parse", "--git-common-dir"],
         cwd=repo_root,
         timeout=30,
-        env=minimal_child_env(state_root=state_root),
+        env=minimal_child_env(
+            state_root=config["state_root"],
+            external_volume=config["external_volume"],
+        ),
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise ContinuityError("cannot resolve Codex hook discovery checkout")
@@ -137,7 +142,10 @@ def _run_host_until_native_event(
     surface: str,
     output_dir: Path,
     timeout: float,
+    required_mount: tuple[str | Path, str | Path] | None = None,
 ) -> str:
+    if required_mount is not None:
+        validate_state_storage(*required_mount)
     stdout_path = output_dir / "host.stdout"
     stderr_path = output_dir / "host.stderr"
     with (
@@ -191,6 +199,15 @@ def _run_host_until_native_event(
             deadline = time.monotonic() + timeout
             last_error: ContinuityError | None = None
             while time.monotonic() < deadline:
+                if required_mount is not None:
+                    try:
+                        validate_state_storage(*required_mount)
+                    except ContinuityError as exc:
+                        contained.terminate_tree()
+                        raise ContinuityError(
+                            "required external storage became unavailable during "
+                            f"{surface} native observation"
+                        ) from exc
                 stdout_handle.flush()
                 stderr_handle.flush()
                 output = stdout_path.read_text(
@@ -273,13 +290,15 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
     if target.read_text(encoding="utf-8") != rendered[target]:
         raise ContinuityError(f"{surface} project hook adapter is stale")
     if surface == "codex":
-        _require_codex_discovery_checkout(repo_root, Path(config["state_root"]))
+        _require_codex_discovery_checkout(repo_root, config)
         codex_config = repo_root / ".codex/config.toml"
         if codex_config.read_text(encoding="utf-8") != rendered[codex_config]:
             raise ContinuityError("codex project config layer is stale")
     executable = _host_executable(config, surface)
     checkpoint = _event_log_checkpoint(config)
-    confined_env = minimal_child_env(state_root=config["state_root"])
+    confined_env = minimal_child_env(
+        state_root=config["state_root"], external_volume=config["external_volume"]
+    )
     state_root = Path(confined_env["HOME"])
     temp_root = Path(confined_env["TMPDIR"])
     with tempfile.TemporaryDirectory(
@@ -310,11 +329,16 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
         _run_host_until_native_event(
             _project_host_command(executable, surface),
             cwd=repo_root,
-            env=minimal_child_env(extra_env, state_root=state_root),
+            env=minimal_child_env(
+                extra_env,
+                state_root=state_root,
+                external_volume=config["external_volume"],
+            ),
             checkpoint=checkpoint,
             surface=surface,
             output_dir=Path(temp),
             timeout=120,
+            required_mount=(config["external_volume"], config["state_root"]),
         )
     if (
         sha256_file(executable)
@@ -370,7 +394,9 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
         raise ContinuityError("installed Hermes hook config drifted from its manifest")
     executable = _host_executable(config, "hermes")
     env = minimal_child_env(
-        {"HERMES_HOME": str(hermes_home)}, state_root=config["state_root"]
+        {"HERMES_HOME": str(hermes_home)},
+        state_root=config["state_root"],
+        external_volume=config["external_volume"],
     )
     commands = (
         ("list", ["hooks", "list"]),
@@ -383,6 +409,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
             cwd=repo_root,
             timeout=120,
             env=env,
+            required_mount=(config["external_volume"], config["state_root"]),
         )
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode != 0:

@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import re
+import stat
 import sys
 import time
 from contextlib import contextmanager
@@ -24,13 +25,18 @@ except ImportError:  # pragma: no cover - Windows release is not supported by th
 from continuity_bridge import ALLOWED_ACTIVE_STATES, build_preflight
 from continuity_common import (
     ContinuityError,
-    atomic_write_json,
-    atomic_write_text,
+    confined_atomic_write_json,
+    confined_atomic_write_text,
+    confined_ensure_dir,
+    confined_load_json,
+    confined_parent,
+    confined_read_text,
     external_volume_available,
     external_input_digests,
     git_state,
     load_json,
     minimal_child_env,
+    parse_markdown_frontmatter,
     read_markdown_frontmatter,
     receipt_errors,
     receipt_signing_key,
@@ -39,6 +45,7 @@ from continuity_common import (
     run_command,
     sha256_file,
     sign_receipt,
+    validate_state_storage,
     verify_pinned_executable,
 )
 
@@ -160,7 +167,11 @@ def _require_committed_config(
         ["git", "show", "HEAD:.continuity/config.json"],
         cwd=repo_root,
         timeout=30,
-        env=minimal_child_env(state_root=config["state_root"]),
+        env=minimal_child_env(
+            state_root=config["state_root"],
+            external_volume=config["external_volume"],
+        ),
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     try:
         committed_config = (
@@ -193,7 +204,9 @@ def strict_authority_check(
     beads = config["beads"]
     verify_pinned_executable(config, cwd.resolve(), "beads", Path(beads["binary"]))
     env = minimal_child_env(
-        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+        {"BEADS_DIR": beads["data_dir"]},
+        state_root=config["state_root"],
+        external_volume=config["external_volume"],
     )
     try:
         result = run_command(
@@ -201,6 +214,7 @@ def strict_authority_check(
             cwd=cwd,
             timeout=float(beads.get("completion_timeout_seconds", 60)),
             env=env,
+            required_mount=(config["external_volume"], config["state_root"]),
         )
         if result.returncode != 0:
             raise ContinuityError(f"bd show exited with status {result.returncode}")
@@ -456,7 +470,11 @@ print(json.dumps({"python_version": sys.version, "packages": records}, separator
         [str(python_path), "-I", "-c", probe],
         cwd=repo_root,
         timeout=60,
-        env=minimal_child_env(state_root=config["state_root"]),
+        env=minimal_child_env(
+            state_root=config["state_root"],
+            external_volume=config["external_volume"],
+        ),
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     if result.returncode != 0:
         raise ContinuityError("dependency identity probe failed")
@@ -758,7 +776,12 @@ def _execute_evidence(
         argv,
         cwd=repo_root,
         timeout=timeout,
-        env=minimal_child_env(child_env, state_root=config["state_root"]),
+        env=minimal_child_env(
+            child_env,
+            state_root=config["state_root"],
+            external_volume=config["external_volume"],
+        ),
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     if _verify_evidence_entrypoint(config, repo_root, spec) != entrypoint_digest:
         raise ContinuityError("evidence executable changed during execution")
@@ -837,6 +860,7 @@ def create_receipt(
     require_mounted_volume: bool = True,
 ) -> dict[str, Any]:
     config = load_json(config_path)
+    validate_state_storage(config["external_volume"], config["state_root"])
     repo_root = _require_committed_config(config_path, config, cwd=cwd)
     configured_tier = config.get("risk_tier")
     if risk_tier != configured_tier:
@@ -891,8 +915,7 @@ def create_receipt(
         raise ContinuityError(f"strict authority check failed{suffix}")
     dependency_identity = _dependency_identity(config, repo_root)
     signing_key = receipt_signing_key(config)
-    evidence_home = Path(config["state_root"]) / "evidence-home"
-    evidence_home.mkdir(parents=True, exist_ok=True)
+    evidence_home = confined_ensure_dir(config, "evidence-home")
     receipt = {
         "schema_version": 1,
         "gate": "hermes-continuity-gate/2",
@@ -965,12 +988,14 @@ def verify_receipt(
     allow_recovery_journal: bool = False,
 ) -> list[str]:
     config = load_json(config_path)
+    validate_state_storage(config["external_volume"], config["state_root"])
+    receipt_path = _confined_receipt_output(config, receipt_path)
     repo_root = _require_committed_config(config_path, config, cwd=cwd)
     current = git_state(cwd.resolve(), integration_ref=config.get("integration_ref"))
     errors: list[str] = []
     if current.root != str(Path(config["expected_repo_root"]).resolve()):
         errors.append("current repository root does not match continuity config")
-    receipt = load_json(receipt_path)
+    receipt = confined_load_json(config, receipt_path)
     errors.extend(receipt_signature_errors(config, receipt))
     if receipt.get("project") != config.get("project"):
         errors.append("receipt project does not match continuity config")
@@ -1009,13 +1034,16 @@ def _run_beads(config: dict[str, Any], arguments: list[str], repo_root: Path) ->
     beads = config["beads"]
     verify_pinned_executable(config, repo_root, "beads", Path(beads["binary"]))
     env = minimal_child_env(
-        {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+        {"BEADS_DIR": beads["data_dir"]},
+        state_root=config["state_root"],
+        external_volume=config["external_volume"],
     )
     result = run_command(
         [beads["binary"], *arguments, "--json"],
         cwd=repo_root,
         timeout=float(beads.get("completion_timeout_seconds", 60)),
         env=env,
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     if result.returncode != 0:
         raise ContinuityError(f"Beads update failed with status {result.returncode}")
@@ -1029,8 +1057,11 @@ def _beads_status(config: dict[str, Any], repo_root: Path) -> str | None:
         cwd=repo_root,
         timeout=float(beads.get("completion_timeout_seconds", 60)),
         env=minimal_child_env(
-            {"BEADS_DIR": beads["data_dir"]}, state_root=config["state_root"]
+            {"BEADS_DIR": beads["data_dir"]},
+            state_root=config["state_root"],
+            external_volume=config["external_volume"],
         ),
+        required_mount=(config["external_volume"], config["state_root"]),
     )
     if result.returncode != 0:
         raise ContinuityError("Beads verification query failed")
@@ -1048,24 +1079,49 @@ def _promotion_lock(config: dict[str, Any], timeout: float = 15):
     if fcntl is None:
         raise ContinuityError("promotion locking is unavailable on this platform")
     path = Path(config["state_root"]) / "promotion.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise ContinuityError("timed out waiting for the promotion lock")
-                time.sleep(0.05)
-        yield
-    finally:
+    with confined_parent(config, path) as (parent_fd, target):
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
+            descriptor = (
+                os.open(
+                    target,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                    0o600,
+                )
+                if parent_fd is None
+                else os.open(
+                    target,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            )
+        except OSError as exc:
+            raise ContinuityError(f"cannot open promotion lock safely: {exc}") from exc
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             os.close(descriptor)
+            raise ContinuityError("promotion lock is not a regular file")
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ContinuityError("timed out waiting for the promotion lock")
+                    time.sleep(0.05)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def promote(
@@ -1077,7 +1133,11 @@ def promote(
 ) -> None:
     if target not in {"TESTED", "ENFORCED"}:
         raise ContinuityError("only TESTED or ENFORCED may be promoted by the gate")
+    if fcntl is None:
+        raise ContinuityError("promotion locking is unavailable on this platform")
     config = load_json(config_path)
+    validate_state_storage(config["external_volume"], config["state_root"])
+    receipt_path = _confined_receipt_output(config, receipt_path)
     _require_committed_config(config_path, config, cwd=cwd)
     if not external_volume_available(Path(config["external_volume"])):
         raise ContinuityError("external volume is not mounted")
@@ -1093,8 +1153,11 @@ def promote(
     journal_path = Path(config["state_root"]) / "promotion.json"
     with _promotion_lock(config):
         recovery = False
-        if journal_path.is_file():
-            existing_journal = load_json(journal_path)
+        try:
+            existing_journal = confined_load_json(config, journal_path)
+        except FileNotFoundError:
+            existing_journal = None
+        if existing_journal is not None:
             recovery = (
                 existing_journal.get("status")
                 in {"PREPARED", "CARD_WRITTEN", "RECOVERY_REQUIRED"}
@@ -1107,7 +1170,7 @@ def promote(
             cwd=cwd,
             allow_recovery_journal=recovery,
         )
-        receipt = load_json(receipt_path)
+        receipt = confined_load_json(config, receipt_path)
         if recovery and existing_journal.get("commit") != receipt.get("git", {}).get(
             "commit"
         ):
@@ -1118,9 +1181,14 @@ def promote(
             raise ContinuityError("promotion refused: " + "; ".join(errors))
 
         card_path = Path(config["basic_memory"]["card_path"])
-        card_data, card_body = read_markdown_frontmatter(card_path)
-        if journal_path.is_file():
-            prior_journal = load_json(journal_path)
+        card_data, card_body = parse_markdown_frontmatter(
+            confined_read_text(config, card_path), card_path
+        )
+        try:
+            prior_journal = confined_load_json(config, journal_path)
+        except FileNotFoundError:
+            prior_journal = None
+        if prior_journal is not None:
             if (
                 prior_journal.get("status") == "COMMITTED"
                 and prior_journal.get("target") == target
@@ -1148,7 +1216,7 @@ def promote(
             "commit": receipt["git"]["commit"],
             "updated_at": now,
         }
-        atomic_write_json(journal_path, journal)
+        confined_atomic_write_json(config, journal_path, journal)
         card_data["state"] = target
         card_data["evidence"] = evidence
         card_data["next_action"] = (
@@ -1156,10 +1224,12 @@ def promote(
             if target == "TESTED"
             else "Monitor enforced continuity before expanding to another project."
         )
-        atomic_write_text(card_path, render_markdown_frontmatter(card_data, card_body))
+        confined_atomic_write_text(
+            config, card_path, render_markdown_frontmatter(card_data, card_body)
+        )
         journal["status"] = "CARD_WRITTEN"
         journal["updated_at"] = datetime.now(timezone.utc).isoformat()
-        atomic_write_json(journal_path, journal)
+        confined_atomic_write_json(config, journal_path, journal)
         if target == "ENFORCED":
             try:
                 repo_root = Path(config["expected_repo_root"])
@@ -1180,11 +1250,11 @@ def promote(
                 journal["status"] = "RECOVERY_REQUIRED"
                 journal["error_type"] = type(exc).__name__
                 journal["updated_at"] = datetime.now(timezone.utc).isoformat()
-                atomic_write_json(journal_path, journal)
+                confined_atomic_write_json(config, journal_path, journal)
                 raise
         journal["status"] = "COMMITTED"
         journal["updated_at"] = datetime.now(timezone.utc).isoformat()
-        atomic_write_json(journal_path, journal)
+        confined_atomic_write_json(config, journal_path, journal)
 
 
 def manifest_membership_errors(
@@ -1203,6 +1273,26 @@ def manifest_membership_errors(
     if len(identities) != len(actual):
         errors.append("integration manifest identities are duplicated")
     return errors
+
+
+def _confined_receipt_output(config: dict[str, Any], output: Path) -> Path:
+    state = validate_state_storage(config["external_volume"], config["state_root"])
+    try:
+        receipt_dir = Path(config["receipt_dir"]).resolve(strict=True)
+    except OSError as exc:
+        raise ContinuityError(f"receipt directory is unavailable: {exc}") from exc
+    if not receipt_dir.is_dir() or not receipt_dir.is_relative_to(state):
+        raise ContinuityError("receipt directory escapes pilot state root")
+    normalized = Path(os.path.abspath(output))
+    try:
+        parent = normalized.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ContinuityError(f"receipt output parent is unavailable: {exc}") from exc
+    if parent != receipt_dir:
+        raise ContinuityError("receipt output escapes configured receipt directory")
+    with confined_parent(config, normalized):
+        pass
+    return normalized
 
 
 def managed_manifest_file_errors(
@@ -1563,6 +1653,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "create-receipt":
+            output_config = load_json(args.config)
+            output_path = _confined_receipt_output(output_config, args.output)
             receipt = create_receipt(
                 args.config,
                 cwd=args.cwd,
@@ -1573,9 +1665,9 @@ def main(argv: list[str] | None = None) -> int:
                 rollback=_load_object(args.rollback_json, "rollback evidence"),
                 require_mounted_volume=True,
             )
-            atomic_write_json(args.output, receipt)
+            confined_atomic_write_json(output_config, output_path, receipt)
             print(
-                json.dumps({"result": receipt["result"], "receipt": str(args.output)})
+                json.dumps({"result": receipt["result"], "receipt": str(output_path)})
             )
             return 0 if receipt["result"] == "PASS" else 2
         if args.command == "verify-receipt":

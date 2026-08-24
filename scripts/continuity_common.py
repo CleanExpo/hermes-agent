@@ -10,12 +10,14 @@ import platform
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import psutil
 import yaml
@@ -70,6 +72,10 @@ def read_markdown_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ContinuityError(f"cannot read authority {path}: {exc}") from exc
+    return parse_markdown_frontmatter(text, path)
+
+
+def parse_markdown_frontmatter(text: str, path: Path) -> tuple[dict[str, Any], str]:
     if len(text) > 256_000:
         raise ContinuityError(f"authority is unexpectedly large: {path}")
     lines = text.splitlines()
@@ -134,6 +140,7 @@ def minimal_child_env(
     extra: dict[str, str] | None = None,
     *,
     state_root: str | Path,
+    external_volume: str | Path,
 ) -> dict[str, str]:
     """Return a credential-minimized, state-confined child environment."""
     allowed = {
@@ -149,21 +156,15 @@ def minimal_child_env(
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
     env["PATH"] = os.defpath
-    requested_state = Path(state_root)
-    if not requested_state.is_dir():
-        raise ContinuityError(
-            f"pilot state root is unavailable or not a directory: {requested_state}"
-        )
-    resolved_state = requested_state.resolve(strict=True)
-    temp_root = resolved_state / "tmp"
+    resolved_state = validate_state_storage(external_volume, state_root)
+    expected_temp_root = resolved_state / "tmp"
     try:
-        temp_root.mkdir(exist_ok=True)
+        temp_root = expected_temp_root.resolve(strict=True)
     except OSError as exc:
-        raise ContinuityError(f"cannot prepare child temp root: {exc}") from exc
-    temp_root = temp_root.resolve()
-    if not temp_root.is_relative_to(resolved_state):
+        raise ContinuityError(f"child temp root is unavailable: {exc}") from exc
+    if temp_root != expected_temp_root or not temp_root.is_dir():
         raise ContinuityError(
-            f"child temp root escapes pilot state root: {temp_root}"
+            f"child temp root is not a confined direct directory: {temp_root}"
         )
     env.update({
         "HOME": str(resolved_state),
@@ -180,6 +181,345 @@ def minimal_child_env(
                 f"child {name} escapes pilot state root: {path}"
             )
     return env
+
+
+def validate_state_storage(
+    external_volume: str | Path, state_root: str | Path
+) -> Path:
+    """Validate a real mount and an existing state directory beneath it."""
+    secure_dirfd = (
+        os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    )
+    if not secure_dirfd and os.name != "nt":
+        raise ContinuityError(
+            "secure confined state access is unavailable on this platform"
+        )
+    volume = Path(external_volume)
+    if not external_volume_available(volume):
+        raise ContinuityError(f"external volume is not mounted: {volume}")
+    try:
+        mounted = volume.resolve(strict=True)
+        raw_state = Path(os.path.abspath(state_root))
+        state = raw_state.resolve(strict=True)
+    except OSError as exc:
+        raise ContinuityError(f"pilot state storage is unavailable: {exc}") from exc
+    if not state.is_dir() or not state.is_relative_to(mounted):
+        raise ContinuityError(f"pilot state root escapes external volume: {state}")
+    if os.name == "nt":
+        _windows_require_plain_path(raw_state, mounted)
+    return state
+
+
+def _windows_require_plain_path(path: Path, root: Path) -> None:
+    """Reject Windows reparse points from root through an existing path."""
+    reparse_point = 0x400
+    normalized = Path(os.path.abspath(path))
+    try:
+        relative = normalized.relative_to(root)
+    except ValueError as exc:
+        raise ContinuityError(f"state path escapes pilot state root: {path}") from exc
+    candidates = (
+        root,
+        *(
+            root / Path(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    for current in candidates:
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise ContinuityError(f"state path is unavailable: {current}: {exc}") from exc
+        if getattr(metadata, "st_file_attributes", 0) & reparse_point:
+            raise ContinuityError(f"state path contains a reparse point: {current}")
+
+
+def _windows_reject_reparse_target(path: Path) -> None:
+    """Reject an existing Windows target leaf when it is a reparse point."""
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ContinuityError(f"state target is unavailable: {path}: {exc}") from exc
+    if getattr(metadata, "st_file_attributes", 0) & 0x400:
+        raise ContinuityError(f"state target is a reparse point: {path}")
+
+
+def _secure_dirfd_available() -> bool:
+    return (
+        os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    )
+
+
+@contextmanager
+def confined_parent(
+    config: dict[str, Any], path: Path
+) -> Iterator[tuple[int | None, str | Path]]:
+    """Open a target parent relative to an already-validated state root."""
+    state = validate_state_storage(config["external_volume"], config["state_root"])
+    normalized = Path(os.path.abspath(path))
+    try:
+        relative = normalized.relative_to(state)
+    except ValueError as exc:
+        raise ContinuityError(f"state path escapes pilot state root: {path}") from exc
+    if len(relative.parts) < 1:
+        raise ContinuityError(f"state path has no target name: {path}")
+    parent_parts = relative.parts[:-1]
+    if not _secure_dirfd_available():
+        if os.name != "nt":
+            raise ContinuityError(
+                "secure confined state access requires directory descriptor support"
+            )
+        parent = normalized.parent
+        _windows_require_plain_path(parent, state)
+        if parent.resolve(strict=True) != parent:
+            raise ContinuityError(f"state path parent is not direct: {parent}")
+        _windows_reject_reparse_target(normalized)
+        validate_state_storage(config["external_volume"], config["state_root"])
+        yield None, normalized
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(state, flags)
+    except OSError as exc:
+        raise ContinuityError(f"cannot open confined state root: {exc}") from exc
+    try:
+        try:
+            for part in parent_parts:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot open confined state parent for {path}: {exc}"
+            ) from exc
+        validate_state_storage(config["external_volume"], config["state_root"])
+        yield descriptor, relative.name
+    finally:
+        os.close(descriptor)
+
+
+def confined_atomic_write_text(
+    config: dict[str, Any], path: Path, content: str
+) -> None:
+    data = content.encode("utf-8")
+    with confined_parent(config, path) as (parent_fd, target):
+        _require_regular_leaf(parent_fd, target, missing_ok=True)
+        if parent_fd is None:
+            target_path = Path(target)
+            temporary = target_path.parent / (
+                f".{target_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            try:
+                descriptor = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                try:
+                    _write_all(descriptor, data)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                validate_state_storage(
+                    config["external_volume"], config["state_root"]
+                )
+                _windows_reject_reparse_target(target_path)
+                os.replace(temporary, target_path)
+            except BaseException as exc:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                if isinstance(exc, OSError):
+                    raise ContinuityError(
+                        f"cannot write confined state file {path}: {exc}"
+                    ) from exc
+                raise
+            return
+        temporary = f".{target}.{os.getpid()}.{time.time_ns()}.tmp"
+        try:
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_all(descriptor, data)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, target, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except BaseException as exc:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            if isinstance(exc, OSError):
+                raise ContinuityError(
+                    f"cannot write confined state file {path}: {exc}"
+                ) from exc
+            raise
+
+
+def confined_atomic_write_json(
+    config: dict[str, Any], path: Path, value: dict[str, Any]
+) -> None:
+    confined_atomic_write_text(
+        config, path, json.dumps(value, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def confined_read_bytes(config: dict[str, Any], path: Path) -> bytes:
+    with confined_parent(config, path) as (parent_fd, target):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = (
+                os.open(target, flags)
+                if parent_fd is None
+                else os.open(target, flags, dir_fd=parent_fd)
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise ContinuityError(
+                f"cannot open confined state file {path}: {exc}"
+            ) from exc
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ContinuityError(
+                    f"confined state file is not a regular file: {path}"
+                )
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            os.close(descriptor)
+
+
+def _require_regular_leaf(
+    parent_fd: int | None, target: str | Path, *, missing_ok: bool
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = (
+            os.open(target, flags)
+            if parent_fd is None
+            else os.open(target, flags, dir_fd=parent_fd)
+        )
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    except OSError as exc:
+        raise ContinuityError(f"state target cannot be opened safely: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ContinuityError("state target is not a regular file")
+    finally:
+        os.close(descriptor)
+
+
+def confined_read_text(config: dict[str, Any], path: Path) -> str:
+    try:
+        return confined_read_bytes(config, path).decode("utf-8")
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ContinuityError(f"cannot read confined state file {path}: {exc}") from exc
+
+
+def confined_load_json(config: dict[str, Any], path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(confined_read_text(config, path))
+    except json.JSONDecodeError as exc:
+        raise ContinuityError(f"cannot read JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContinuityError(f"expected a JSON object in {path}")
+    return value
+
+
+def confined_ensure_dir(config: dict[str, Any], name: str) -> Path:
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise ContinuityError(f"invalid state directory name: {name!r}")
+    state = validate_state_storage(config["external_volume"], config["state_root"])
+    if not _secure_dirfd_available():
+        if os.name != "nt":
+            raise ContinuityError(
+                "secure confined state directory creation requires directory descriptor support"
+            )
+        target = state / name
+        _windows_reject_reparse_target(target)
+        validate_state_storage(config["external_volume"], config["state_root"])
+        try:
+            os.mkdir(target, mode=0o700)
+        except FileExistsError:
+            pass
+        _windows_require_plain_path(target, state)
+        if not target.is_dir():
+            raise ContinuityError(
+                f"state directory is not a confined direct directory: {target}"
+            )
+        return target
+    try:
+        descriptor = os.open(
+            state,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise ContinuityError(f"cannot open confined state root: {exc}") from exc
+    try:
+        validate_state_storage(config["external_volume"], config["state_root"])
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=descriptor)
+        except FileExistsError:
+            pass
+        try:
+            child_descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+        except OSError as exc:
+            raise ContinuityError(
+                f"state directory is not a confined direct directory: {state / name}"
+            ) from exc
+        else:
+            os.close(child_descriptor)
+    finally:
+        os.close(descriptor)
+    return state / name
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("confined write made no progress")
+        offset += written
 
 
 def verify_pinned_executable(
@@ -275,24 +615,52 @@ def _receipt_key_path(config: dict[str, Any]) -> Path:
 
 def _load_receipt_key(config: dict[str, Any], *, create: bool) -> bytes:
     path = _receipt_key_path(config)
-    if create and not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
+    with confined_parent(config, path) as (parent_fd, target):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        if create:
             try:
-                key = secrets.token_bytes(32)
-                os.write(descriptor, key)
-                os.fsync(descriptor)
+                descriptor = (
+                    os.open(target, flags, 0o600)
+                    if parent_fd is None
+                    else os.open(target, flags, 0o600, dir_fd=parent_fd)
+                )
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ContinuityError(
+                    f"cannot create receipt signing key safely: {exc}"
+                ) from exc
+            else:
+                try:
+                    _write_all(descriptor, secrets.token_bytes(32))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                if parent_fd is not None:
+                    os.fsync(parent_fd)
+        read_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = (
+                os.open(target, read_flags)
+                if parent_fd is None
+                else os.open(target, read_flags, dir_fd=parent_fd)
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ContinuityError(
+                        "receipt signing key must be a regular file"
+                    )
+                key = os.read(descriptor, 33)
+                mode = metadata.st_mode & 0o777
             finally:
                 os.close(descriptor)
-    try:
-        key = path.read_bytes()
-        mode = path.stat().st_mode & 0o777
-    except OSError as exc:
-        raise ContinuityError(f"cannot read receipt signing key: {exc}") from exc
+        except OSError as exc:
+            raise ContinuityError(f"cannot read receipt signing key: {exc}") from exc
     if len(key) != 32 or mode & 0o077:
         raise ContinuityError("receipt signing key must be 32 bytes with mode 0600")
     return key
@@ -365,6 +733,21 @@ def _terminate_process_tree(
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and process.poll() is None:
+            time.sleep(0.025)
+        try:
+            os.killpg(  # windows-footgun: ok -- POSIX gate
+                process_group, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            process.communicate(timeout=0.75)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+
     try:
         parent = psutil.Process(process.pid)
         descendants = parent.children(recursive=True)
@@ -415,13 +798,6 @@ def _terminate_process_tree(
     if process.poll() is None:
         try:
             process.kill()
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    if process_group is not None and os.name == "posix":
-        try:
-            os.killpg(  # windows-footgun: ok -- POSIX gate
-                process_group, getattr(signal, "SIGKILL", signal.SIGTERM)
-            )
         except (ProcessLookupError, PermissionError, OSError):
             pass
     try:
@@ -603,7 +979,10 @@ def run_command(
     cwd: Path,
     timeout: float,
     env: dict[str, str] | None = None,
+    required_mount: tuple[str | Path, str | Path] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if required_mount is not None:
+        validate_state_storage(*required_mount)
     contained = _spawn_contained_process(
         args,
         cwd=cwd,
@@ -613,16 +992,28 @@ def run_command(
         stderr=subprocess.PIPE,
     )
     process = contained.process
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        contained.terminate_tree()
-        raise ContinuityError(
-            f"command timed out after {timeout:g}s: {args[0]}"
-        ) from exc
-    except BaseException:
-        contained.terminate_tree()
-        raise
+    deadline = time.monotonic() + timeout
+    while True:
+        if required_mount is not None:
+            try:
+                validate_state_storage(*required_mount)
+            except ContinuityError as exc:
+                contained.terminate_tree()
+                raise ContinuityError(
+                    f"required external storage became unavailable during command: {args[0]}"
+                ) from exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            contained.terminate_tree()
+            raise ContinuityError(f"command timed out after {timeout:g}s: {args[0]}")
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+        except BaseException:
+            contained.terminate_tree()
+            raise
     contained.terminate_tree()
     return subprocess.CompletedProcess(
         args=args,
