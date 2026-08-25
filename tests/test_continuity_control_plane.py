@@ -3621,6 +3621,94 @@ def test_live_system_guard_tracks_direct_multiprocessing_child(
     assert not child.is_alive()
 
 
+def test_live_system_guard_released_leader_probe(tmp_path: Path) -> None:
+    """Nested-pytest helper for the released-leader teardown regression."""
+    identity_path_value = os.environ.get("CONTINUITY_RELEASED_LEADER_IDENTITY_PATH")
+    if not identity_path_value:
+        pytest.skip("only executed by the released-leader teardown regression")
+    if os.name != "posix":
+        pytest.skip("process-group teardown is POSIX-only")
+
+    identity_path = Path(identity_path_value)
+    descendant = "import time; time.sleep(30)"
+    leader = (
+        "import pathlib,psutil,subprocess,sys; "
+        f"child=subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
+        "created=psutil.Process(child.pid).create_time(); "
+        "pathlib.Path(sys.argv[1]).write_text("
+        "f'{child.pid}:{created}', encoding='utf-8')"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader, str(identity_path)],
+        start_new_session=True,
+    )
+
+    assert process.wait(timeout=5) == 0
+    assert identity_path.is_file()
+    if os.environ.get("CONTINUITY_RELEASED_LEADER_PROBE_MODE") == "fail":
+        pytest.fail("exercise teardown after an ordinary test failure")
+
+
+@pytest.mark.parametrize(
+    ("probe_mode", "expected_returncode"), (("pass", 0), ("fail", 1))
+)
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_reaps_descendant_after_released_leader(
+    tmp_path: Path,
+    _live_system_signal_primitives: dict[str, object],
+    _os_case: str,
+    probe_mode: str,
+    expected_returncode: int,
+) -> None:
+    """Nested pytest must drain the group after success and failure paths."""
+    identity_path = tmp_path / f"released-leader-descendant-{probe_mode}.txt"
+    env = os.environ.copy()
+    env["CONTINUITY_RELEASED_LEADER_IDENTITY_PATH"] = str(identity_path)
+    env["CONTINUITY_RELEASED_LEADER_PROBE_MODE"] = probe_mode
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            str(Path(__file__).resolve()),
+            "-k",
+            "test_live_system_guard_released_leader_probe",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
+    pid_text, created_at_text = identity_path.read_text(encoding="utf-8").split(":")
+    pid = int(pid_text)
+    created_at = float(created_at_text)
+
+    def exact_identity_is_live() -> bool:
+        try:
+            candidate = psutil.Process(pid)
+            return (
+                candidate.create_time() == created_at
+                and candidate.status() != psutil.STATUS_ZOMBIE
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    deadline = time.monotonic() + 3.0
+    try:
+        while exact_identity_is_live() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not exact_identity_is_live()
+    finally:
+        if exact_identity_is_live():
+            real_kill = _live_system_signal_primitives["kill"]
+            assert callable(real_kill)
+            real_kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_live_system_guard_refuses_stale_owned_process_group_number(
     monkeypatch: pytest.MonkeyPatch,

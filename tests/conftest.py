@@ -1391,6 +1391,16 @@ def _live_system_guard(
     import subprocess as _subprocess
 
     real_kill = _live_system_signal_primitives["kill"]
+    real_waitpid = getattr(_os, "waitpid", None)
+    real_getpgid = getattr(_os, "getpgid", None)
+    try:
+        import psutil as _teardown_psutil
+
+        real_psutil_process = _teardown_psutil.Process
+        real_psutil_process_iter = _teardown_psutil.process_iter
+    except ImportError:
+        real_psutil_process = None
+        real_psutil_process_iter = None
 
     def _is_live_direct_child(pid: int) -> bool:
         if pid not in owned_process_registry:
@@ -1868,26 +1878,133 @@ def _live_system_guard(
     try:
         yield
     finally:
-        if _os.name == "posix" and "real_killpg" in locals():
-            for pgid in tuple(owned_process_group_registry):
+
+        def _retain_released_group_members(pgid, record):
+            """Bind surviving group members to exact identities before cleanup.
+
+            A session leader may already have been waited on while one of its
+            descendants keeps the original process group alive.  In that case
+            ``waitpid`` can no longer authenticate the group through the direct
+            child relationship.  A live process at the leader PID with a
+            different creation time proves the numeric PGID was reused, so the
+            group must not be touched.  If the original leader PID is absent,
+            POSIX cannot create a new group with that orphaned PGID; remaining
+            members are descendants of the registered group and are retained
+            by PID plus creation time for exact-identity signalling below.
+            """
+            if (
+                real_getpgid is None
+                or real_psutil_process is None
+                or real_psutil_process_iter is None
+            ):
+                pytest.fail(
+                    "tests/conftest.py live-system guard cannot authenticate "
+                    f"released process group {pgid}"
+                )
+            try:
+                leader = real_psutil_process(pgid)
+                if leader.create_time() != record.get("leader_created_at"):
+                    return
+            except _teardown_psutil.NoSuchProcess:
+                pass
+            except (_teardown_psutil.AccessDenied, OSError) as exc:
+                pytest.fail(
+                    "tests/conftest.py live-system guard cannot authenticate "
+                    f"released process group {pgid}: {exc}"
+                )
+
+            try:
+                candidates = tuple(real_psutil_process_iter(["pid", "create_time"]))
+            except (OSError, PermissionError) as exc:
+                pytest.fail(
+                    "tests/conftest.py live-system guard cannot enumerate "
+                    f"released process group {pgid}: {exc}"
+                )
+            for candidate in candidates:
+                pid = int(candidate.info["pid"])
+                if pid == pgid:
+                    continue
                 try:
-                    waited_pid, _status = _os.waitpid(pgid, _os.WNOHANG)
+                    if int(real_getpgid(pid)) != pgid:
+                        continue
+                    created_at = candidate.info.get("create_time")
+                    if created_at is None:
+                        created_at = candidate.create_time()
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    continue
+                owned_process_identity_registry[pid] = float(created_at)
+
+        def _kill_retained_identities():
+            """Kill only descendants whose PID and creation time still match."""
+            if real_psutil_process is None:
+                pytest.fail(
+                    "tests/conftest.py live-system guard cannot verify exact "
+                    "owned descendant identities"
+                )
+
+            pending = dict(owned_process_identity_registry)
+            for pid, created_at in tuple(pending.items()):
+                try:
+                    candidate = real_psutil_process(pid)
+                    if candidate.create_time() != created_at:
+                        pending.pop(pid, None)
+                        continue
+                    real_kill(pid, _signal.SIGKILL)
+                except (_teardown_psutil.NoSuchProcess, ProcessLookupError):
+                    pending.pop(pid, None)
+                except (_teardown_psutil.AccessDenied, OSError):
+                    continue
+
+            deadline = time.monotonic() + 3.0
+            while pending and time.monotonic() < deadline:
+                for pid, created_at in tuple(pending.items()):
+                    try:
+                        candidate = real_psutil_process(pid)
+                        if (
+                            candidate.create_time() != created_at
+                            or candidate.status() == _teardown_psutil.STATUS_ZOMBIE
+                        ):
+                            pending.pop(pid, None)
+                    except _teardown_psutil.NoSuchProcess:
+                        pending.pop(pid, None)
+                    except (_teardown_psutil.AccessDenied, OSError):
+                        continue
+                if pending:
+                    time.sleep(0.02)
+            if pending:
+                pytest.fail(
+                    "tests/conftest.py live-system guard could not drain exact "
+                    "owned descendant identities: "
+                    + ", ".join(str(pid) for pid in sorted(pending))
+                )
+
+        if _os.name == "posix" and "real_killpg" in locals():
+            for pgid, record in tuple(owned_process_group_registry.items()):
+                try:
+                    waited_pid, _status = real_waitpid(pgid, _os.WNOHANG)
                 except ChildProcessError:
+                    _retain_released_group_members(pgid, record)
                     continue
                 if waited_pid != 0:
+                    _retain_released_group_members(pgid, record)
                     continue
                 try:
                     real_killpg(pgid, _signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 try:
-                    _os.waitpid(pgid, 0)
+                    real_waitpid(pgid, 0)
                 except ChildProcessError:
                     pass
+            _kill_retained_identities()
         if _os.name == "posix":
             for pid in tuple(owned_process_registry):
                 try:
-                    waited_pid, _status = _os.waitpid(pid, _os.WNOHANG)
+                    waited_pid, _status = real_waitpid(pid, _os.WNOHANG)
                 except ChildProcessError:
                     continue
                 if waited_pid == 0:
@@ -1896,7 +2013,7 @@ def _live_system_guard(
                     except ProcessLookupError:
                         pass
                     try:
-                        _os.waitpid(pid, 0)
+                        real_waitpid(pid, 0)
                     except ChildProcessError:
                         pass
 
