@@ -545,6 +545,7 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
         "dependency_identity": {
             "python": sys.executable,
             "requirements_lock": ".continuity/ci-requirements.txt",
+            "requirements_sha256": sha256_file(requirements_lock),
         },
         "native_observation_policy": {
             "required_surfaces": ["sandbox"],
@@ -1141,7 +1142,8 @@ def test_promotion_lock_rejects_symlink_leaf(
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_confined_state_rejects_special_file_leaves_without_blocking(
-    pilot: dict[str, Path], _os_case: str,
+    pilot: dict[str, Path],
+    _os_case: str,
 ) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     receipt_fifo = pilot["state"] / "receipts/special.json"
@@ -1767,6 +1769,9 @@ def test_dependency_identity_rejects_lock_environment_mismatch(
         f"missing-package==1.0 --hash=sha256:{'0' * 64}\n",
         encoding="utf-8",
     )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["dependency_identity"]["requirements_sha256"] = sha256_file(requirements)
+    atomic_write_json(pilot["config"], config)
     _commit_and_rebind(pilot, "bind mismatched dependency lock")
 
     with pytest.raises(
@@ -1810,6 +1815,64 @@ def test_dependency_identity_rejects_wrong_psutil_version(
     with pytest.raises(
         ContinuityError,
         match="resolved dependency environment does not match requirements lock: psutil",
+    ):
+        continuity_gate._dependency_identity(config, pilot["repo"])
+
+
+def test_dependency_identity_rejects_wrong_requirements_hash(
+    pilot: dict[str, Path],
+) -> None:
+    requirements = pilot["repo"] / ".continuity/ci-requirements.txt"
+    requirements.write_text(
+        requirements.read_text(encoding="utf-8").replace("0" * 64, "f" * 64, 1),
+        encoding="utf-8",
+    )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+
+    with pytest.raises(
+        ContinuityError, match="dependency identity requirements digest mismatch"
+    ):
+        continuity_gate._dependency_identity(config, pilot["repo"])
+
+
+@pytest.mark.parametrize("missing_field", ("METADATA", "RECORD", "direct_url.json"))
+def test_dependency_identity_rejects_missing_package_digest(
+    pilot: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+) -> None:
+    packages = [
+        {
+            "name": "pyyaml",
+            "version": yaml.__version__,
+            "METADATA": "a" * 64,
+            "RECORD": "b" * 64,
+            "direct_url.json": "c" * 64,
+        },
+        {
+            "name": "psutil",
+            "version": psutil.__version__,
+            "METADATA": "d" * 64,
+            "RECORD": "e" * 64,
+            "direct_url.json": "f" * 64,
+        },
+    ]
+    del packages[1][missing_field]
+    monkeypatch.setattr(
+        continuity_gate,
+        "run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"python_version": sys.version, "packages": packages}),
+            stderr="",
+        ),
+    )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+
+    with pytest.raises(
+        ContinuityError,
+        match="dependency identity probe returned malformed package records",
     ):
         continuity_gate._dependency_identity(config, pilot["repo"])
 
@@ -2605,24 +2668,24 @@ def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
 
 @pytest.mark.parametrize("home_shape", ("outside-state", "home/.hermes"))
 def test_hermes_adapter_apply_rejects_noncanonical_home(
-    tmp_path: Path, home_shape: str
+    pilot: dict[str, Path], tmp_path: Path, home_shape: str
 ) -> None:
     candidate = tmp_path / home_shape
     candidate.mkdir(parents=True)
 
     with pytest.raises(ContinuityError, match="canonical isolated pilot home"):
-        install_hermes_adapter(REPO_ROOT, candidate)
+        install_hermes_adapter(pilot["repo"], candidate)
 
 
 @pytest.mark.parametrize("home_shape", ("outside-state", "home/.hermes"))
 def test_hermes_adapter_rollback_rejects_noncanonical_home(
-    tmp_path: Path, home_shape: str
+    pilot: dict[str, Path], tmp_path: Path, home_shape: str
 ) -> None:
     candidate = tmp_path / home_shape
     candidate.mkdir(parents=True)
 
     with pytest.raises(ContinuityError, match="canonical isolated pilot home"):
-        rollback_hermes_adapter(REPO_ROOT, candidate, apply=False)
+        rollback_hermes_adapter(pilot["repo"], candidate, apply=False)
 
 
 @pytest.mark.parametrize("operation", ("apply", "rollback", "validate", "observe"))
@@ -2710,9 +2773,7 @@ def test_hermes_manifest_binds_committed_installer_authority_digests(
     hermes_home = _pilot_hermes_home(pilot)
     install_hermes_adapter(pilot["repo"], hermes_home)
     manifest = json.loads(
-        (hermes_home / continuity_adapters.HERMES_MANIFEST).read_text(
-            encoding="utf-8"
-        )
+        (hermes_home / continuity_adapters.HERMES_MANIFEST).read_text(encoding="utf-8")
     )
     expected = {}
     for relative in (
@@ -2975,14 +3036,16 @@ def test_native_observer_reaps_descendant_after_root_exits(
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_native_observer_reaps_detached_descendant_after_root_exits(
-    tmp_path: Path, _os_case: str,
+    tmp_path: Path,
+    _os_case: str,
 ) -> None:
     _assert_native_observer_reaps_after_root_exit(tmp_path, detached=True)
 
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_fast_spawn_detach_exit_stress_reaps_every_descendant(
-    tmp_path: Path, _os_case: str,
+    tmp_path: Path,
+    _os_case: str,
 ) -> None:
     denial = tmp_path / "fast-detach-denied.txt"
     launched = tmp_path / "fast-detach-launched.txt"
@@ -3472,9 +3535,7 @@ def test_descendant_monitor_timeout_fails_closed_and_retains_thread(
         release.wait(1)
 
     contained.snapshot_descendants = blocked_snapshot
-    monkeypatch.setattr(
-        continuity_common, "_DESCENDANT_MONITOR_DRAIN_TIMEOUT", 0.05
-    )
+    monkeypatch.setattr(continuity_common, "_DESCENDANT_MONITOR_DRAIN_TIMEOUT", 0.05)
     contained.start_descendant_monitor()
     assert started.wait(1)
 
@@ -3494,10 +3555,10 @@ def test_live_system_guard_allows_only_registered_owned_process_groups(
     register_owned_process_group, _os_case: str
 ) -> None:
     ready_read, ready_write = os.pipe()
-    child_pid = os.fork()
+    child_pid = os.fork()  # windows-footgun: ok -- POSIX marker gate
     if child_pid == 0:
         os.close(ready_read)
-        os.setsid()
+        os.setsid()  # windows-footgun: ok -- POSIX marker gate
         os.write(ready_write, b"ready")
         os.close(ready_write)
         signal.pause()
@@ -3506,24 +3567,132 @@ def test_live_system_guard_allows_only_registered_owned_process_groups(
     os.close(ready_write)
     try:
         assert os.read(ready_read, 5) == b"ready"
-        with pytest.raises(RuntimeError, match="PGID is outside"):
-            os.killpg(child_pid, signal.SIGTERM)
+        with pytest.raises(RuntimeError, match="was not registered"):
+            os.killpg(  # windows-footgun: ok -- POSIX marker gate
+                child_pid, signal.SIGTERM
+            )
 
         register_owned_process_group(child_pid)
-        os.killpg(child_pid, signal.SIGTERM)
+        os.killpg(  # windows-footgun: ok -- POSIX marker gate
+            child_pid, signal.SIGTERM
+        )
         waited_pid, _status = os.waitpid(child_pid, 0)
         assert waited_pid == child_pid
     finally:
         os.close(ready_read)
         try:
             register_owned_process_group(child_pid)
-            os.killpg(child_pid, signal.SIGKILL)
+            os.killpg(  # windows-footgun: ok -- POSIX marker gate
+                child_pid,
+                signal.SIGKILL,  # windows-footgun: ok -- POSIX marker gate
+            )
         except (OSError, RuntimeError, psutil.Error):
             pass
         try:
             os.waitpid(child_pid, os.WNOHANG)
         except ChildProcessError:
             pass
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_rejects_current_and_unregistered_groups(
+    _os_case: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="not captured as an exact test child"):
+        os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(RuntimeError, match="was not registered"):
+        os.killpg(  # windows-footgun: ok -- POSIX marker gate
+            os.getpgrp(), signal.SIGTERM
+        )
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_tracks_direct_multiprocessing_child(
+    _os_case: str,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    child = context.Process(target=time.sleep, args=(30,))
+    child.start()
+    assert child.pid is not None
+
+    os.kill(child.pid, signal.SIGTERM)
+    child.join(timeout=5)
+
+    assert not child.is_alive()
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_refuses_stale_owned_process_group_number(
+    monkeypatch: pytest.MonkeyPatch,
+    owned_process_registry: set[int],
+    owned_process_group_registry: dict[int, dict[str, float | None]],
+    _live_system_signal_primitives: dict[str, object],
+    register_owned_process_group,
+    _os_case: str,
+) -> None:
+    stale_pgid = 2_000_000_001
+    owned_process_registry.add(stale_pgid)
+    owned_process_group_registry[stale_pgid] = {
+        "leader_created_at": 50.0,
+        "released_at": None,
+    }
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setitem(
+        _live_system_signal_primitives,
+        "killpg",
+        lambda pgid, sig: delivered.append((pgid, sig)),
+    )
+    monkeypatch.setattr(os, "waitpid", lambda *_args: (stale_pgid, 0))
+    monkeypatch.setattr(os, "getpgid", lambda _pid: stale_pgid)
+
+    with pytest.raises(RuntimeError, match="no longer a live direct child"):
+        register_owned_process_group(stale_pgid)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(  # windows-footgun: ok -- POSIX marker gate
+            stale_pgid, signal.SIGTERM
+        )
+
+    assert delivered == []
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_refuses_process_created_after_group_release(
+    monkeypatch: pytest.MonkeyPatch,
+    owned_process_group_registry: dict[int, dict[str, float | None]],
+    _live_system_signal_primitives: dict[str, object],
+    _os_case: str,
+) -> None:
+    released_pgid = 2_000_000_002
+    reused_pid = 2_000_000_003
+    owned_process_group_registry[released_pgid] = {
+        "leader_created_at": 50.0,
+        "released_at": 100.0,
+    }
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setitem(
+        _live_system_signal_primitives,
+        "kill",
+        lambda pid, sig: delivered.append((pid, sig)),
+    )
+
+    def not_a_direct_child(*_args):
+        raise ChildProcessError
+
+    class ReusedProcess:
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def create_time(self) -> float:
+            return 101.0
+
+    monkeypatch.setattr(os, "waitpid", not_a_direct_child)
+    monkeypatch.setattr(os, "getpgid", lambda _pid: released_pgid)
+    monkeypatch.setattr(psutil, "Process", ReusedProcess)
+
+    with pytest.raises(RuntimeError, match="not captured as an exact test child"):
+        os.kill(reused_pid, signal.SIGTERM)
+
+    assert delivered == []
 
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
@@ -3550,11 +3719,7 @@ def test_completed_command_does_not_signal_released_process_group(
             return isinstance(instance, real_psutil_process)
 
         def __call__(cls, pid=None, *args, **kwargs):
-            if (
-                spawned
-                and pid == spawned[-1].pid
-                and spawned[-1].poll() is not None
-            ):
+            if spawned and pid == spawned[-1].pid and spawned[-1].poll() is not None:
                 released_parent_lookups.append(pid)
                 raise AssertionError("released parent PID was looked up")
             return real_psutil_process(pid, *args, **kwargs)
@@ -3835,7 +4000,8 @@ def test_native_observer_consumes_signal_caught_during_handler_restoration(
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_native_observer_blocks_termination_across_spawn_handler_race(
-    tmp_path: Path, _os_case: str,
+    tmp_path: Path,
+    _os_case: str,
 ) -> None:
     child_pid_path = tmp_path / "spawned-child-pid.txt"
     sentinel = tmp_path / "spawn-race-host-survived.txt"
@@ -4396,10 +4562,15 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
         "docs/continuity-pilot.md",
     ):
         assert workflow.count(f"- '{protected}'") == 2
+    folded_workflow = " ".join(workflow.split())
     assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in workflow
     assert "uv sync --locked --python 3.11 --extra dev" in workflow
+    assert (
+        "uv pip install --python .venv/bin/python --no-config --require-hashes "
+        "--no-deps --reinstall-package PyYAML --reinstall-package psutil "
+        "-r .continuity/ci-requirements.txt"
+    ) in folded_workflow
     assert ".venv/bin/python scripts/continuity_gate.py static" in workflow
-    folded_workflow = " ".join(workflow.split())
     assert (
         "scripts/run_tests.sh tests/test_continuity_control_plane.py" in folded_workflow
     )

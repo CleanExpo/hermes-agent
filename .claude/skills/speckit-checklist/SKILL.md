@@ -18,10 +18,6 @@ metadata:
 
 Generates reviewer-owned checks for requirements quality. It does not verify implementation behavior or mark generated checks complete.
 
-## Overview
-
-Use the generated checklist procedure below to test clarity and completeness.
-
 ## When to Use
 
 Use when a feature specification needs a domain-specific quality checklist.

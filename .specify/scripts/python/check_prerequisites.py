@@ -137,16 +137,14 @@ def _available_docs(paths: FeaturePaths, include_tasks: bool) -> list[str]:
 def _print_paths_only(paths: FeaturePaths, json_mode: bool) -> None:
     if json_mode:
         sys.stdout.write(
-            _json_line(
-                {
-                    "REPO_ROOT": str(paths.repo_root),
-                    "BRANCH": paths.current_branch,
-                    "FEATURE_DIR": str(paths.feature_dir),
-                    "FEATURE_SPEC": str(paths.feature_spec),
-                    "IMPL_PLAN": str(paths.impl_plan),
-                    "TASKS": str(paths.tasks),
-                }
-            )
+            _json_line({
+                "REPO_ROOT": str(paths.repo_root),
+                "BRANCH": paths.current_branch,
+                "FEATURE_DIR": str(paths.feature_dir),
+                "FEATURE_SPEC": str(paths.feature_spec),
+                "IMPL_PLAN": str(paths.impl_plan),
+                "TASKS": str(paths.tasks),
+            })
         )
         return
 
@@ -215,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not paths.feature_dir.is_dir():
-        print(f"ERROR: Feature directory not found: {paths.feature_dir}", file=sys.stderr)
+        print(
+            f"ERROR: Feature directory not found: {paths.feature_dir}", file=sys.stderr
+        )
         print(
             f"Run {format_speckit_command('specify', paths.repo_root)} first to create the feature structure.",
             file=sys.stderr,
@@ -263,9 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.template_name:
             payload["TEMPLATE_CONTENT"] = template_content
-        sys.stdout.write(
-            _json_line(payload)
-        )
+        sys.stdout.write(_json_line(payload))
     else:
         _print_text_results(paths, args.include_tasks)
     return 0

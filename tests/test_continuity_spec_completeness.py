@@ -18,6 +18,42 @@ from continuity_common import GitState
 GOAL = "Pilot deterministic cross-agent continuity in Hermes"
 TASK_ID = "hermes-continuity-b6l"
 CHANGE_ID = "001-global-continuity-pilot"
+HARDLINE_SKILL_HEADINGS = (
+    "When to Use",
+    "Prerequisites",
+    "How to Run",
+    "Quick Reference",
+    "Procedure",
+    "Pitfalls",
+    "Verification",
+)
+
+
+def _outside_fence_h2s_and_argument_fences(
+    text: str,
+) -> tuple[list[str], list[tuple[int, bool]]]:
+    headings: list[str] = []
+    arguments: list[tuple[int, bool]] = []
+    fence_marker: str | None = None
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            if fence_marker is None:
+                fence_marker = marker
+            elif marker == fence_marker:
+                fence_marker = None
+            continue
+        if stripped == "$ARGUMENTS" and fence_marker is not None:
+            closes_immediately = (
+                index + 1 < len(lines) and lines[index + 1].strip() == fence_marker
+            )
+            arguments.append((index + 1, closes_immediately))
+        if fence_marker is None and line.startswith("## "):
+            headings.append(line[3:].strip())
+    assert fence_marker is None, "unclosed Markdown fence"
+    return headings, arguments
 
 
 def _frontmatter(data: dict, body: str) -> str:
@@ -178,3 +214,29 @@ def test_preflight_blocks_empty_spec_body_with_named_cause(
     assert (
         "Spec Kit change body is incomplete: no substantive content" in result["errors"]
     )
+
+
+def test_spec_kit_skill_hardline_is_fence_aware_and_mirrored() -> None:
+    source_root = REPO_ROOT / ".agents/skills"
+    mirror_root = REPO_ROOT / ".claude/skills"
+    sources = sorted(source_root.glob("speckit-*/SKILL.md"))
+
+    assert len(sources) == 10
+    assert len({path.parent.name for path in sources}) == 10
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        headings, argument_fences = _outside_fence_h2s_and_argument_fences(text)
+        required = [
+            heading for heading in headings if heading in HARDLINE_SKILL_HEADINGS
+        ]
+
+        assert "Overview" not in headings, source
+        assert required[0] == "When to Use", source
+        assert [required.index(heading) for heading in HARDLINE_SKILL_HEADINGS] == list(
+            range(len(HARDLINE_SKILL_HEADINGS))
+        ), source
+        assert argument_fences, source
+        assert all(closed for _line, closed in argument_fences), source
+
+        mirror = mirror_root / source.parent.name / "SKILL.md"
+        assert mirror.read_bytes() == source.read_bytes(), source

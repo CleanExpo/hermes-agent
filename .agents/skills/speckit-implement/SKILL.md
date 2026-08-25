@@ -18,10 +18,6 @@ metadata:
 
 Executes the dependency-ordered tasks for the current feature. It preserves task scope and stops on unresolved blocking prerequisites.
 
-## Overview
-
-Use the generated implementation procedure below as the execution authority.
-
 ## When to Use
 
 Use after the specification, plan, and tasks are ready for implementation.

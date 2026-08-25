@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -548,6 +549,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    singleton might still be cached from a previous test).
     try:
         import hermes_cli.plugins as _plugins_mod
+
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
         # Also clear the keyed per-home manager cache (and any plugin
         # submodules it left in sys.modules) so a manager built for a
@@ -676,6 +678,7 @@ def _capture_real_kanban_root() -> Path:
         # honor it via the normal resolver (it may be a profile dir whose
         # root matters).
         from hermes_constants import get_default_hermes_root
+
         return get_default_hermes_root().resolve()
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
@@ -720,9 +723,7 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
             resolved = Path(db_path).expanduser().resolve()
         else:
             resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
+                _kdb.kanban_db_path(board=kwargs.get("board")).expanduser().resolve()
             )
         try:
             resolved.relative_to(_REAL_KANBAN_ROOT)
@@ -769,12 +770,8 @@ def _state_db_write_guard(request, monkeypatch):
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
     ):
-        extra_roots.append(
-            Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
-        )
-    monkeypatch.setattr(
-        _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
-    )
+        extra_roots.append(Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve())
+    monkeypatch.setattr(_hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots))
     yield
 
 
@@ -1192,7 +1189,10 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # raises AttributeError at timer setup and the whole run aborts before any
     # test executes. Fall back to the thread-based timer on Windows so the
     # suite runs natively there (POSIX keeps the more reliable signal method).
-    if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
+    if (
+        sys.platform == "win32"
+        and getattr(config.option, "timeout_method", None) == "signal"
+    ):
         config.option.timeout_method = "thread"
 
 
@@ -1287,39 +1287,80 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
 
 
 @pytest.fixture
-def owned_process_group_registry():
-    """Track process groups created by the current test process."""
+def owned_process_registry():
+    """Track exact child PIDs captured by test-local spawn primitives."""
     return set()
 
 
 @pytest.fixture
-def register_owned_process_group(owned_process_group_registry):
-    """Register a test-owned process group after proving its ancestry."""
-    import psutil as _psutil
+def owned_process_identity_registry():
+    """Track retained PID and creation-time identities for owned descendants."""
+    return {}
 
-    test_pid = os.getpid()
+
+@pytest.fixture
+def owned_process_group_registry():
+    """Track exact session leaders and their bounded release times."""
+    return {}
+
+
+@pytest.fixture
+def _live_system_signal_primitives():
+    """Retain exact signal primitives so refusal paths can be tested safely."""
+    return {
+        "kill": os.kill,
+        "killpg": getattr(os, "killpg", None),
+    }
+
+
+@pytest.fixture
+def register_owned_process_group(owned_process_registry, owned_process_group_registry):
+    """Register a session leader captured at fork/spawn time."""
 
     def register(pgid: int) -> int:
         candidate = int(pgid)
-        try:
-            process = _psutil.Process(candidate)
-            family = {process.pid, *(parent.pid for parent in process.parents())}
-        except Exception as exc:
+        if candidate not in owned_process_registry:
             raise RuntimeError(
-                f"cannot prove process-group ownership for PGID {candidate}"
-            ) from exc
-        if test_pid not in family:
-            raise RuntimeError(
-                f"PGID {candidate} is outside the current test process subtree"
+                f"PGID {candidate} was not captured as an exact test child"
             )
-        owned_process_group_registry.add(candidate)
+        if os.name != "posix":
+            raise RuntimeError("process-group registration requires POSIX")
+        try:
+            waited_pid, _status = os.waitpid(candidate, os.WNOHANG)
+        except ChildProcessError as exc:
+            raise RuntimeError(f"PGID {candidate} is not a direct child") from exc
+        if waited_pid != 0:
+            raise RuntimeError(f"PGID {candidate} is no longer a live direct child")
+        try:
+            actual_pgid = os.getpgid(candidate)
+        except OSError as exc:
+            raise RuntimeError(f"PGID {candidate} is no longer live") from exc
+        if actual_pgid != candidate:
+            raise RuntimeError(f"PID {candidate} is not its own process-group leader")
+        try:
+            import psutil as _psutil
+
+            leader_created_at = _psutil.Process(candidate).create_time()
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError) as exc:
+            raise RuntimeError(f"PGID {candidate} identity is unavailable") from exc
+        owned_process_group_registry[candidate] = {
+            "leader_created_at": leader_created_at,
+            "released_at": None,
+        }
         return candidate
 
     return register
 
 
 @pytest.fixture(autouse=True)
-def _live_system_guard(request, monkeypatch, owned_process_group_registry):
+def _live_system_guard(
+    request,
+    monkeypatch,
+    owned_process_registry,
+    owned_process_identity_registry,
+    owned_process_group_registry,
+    _live_system_signal_primitives,
+):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
     See block comment above for the why. Tests that genuinely need
@@ -1346,66 +1387,50 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
 
     import os as _os
     import shlex as _shlex
+    import signal as _signal
     import subprocess as _subprocess
 
-    test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
-    try:
-        import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
-    except Exception:
-        _psutil = None
-        _initial_children = set()
+    real_kill = _live_system_signal_primitives["kill"]
 
-    def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
-        if pid == 0:
-            return True
-        if pid < 0:
+    def _is_live_direct_child(pid: int) -> bool:
+        if pid not in owned_process_registry:
             return False
-        if pid == test_pid or pid in _initial_children:
-            return True
-        if _psutil is None:
-            return False
-        try:
-            walker = _psutil.Process(pid)
-        except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
+        if _os.name != "posix":
             return True
         try:
-            for parent in walker.parents():
-                if parent.pid == test_pid:
-                    return True
-        except Exception:
+            waited_pid, _status = _os.waitpid(pid, _os.WNOHANG)
+        except ChildProcessError:
             return False
-        return False
-
-    real_kill = _os.kill
+        return waited_pid == 0
 
     def _belongs_to_owned_process_group(pid: int) -> bool:
         if _os.name != "posix" or pid <= 0:
             return False
+        retained_created_at = owned_process_identity_registry.get(pid)
+        if retained_created_at is not None:
+            try:
+                import psutil as _psutil
+
+                if _psutil.Process(pid).create_time() == retained_created_at:
+                    return True
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                return False
         try:
-            return int(_os.getpgid(pid)) in owned_process_group_registry
+            pgid = int(_os.getpgid(pid))
         except OSError:
             return False
-
-    def _is_stale_or_zombie(pid: int) -> bool:
-        if _psutil is None or pid <= 0:
+        record = owned_process_group_registry.get(pgid)
+        if record is None:
             return False
-        try:
-            return _psutil.Process(pid).status() == _psutil.STATUS_ZOMBIE
-        except _psutil.NoSuchProcess:
+        if _is_live_direct_child(pgid):
             return True
-        except Exception:
+        try:
+            import psutil as _psutil
+
+            candidate_created_at = _psutil.Process(pid).create_time()
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
             return False
+        return owned_process_identity_registry.get(pid) == candidate_created_at
 
     def _guarded_kill(pid, sig, *args, **kwargs):
         # Signal 0 is a pure liveness probe — it cannot terminate anything.
@@ -1413,17 +1438,33 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
         # just-killed grandchild that was reparented to init (zombie with a
         # foreign parent chain) must not trip the guard. Flaked in CI on
         # test_entire_tree_is_sigkilled_not_just_parent.
-        if int(sig) == 0:
+        if int(sig) == 0 and _os.name == "posix":
             return real_kill(pid, sig, *args, **kwargs)
-        if (
-            _is_own_subtree(int(pid))
-            or _belongs_to_owned_process_group(int(pid))
-            or _is_stale_or_zombie(int(pid))
+        if int(sig) == 0:
+            import psutil as _psutil
+
+            if _psutil.pid_exists(int(pid)):
+                return None
+            raise ProcessLookupError(int(pid))
+        candidate = int(pid)
+        if _is_live_direct_child(candidate) or _belongs_to_owned_process_group(
+            candidate
         ):
             return real_kill(pid, sig, *args, **kwargs)
+        if candidate in owned_process_registry:
+            raise ProcessLookupError(candidate)
+        if candidate in owned_process_identity_registry:
+            raise ProcessLookupError(candidate)
+        try:
+            candidate_pgid = _os.getpgid(candidate)
+        except OSError:
+            candidate_pgid = None
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
-            f"{pid}, {sig}) — PID is outside the test process subtree. "
+            f"{pid}, {sig}) — PID was not captured as an exact test child. "
+            f"Observed PGID={candidate_pgid}, registered_group="
+            f"{candidate_pgid in owned_process_group_registry}, "
+            f"retained_identity={candidate in owned_process_identity_registry}. "
             "If this fired in CI it means the test reached a real "
             "kill_gateway_processes / stop_profile_gateway / cmd_update "
             "code path without mocking find_gateway_pids and os.kill. "
@@ -1437,28 +1478,89 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
     # ``os.killpg`` is the same risk class — sends a signal to every
     # process in a group. The gateway is a session leader (its own
     # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # kill of the live process. Allow it only when the target PGID was
+    # explicitly registered from an exact child captured at spawn time.
     if hasattr(_os, "killpg"):
-        real_killpg = _os.killpg
-        own_pgid = _os.getpgrp()
+
+        def real_killpg(pgid, sig, *args, **kwargs):
+            primitive = _live_system_signal_primitives["killpg"]
+            if primitive is None:
+                raise AttributeError("process-group signals are unavailable")
+            return primitive(pgid, sig, *args, **kwargs)
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if (
-                int(pgid) == own_pgid
-                or int(pgid) in owned_process_group_registry
+            candidate = int(pgid)
+            if candidate in owned_process_group_registry and _is_live_direct_child(
+                candidate
             ):
                 return real_killpg(pgid, sig, *args, **kwargs)
+            if candidate in owned_process_group_registry:
+                raise ProcessLookupError(candidate)
+            operation = ".".join(("os", "killpg"))
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
-                "process group. See _live_system_guard for the why."
+                f"{operation}({pgid}, {sig}) — PGID was not registered "
+                "as a test-owned process group. See _live_system_guard "
+                "for the why."
             )
 
         monkeypatch.setattr(_os, "killpg", _guarded_killpg)
+
+    if hasattr(_os, "fork"):
+        real_fork = _os.fork
+
+        def _guarded_fork(*args, **kwargs):
+            child_pid = real_fork(*args, **kwargs)
+            if child_pid > 0:
+                owned_process_registry.add(int(child_pid))
+            return child_pid
+
+        monkeypatch.setattr(_os, "fork", _guarded_fork)
+
+    try:
+        import multiprocessing.process as _multiprocessing_process
+        import psutil as _psutil
+
+        real_process_start = _multiprocessing_process.BaseProcess.start
+
+        def _guarded_process_start(self, *args, **kwargs):
+            result = real_process_start(self, *args, **kwargs)
+            if self.pid is not None:
+                owned_process_registry.add(int(self.pid))
+            return result
+
+        monkeypatch.setattr(
+            _multiprocessing_process.BaseProcess, "start", _guarded_process_start
+        )
+
+        real_process_children = _psutil.Process.children
+
+        def _guarded_process_children(self, *args, **kwargs):
+            descendants = real_process_children(self, *args, **kwargs)
+            record = owned_process_group_registry.get(int(self.pid))
+            if record is None:
+                return descendants
+            try:
+                leader_created_at = self.create_time()
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                return descendants
+            if leader_created_at != record.get("leader_created_at"):
+                return descendants
+            for descendant in descendants:
+                try:
+                    owned_process_identity_registry[int(descendant.pid)] = (
+                        descendant.create_time()
+                    )
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                    continue
+            return descendants
+
+        monkeypatch.setattr(_psutil.Process, "children", _guarded_process_children)
+    except (AttributeError, ImportError):
+        pass
 
     # ── Subprocess command-string inspection (whole-line) ──────────
     _HERMES_TOKENS = (
@@ -1470,16 +1572,38 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
         "hermes gateway",
     )
     _MUTATING_VERBS = (
-        "restart", "start", "stop", "kill", "reload",
-        "reset-failed", "enable", "disable", "mask", "unmask",
-        "daemon-reload", "try-restart", "reload-or-restart",
+        "restart",
+        "start",
+        "stop",
+        "kill",
+        "reload",
+        "reset-failed",
+        "enable",
+        "disable",
+        "mask",
+        "unmask",
+        "daemon-reload",
+        "try-restart",
+        "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
     # Shell/launcher executables whose arguments are themselves commands —
     # argv[0]-only scanning must not exempt what they wrap.
     _WRAPPER_COMMANDS = (
-        "sh", "bash", "zsh", "dash", "env", "nohup", "setsid",
-        "timeout", "sudo", "xargs", "nice", "ionice", "stdbuf", "flock",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "env",
+        "nohup",
+        "setsid",
+        "timeout",
+        "sudo",
+        "xargs",
+        "nice",
+        "ionice",
+        "stdbuf",
+        "flock",
     )
 
     def _cmd_to_string(cmd) -> str:
@@ -1605,6 +1729,7 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
         def _guarded(cmd, *args, **kwargs):
             _check_subprocess_cmd(name, cmd)
             return real(cmd, *args, **kwargs)
+
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
         # the wrapped object is. ``subprocess.Popen[bytes]`` is used as
@@ -1623,8 +1748,40 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                owned_process_registry.add(int(self.pid))
                 if _os.name == "posix" and kwargs.get("start_new_session") is True:
-                    owned_process_group_registry.add(int(self.pid))
+                    try:
+                        import psutil as _psutil
+
+                        leader_created_at = _psutil.Process(self.pid).create_time()
+                    except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                        leader_created_at = None
+                    owned_process_group_registry[int(self.pid)] = {
+                        "leader_created_at": leader_created_at,
+                        "released_at": None,
+                    }
+
+            def _record_group_release(self) -> None:
+                record = owned_process_group_registry.get(int(self.pid))
+                if record is not None and self.returncode is not None:
+                    record["released_at"] = time.time()
+
+            def poll(self):
+                result = super().poll()
+                self._record_group_release()
+                return result
+
+            def wait(self, *args, **kwargs):
+                try:
+                    return super().wait(*args, **kwargs)
+                finally:
+                    self._record_group_release()
+
+            def communicate(self, *args, **kwargs):
+                try:
+                    return super().communicate(*args, **kwargs)
+                finally:
+                    self._record_group_release()
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -1676,6 +1833,7 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
     # pty.spawn — POSIX-only.
     try:
         import pty as _pty
+
         if hasattr(_pty, "spawn"):
             real_pty_spawn = _pty.spawn
 
@@ -1690,13 +1848,12 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
     # asyncio.create_subprocess_* — bypasses subprocess module entirely.
     try:
         import asyncio as _asyncio
+
         real_async_exec = _asyncio.create_subprocess_exec
         real_async_shell = _asyncio.create_subprocess_shell
 
         async def _guarded_async_exec(program, *args, **kwargs):
-            _check_subprocess_cmd(
-                "asyncio.create_subprocess_exec", [program, *args]
-            )
+            _check_subprocess_cmd("asyncio.create_subprocess_exec", [program, *args])
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
@@ -1704,13 +1861,44 @@ def _live_system_guard(request, monkeypatch, owned_process_group_registry):
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
-        monkeypatch.setattr(
-            _asyncio, "create_subprocess_shell", _guarded_async_shell
-        )
+        monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
     except Exception:
         pass
 
-    yield
+    try:
+        yield
+    finally:
+        if _os.name == "posix" and "real_killpg" in locals():
+            for pgid in tuple(owned_process_group_registry):
+                try:
+                    waited_pid, _status = _os.waitpid(pgid, _os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                if waited_pid != 0:
+                    continue
+                try:
+                    real_killpg(pgid, _signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    _os.waitpid(pgid, 0)
+                except ChildProcessError:
+                    pass
+        if _os.name == "posix":
+            for pid in tuple(owned_process_registry):
+                try:
+                    waited_pid, _status = _os.waitpid(pid, _os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                if waited_pid == 0:
+                    try:
+                        real_kill(pid, _signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        _os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
 
 
 @pytest.fixture(autouse=True)

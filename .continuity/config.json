@@ -35,7 +35,8 @@
   ],
   "dependency_identity": {
     "python": ".venv/bin/python",
-    "requirements_lock": ".continuity/ci-requirements.txt"
+    "requirements_lock": ".continuity/ci-requirements.txt",
+    "requirements_sha256": "562549d7b348b8e2338d2034b346e32da9e7d742c3d66933d5d7e7d974caae97"
   },
   "native_observation_policy": {
     "required_surfaces": ["claude", "codex", "hermes"],

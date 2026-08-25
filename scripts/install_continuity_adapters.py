@@ -238,9 +238,12 @@ def _require_canonical_hermes_home(
 def _managed_hermes_hooks(
     repo_root: Path, adapter_contract: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    rendered = yaml.safe_load(
-        render_hermes_config(repo_root, adapter_contract=adapter_contract)
-    ) or {}
+    rendered = (
+        yaml.safe_load(
+            render_hermes_config(repo_root, adapter_contract=adapter_contract)
+        )
+        or {}
+    )
     return dict(rendered.get("hooks") or {})
 
 

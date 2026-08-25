@@ -18,10 +18,6 @@ metadata:
 
 Generates an actionable, dependency-ordered implementation task list. It does not execute or pre-complete generated tasks.
 
-## Overview
-
-Use the generated task procedure below to translate design artifacts into work units.
-
 ## When to Use
 
 Use after planning artifacts are complete and before implementation.

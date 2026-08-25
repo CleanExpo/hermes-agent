@@ -18,10 +18,6 @@ metadata:
 
 Creates or updates a feature specification from the user's stated need. It defines requirements without planning or implementing the solution.
 
-## Overview
-
-Use the generated specification procedure below to establish feature scope and acceptance criteria.
-
 ## When to Use
 
 Use when a feature needs a new or revised specification.

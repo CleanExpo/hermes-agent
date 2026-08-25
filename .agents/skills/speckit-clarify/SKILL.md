@@ -18,10 +18,6 @@ metadata:
 
 Finds material ambiguity and records confirmed answers in the feature specification. It limits questioning to the generated clarification workflow.
 
-## Overview
-
-Use the procedure below to prioritize and resolve specification gaps.
-
 ## When to Use
 
 Use before planning when the current feature specification is underspecified.

@@ -387,9 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         needs_spec = not spec_file.is_file()
         if needs_spec:
             try:
-                template_content = resolve_template_content(
-                    "spec-template", repo_root
-                )
+                template_content = resolve_template_content("spec-template", repo_root)
             except TemplateResolutionError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1

@@ -18,10 +18,6 @@ metadata:
 
 Generates implementation design artifacts from the approved feature specification. It does not execute implementation tasks.
 
-## Overview
-
-Use the generated planning procedure below to apply the project plan template.
-
 ## When to Use
 
 Use after specification clarification and before task generation.

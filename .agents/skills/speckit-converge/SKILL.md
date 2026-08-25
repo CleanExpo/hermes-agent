@@ -18,10 +18,6 @@ metadata:
 
 Compares the built code against feature artifacts and appends verified remaining work. It does not silently rewrite completed tasks or implementation.
 
-## Overview
-
-Use the generated convergence procedure below to identify concrete unbuilt work.
-
 ## When to Use
 
 Use after an implementation pass when specification coverage may be incomplete.

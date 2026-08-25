@@ -18,10 +18,6 @@ metadata:
 
 Converts existing feature tasks into dependency-aware GitHub issue definitions. It does not invent work beyond the current task artifacts.
 
-## Overview
-
-Use the generated conversion procedure below to preserve task identity and dependencies.
-
 ## When to Use
 
 Use when an approved task list must be represented as GitHub issues.

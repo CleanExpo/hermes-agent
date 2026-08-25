@@ -18,10 +18,6 @@ metadata:
 
 Analyzes specification, plan, and task artifacts for internal consistency. It reports findings without modifying those artifacts.
 
-## Overview
-
-Use the generated analysis procedure below as the authority for scope and severity.
-
 ## When to Use
 
 Use after task generation and before implementation begins.
@@ -48,34 +44,6 @@ The current feature directory and optional user focus.
 
 ```text
 $ARGUMENTS
-
-## Outputs
-
-A prioritized, read-only consistency report with artifact references.
-
-## Constraints
-
-Do not modify feature artifacts or invent absent content.
-
-## Failure Handling
-
-Report missing or unreadable prerequisites and stop the affected analysis.
-
-## Examples
-
-Use `$speckit-analyze` after generating `tasks.md`.
-
-## Pitfalls
-
-Do not treat a missing section as an implementation defect without evidence.
-
-## Verification
-
-Confirm every finding cites a current artifact location and the artifacts remain unchanged.
-
-## References
-
-The upstream source template is recorded in frontmatter metadata.
 ```
 
 You **MUST** consider the user input before proceeding (if not empty).
@@ -321,3 +289,31 @@ After reporting, check if `.specify/extensions.yml` exists in the project root.
 ## Context
 
 $ARGUMENTS
+
+## Outputs
+
+A prioritized, read-only consistency report with artifact references.
+
+## Constraints
+
+Do not modify feature artifacts or invent absent content.
+
+## Failure Handling
+
+Report missing or unreadable prerequisites and stop the affected analysis.
+
+## Examples
+
+Use `$speckit-analyze` after generating `tasks.md`.
+
+## Pitfalls
+
+Do not treat a missing section as an implementation defect without evidence.
+
+## Verification
+
+Confirm every finding cites a current artifact location and the artifacts remain unchanged.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

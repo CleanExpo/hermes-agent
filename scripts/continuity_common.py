@@ -1876,6 +1876,15 @@ def receipt_errors(receipt: dict[str, Any], current: GitState) -> list[str]:
             or not dependency_identity[key]
             for key in dependency_keys - {"schema_version", "package_count"}
         )
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", dependency_identity[key]) is None
+            for key in {
+                "requirements_sha256",
+                "python_launcher_sha256",
+                "python_executable_sha256",
+                "packages_sha256",
+            }
+        )
     ):
         errors.append("receipt dependency identity is absent or malformed")
     target = receipt.get("lifecycle_target")

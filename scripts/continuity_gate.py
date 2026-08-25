@@ -393,14 +393,21 @@ def _dependency_identity(config: dict[str, Any], repo_root: Path) -> dict[str, A
     if not isinstance(policy, dict) or set(policy) != {
         "python",
         "requirements_lock",
+        "requirements_sha256",
     }:
         raise ContinuityError("dependency identity policy is absent or malformed")
     python_token = policy.get("python")
     requirements_token = policy.get("requirements_lock")
+    expected_requirements_sha256 = policy.get("requirements_sha256")
     if not isinstance(python_token, str) or not python_token:
         raise ContinuityError("dependency identity Python is invalid")
     if not isinstance(requirements_token, str) or not requirements_token:
         raise ContinuityError("dependency identity requirements lock is invalid")
+    if (
+        not isinstance(expected_requirements_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_requirements_sha256) is None
+    ):
+        raise ContinuityError("dependency identity requirements digest is invalid")
 
     python_path = Path(python_token)
     if not python_path.is_absolute():
@@ -413,6 +420,9 @@ def _dependency_identity(config: dict[str, Any], repo_root: Path) -> dict[str, A
         raise ContinuityError("dependency identity requirements lock is missing")
     if not python_path.exists():
         raise ContinuityError("dependency identity Python is missing")
+    actual_requirements_sha256 = sha256_file(requirements_path)
+    if actual_requirements_sha256 != expected_requirements_sha256:
+        raise ContinuityError("dependency identity requirements digest mismatch")
     resolved_python = python_path.resolve()
     launcher_material = str(python_path)
     if python_path.is_symlink():
@@ -489,6 +499,35 @@ print(json.dumps({"python_version": sys.version, "packages": records}, separator
     version = resolved.get("python_version") if isinstance(resolved, dict) else None
     if not isinstance(packages, list) or not packages or not isinstance(version, str):
         raise ContinuityError("dependency identity probe returned invalid data")
+    package_keys = {
+        "name",
+        "version",
+        "METADATA",
+        "RECORD",
+        "direct_url.json",
+    }
+    if any(
+        not isinstance(item, dict)
+        or set(item) != package_keys
+        or not isinstance(item.get("name"), str)
+        or not item["name"]
+        or not isinstance(item.get("version"), str)
+        or not item["version"]
+        or any(
+            not isinstance(item.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item[field]) is None
+            for field in ("METADATA", "RECORD", "direct_url.json")
+        )
+        for item in packages
+    ):
+        raise ContinuityError(
+            "dependency identity probe returned malformed package records"
+        )
+    package_names = [item["name"] for item in packages]
+    if len(package_names) != len(set(package_names)):
+        raise ContinuityError(
+            "dependency identity probe returned duplicate package records"
+        )
     installed = {
         item.get("name"): item.get("version")
         for item in packages
@@ -505,7 +544,7 @@ print(json.dumps({"python_version": sys.version, "packages": records}, separator
     packages_json = json.dumps(packages, sort_keys=True, separators=(",", ":"))
     return {
         "schema_version": 1,
-        "requirements_sha256": sha256_file(requirements_path),
+        "requirements_sha256": actual_requirements_sha256,
         "python_launcher_sha256": hashlib.sha256(
             launcher_material.encode("utf-8")
         ).hexdigest(),
@@ -1440,6 +1479,7 @@ def static_validate(config_path: Path) -> list[str]:
     if not isinstance(dependency_policy, dict) or set(dependency_policy) != {
         "python",
         "requirements_lock",
+        "requirements_sha256",
     }:
         errors.append("dependency identity policy has an invalid closed schema")
     else:
@@ -1459,6 +1499,17 @@ def static_validate(config_path: Path) -> list[str]:
             or not dependency_policy["python"]
         ):
             errors.append("dependency identity Python is invalid")
+        expected_requirements_sha256 = dependency_policy.get("requirements_sha256")
+        if (
+            not isinstance(expected_requirements_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_requirements_sha256) is None
+        ):
+            errors.append("dependency identity requirements digest is invalid")
+        elif (
+            requirements_path.is_file()
+            and sha256_file(requirements_path) != expected_requirements_sha256
+        ):
+            errors.append("dependency identity requirements digest mismatch")
     for relative in config.get("instructions", []):
         if not (repo_root / relative).is_file():
             errors.append(f"instruction missing: {relative}")

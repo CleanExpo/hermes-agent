@@ -188,8 +188,7 @@ _SAFE_COMPONENT_PATTERN = re.compile(r"[a-z0-9-]+")
 
 def _is_safe_component(value: object) -> bool:
     return (
-        isinstance(value, str)
-        and _SAFE_COMPONENT_PATTERN.fullmatch(value) is not None
+        isinstance(value, str) and _SAFE_COMPONENT_PATTERN.fullmatch(value) is not None
     )
 
 
@@ -261,13 +260,10 @@ def _sorted_extension_ids(extensions_dir: Path) -> list[str]:
         raw_extensions = data.get("extensions", {})
         if not isinstance(raw_extensions, dict):
             raise TemplateResolutionError(
-                f"Invalid extension registry {registry}: "
-                "'extensions' must be a mapping"
+                f"Invalid extension registry {registry}: 'extensions' must be a mapping"
             )
         extensions = raw_extensions
-        registered_ids = {
-            ext_id for ext_id in extensions if isinstance(ext_id, str)
-        }
+        registered_ids = {ext_id for ext_id in extensions if isinstance(ext_id, str)}
 
     ranked: list[tuple[int, str]] = []
     for ext_id, metadata in extensions.items():
@@ -293,9 +289,7 @@ def _sorted_extension_ids(extensions_dir: Path) -> list[str]:
     return [ext_id for _, ext_id in sorted(ranked)]
 
 
-def _conventional_template(
-    base_dir: Path, template_name: str
-) -> Path | None:
+def _conventional_template(base_dir: Path, template_name: str) -> Path | None:
     for candidate in (
         base_dir / "templates" / f"{template_name}.md",
         base_dir / f"{template_name}.md",
@@ -326,9 +320,7 @@ def resolve_template(template_name: str, repo_root: Path) -> Path | None:
     presets_dir = repo_root / ".specify" / "presets"
     if presets_dir.is_dir():
         for preset_id in _sorted_preset_ids(presets_dir):
-            candidate = _conventional_template(
-                presets_dir / preset_id, template_name
-            )
+            candidate = _conventional_template(presets_dir / preset_id, template_name)
             if candidate is not None:
                 return candidate
 
@@ -375,9 +367,7 @@ def _validate_manifest_template_entry(entry: object) -> None:
     if strategy not in _VALID_TEMPLATE_STRATEGIES:
         raise ValueError(f"invalid manifest template strategy '{strategy}'")
     if entry["type"] == "script" and strategy not in _VALID_SCRIPT_STRATEGIES:
-        raise ValueError(
-            f"invalid manifest script strategy '{strategy}'"
-        )
+        raise ValueError(f"invalid manifest script strategy '{strategy}'")
 
 
 def _preset_template_layer(
@@ -424,11 +414,7 @@ def _preset_template_layer(
                 file_value = entry.get("file", "")
                 strategy = entry.get("strategy", "replace")
                 relative = Path(file_value)
-                if (
-                    not relative
-                    or relative.is_absolute()
-                    or ".." in relative.parts
-                ):
+                if not relative or relative.is_absolute() or ".." in relative.parts:
                     return None
                 candidate = preset_dir / relative
                 if not candidate.is_file():
@@ -476,11 +462,7 @@ def resolve_template_content(template_name: str, repo_root: Path) -> str | None:
         return content
 
     override = (
-        repo_root
-        / ".specify"
-        / "templates"
-        / "overrides"
-        / f"{template_name}.md"
+        repo_root / ".specify" / "templates" / "overrides" / f"{template_name}.md"
     )
     if override.is_file():
         layers.append((override, "replace"))

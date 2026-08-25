@@ -66,6 +66,16 @@ jobs:
         uses: ./.github/actions/retry
         with:
           command: uv sync --locked --python 3.11 --extra dev
+      - name: Consume continuity dependency hashes
+        run: >-
+          uv pip install
+          --python .venv/bin/python
+          --no-config
+          --require-hashes
+          --no-deps
+          --reinstall-package PyYAML
+          --reinstall-package psutil
+          -r .continuity/ci-requirements.txt
       - run: .venv/bin/python scripts/install_continuity_adapters.py --repo-root "$PWD" --check
       - run: .venv/bin/python scripts/continuity_gate.py static --config .continuity/config.json
       - run: >-

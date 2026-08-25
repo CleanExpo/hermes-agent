@@ -18,10 +18,6 @@ metadata:
 
 Creates or updates project governance from supplied principles. It does not implement feature or deployment requests.
 
-## Overview
-
-Use the generated procedure below to preserve governance scope and dependent-template compatibility.
-
 ## When to Use
 
 Use when project principles or governance rules must be established or amended.

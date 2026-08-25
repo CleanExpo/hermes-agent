@@ -63,7 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         try:
-            template_content = resolve_template_content("plan-template", paths.repo_root)
+            template_content = resolve_template_content(
+                "plan-template", paths.repo_root
+            )
         except TemplateResolutionError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -76,14 +78,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if json_mode:
         sys.stdout.write(
-            _json_line(
-                {
-                    "FEATURE_SPEC": str(paths.feature_spec),
-                    "IMPL_PLAN": str(paths.impl_plan),
-                    "SPECS_DIR": str(paths.feature_dir),
-                    "BRANCH": paths.current_branch,
-                }
-            )
+            _json_line({
+                "FEATURE_SPEC": str(paths.feature_spec),
+                "IMPL_PLAN": str(paths.impl_plan),
+                "SPECS_DIR": str(paths.feature_dir),
+                "BRANCH": paths.current_branch,
+            })
         )
     else:
         print(f"FEATURE_SPEC: {paths.feature_spec}")
