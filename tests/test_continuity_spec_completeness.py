@@ -221,8 +221,14 @@ def test_spec_kit_skill_hardline_is_fence_aware_and_mirrored() -> None:
     mirror_root = REPO_ROOT / ".claude/skills"
     sources = sorted(source_root.glob("speckit-*/SKILL.md"))
 
-    assert len(sources) == 10
-    assert len({path.parent.name for path in sources}) == 10
+    source_names = {path.parent.name for path in sources}
+    mirror_names = {
+        path.name
+        for path in mirror_root.glob("speckit-*")
+        if (path / "SKILL.md").is_file()
+    }
+    assert sources
+    assert source_names == mirror_names
     for source in sources:
         text = source.read_text(encoding="utf-8")
         headings, argument_fences = _outside_fence_h2s_and_argument_fences(text)

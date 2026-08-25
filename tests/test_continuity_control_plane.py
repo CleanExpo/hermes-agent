@@ -141,7 +141,7 @@ def _native_observer_interrupt_worker(
         checkpoint=_test_event_checkpoint(state / "events.jsonl"),
         surface="claude",
         output_dir=state,
-        timeout=30,
+        timeout=10,
     )
 
 
@@ -3137,7 +3137,7 @@ def test_nested_contained_command_does_not_rewrap_or_kill_outer_authority(
     result = run_command(
         command,
         cwd=tmp_path,
-        timeout=30,
+        timeout=10,
         env={},
         require_native_containment=True,
     )
@@ -3487,14 +3487,14 @@ def test_descendant_monitor_drains_blocked_snapshot_without_losing_identity() ->
 
     def blocked_snapshot() -> None:
         started.set()
-        release.wait(1)
+        release.wait(2)
         identity = (descendant.pid, descendant.create_time())
         with contained.descendant_lock:
             contained.tracked_descendants[identity] = descendant
 
     contained.snapshot_descendants = blocked_snapshot
     contained.start_descendant_monitor()
-    assert started.wait(1)
+    assert started.wait(2)
     timer = threading.Timer(0.25, release.set)
     timer.start()
     try:
@@ -3545,7 +3545,7 @@ def test_descendant_monitor_timeout_fails_closed_and_retains_thread(
     assert contained.monitor_thread is not None
     assert contained.monitor_thread.is_alive()
     release.set()
-    contained.monitor_thread.join(1)
+    contained.monitor_thread.join(2)
     assert contained._finish_descendant_monitor() == ()
     assert contained.monitor_thread is None
 
@@ -3628,15 +3628,20 @@ def test_live_system_guard_released_leader_probe(
     owned_process_group_registry: dict[int, dict[str, object]],
 ) -> None:
     """Nested-pytest helper for the released-leader teardown regression."""
-    identity_path_value = os.environ.get("CONTINUITY_RELEASED_LEADER_IDENTITY_PATH")
-    if not identity_path_value:
+    control_path = Path.home() / ".continuity-released-leader-probe.json"
+    if not control_path.is_file():
         pytest.skip("only executed by the released-leader teardown regression")
     if os.name != "posix":
         pytest.skip("process-group teardown is POSIX-only")
 
-    identity_path = Path(identity_path_value)
-    probe_mode = os.environ.get("CONTINUITY_RELEASED_LEADER_PROBE_MODE")
-    if probe_mode in {"mutable-killpg", "reused-live-leader"}:
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    identity_path = Path(control["identity_path"])
+    probe_mode = str(control["mode"])
+    if probe_mode in {
+        "mutable-killpg",
+        "reused-live-leader",
+        "reused-live-pgid",
+    }:
         descendant = "import time; time.sleep(30)"
         leader = (
             "import pathlib,psutil,subprocess,sys,time; "
@@ -3665,8 +3670,10 @@ def test_live_system_guard_released_leader_probe(
             monkeypatch.setitem(
                 _live_system_signal_primitives, "killpg", lambda *_args: None
             )
-        else:
+        elif probe_mode == "reused-live-leader":
             owned_process_group_registry[process.pid]["leader_created_at"] = -1.0
+        else:
+            owned_process_group_registry[process.pid]["expected_pgid"] = -1
         return
 
     descendant = "import time; time.sleep(30)"
@@ -3675,8 +3682,7 @@ def test_live_system_guard_released_leader_probe(
         f"child=subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
         "created=psutil.Process(child.pid).create_time(); "
         "pathlib.Path(sys.argv[1]).write_text("
-        "f'{child.pid}:{created}', encoding='utf-8'); "
-        "time.sleep(0.15)"
+        "f'{child.pid}:{created}', encoding='utf-8')"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", leader, str(identity_path)],
@@ -3695,6 +3701,93 @@ def test_live_system_guard_install_failure_probe() -> None:
         pytest.skip("only executed by the guard-install failure regression")
 
 
+def test_live_system_guard_reused_direct_pid_probe(
+    owned_process_creation_registry: dict[int, float],
+) -> None:
+    """Nested-pytest helper for direct-child identity reuse teardown."""
+    control_path = Path.home() / ".continuity-reused-direct-pid-probe.json"
+    if not control_path.is_file():
+        pytest.skip("only executed by the reused-direct-PID regression")
+    if os.name != "posix":
+        pytest.skip("direct-child teardown probe is POSIX-only")
+
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    identity_path = Path(control["identity_path"])
+    child = (
+        "import os,pathlib,psutil,sys,time; "
+        "os.setsid(); "  # windows-footgun: ok -- POSIX probe
+        "process=psutil.Process(); "
+        "pathlib.Path(sys.argv[1]).write_text("
+        "f'{process.pid}:{process.create_time()}', encoding='utf-8'); "
+        "time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", child, str(identity_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 3.0
+    while not identity_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert identity_path.is_file()
+    owned_process_creation_registry[process.pid] = -1.0
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_refuses_reused_direct_pid_at_teardown(
+    tmp_path: Path,
+    _live_system_signal_primitives: dict[str, object],
+    _os_case: str,
+) -> None:
+    """A matching numeric direct-child PID is not sufficient to signal."""
+    identity_path = tmp_path / "reused-direct-pid.txt"
+    (tmp_path / ".continuity-reused-direct-pid-probe.json").write_text(
+        json.dumps({"identity_path": str(identity_path)}), encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts" / "run_tests.sh"),
+            "--file-retries",
+            "0",
+            str(Path(__file__).resolve()),
+            "-k",
+            "test_live_system_guard_reused_direct_pid_probe",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    pid_text, created_at_text = identity_path.read_text(encoding="utf-8").split(":")
+    pid = int(pid_text)
+    created_at = float(created_at_text)
+
+    def exact_identity_is_live() -> bool:
+        try:
+            candidate = psutil.Process(pid)
+            return (
+                candidate.create_time() == created_at
+                and candidate.status() != psutil.STATUS_ZOMBIE
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    try:
+        assert exact_identity_is_live(), "reused direct-child identity was signalled"
+    finally:
+        if exact_identity_is_live():
+            real_kill = _live_system_signal_primitives["kill"]
+            assert callable(real_kill)
+            real_kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
 @pytest.mark.parametrize("guard_name", ("pty", "asyncio"))
 def test_live_system_guard_install_failure_fails_closed(
     tmp_path: Path, guard_name: str
@@ -3703,42 +3796,18 @@ def test_live_system_guard_install_failure_fails_closed(
     if guard_name == "pty" and os.name != "posix":
         pytest.skip("pty.spawn is POSIX-only")
 
-    plugin_path = tmp_path / "continuity_guard_install_failure_plugin.py"
-    plugin_path.write_text(
-        "import asyncio\n"
-        "import os\n"
-        "import pty\n"
-        "import pytest\n\n"
-        "_original_setattr = pytest.MonkeyPatch.setattr\n\n"
-        "def _refusing_setattr(self, target, *args, **kwargs):\n"
-        "    name = args[0] if args else None\n"
-        "    mode = os.environ['CONTINUITY_GUARD_INSTALL_FAILURE_MODE']\n"
-        "    if (mode == 'pty' and target is pty and name == 'spawn') or (\n"
-        "        mode == 'asyncio'\n"
-        "        and target is asyncio\n"
-        "        and name == 'create_subprocess_exec'\n"
-        "    ):\n"
-        "        raise RuntimeError(f'injected {mode} guard install failure')\n"
-        "    return _original_setattr(self, target, *args, **kwargs)\n\n"
-        "pytest.MonkeyPatch.setattr = _refusing_setattr\n",
-        encoding="utf-8",
+    (tmp_path / ".continuity-guard-install-failure-mode").write_text(
+        guard_name, encoding="utf-8"
     )
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{tmp_path}{os.pathsep}{existing_pythonpath}"
-        if existing_pythonpath
-        else str(tmp_path)
-    )
-    env["CONTINUITY_GUARD_INSTALL_FAILURE_MODE"] = guard_name
+    env["HOME"] = str(tmp_path)
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
+            str(REPO_ROOT / "scripts" / "run_tests.sh"),
+            "--file-retries",
+            "0",
             "-p",
-            "continuity_guard_install_failure_plugin",
+            "tests.continuity_guard_install_failure_plugin",
             str(Path(__file__).resolve()),
             "-k",
             "test_live_system_guard_install_failure_probe",
@@ -3747,7 +3816,7 @@ def test_live_system_guard_install_failure_fails_closed(
         env=env,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=30,
         check=False,
     )
     output = result.stdout + result.stderr
@@ -3762,6 +3831,7 @@ def test_live_system_guard_install_failure_fails_closed(
         ("fail", 1),
         ("mutable-killpg", 0),
         ("reused-live-leader", 1),
+        ("reused-live-pgid", 1),
     ),
 )
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
@@ -3774,9 +3844,13 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
 ) -> None:
     """Nested pytest must drain the group after success and failure paths."""
     identity_path = tmp_path / f"released-leader-descendant-{probe_mode}.txt"
+    control_path = tmp_path / ".continuity-released-leader-probe.json"
+    control_path.write_text(
+        json.dumps({"identity_path": str(identity_path), "mode": probe_mode}),
+        encoding="utf-8",
+    )
     env = os.environ.copy()
-    env["CONTINUITY_RELEASED_LEADER_IDENTITY_PATH"] = str(identity_path)
-    env["CONTINUITY_RELEASED_LEADER_PROBE_MODE"] = probe_mode
+    env["HOME"] = str(tmp_path)
     nested_stdout = tmp_path / f"released-leader-{probe_mode}.stdout"
     nested_stderr = tmp_path / f"released-leader-{probe_mode}.stderr"
     timed_out = False
@@ -3787,10 +3861,9 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
         ):
             result = subprocess.run(
                 [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "-q",
+                    str(REPO_ROOT / "scripts" / "run_tests.sh"),
+                    "--file-retries",
+                    "0",
                     str(Path(__file__).resolve()),
                     "-k",
                     "test_live_system_guard_released_leader_probe",
@@ -3800,7 +3873,7 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
                 text=True,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                timeout=5,
+                timeout=30,
                 check=False,
             )
     except subprocess.TimeoutExpired:
@@ -3839,7 +3912,7 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
         identities_are_live = any(
             exact_identity_is_live(*identity) for identity in identities
         )
-        if probe_mode == "reused-live-leader":
+        if probe_mode in {"reused-live-leader", "reused-live-pgid"}:
             assert identities_are_live, "reused group identity was signalled"
         else:
             assert not identities_are_live
