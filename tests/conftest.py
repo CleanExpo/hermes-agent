@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1300,7 +1301,7 @@ def owned_process_identity_registry():
 
 @pytest.fixture
 def owned_process_group_registry():
-    """Track exact session leaders and their bounded release times."""
+    """Track exact session leaders and authenticated descendant monitors."""
     return {}
 
 
@@ -1345,7 +1346,6 @@ def register_owned_process_group(owned_process_registry, owned_process_group_reg
             raise RuntimeError(f"PGID {candidate} identity is unavailable") from exc
         owned_process_group_registry[candidate] = {
             "leader_created_at": leader_created_at,
-            "released_at": None,
         }
         return candidate
 
@@ -1391,16 +1391,90 @@ def _live_system_guard(
     import subprocess as _subprocess
 
     real_kill = _live_system_signal_primitives["kill"]
+    teardown_killpg = getattr(_os, "killpg", None)
     real_waitpid = getattr(_os, "waitpid", None)
     real_getpgid = getattr(_os, "getpgid", None)
     try:
         import psutil as _teardown_psutil
 
         real_psutil_process = _teardown_psutil.Process
-        real_psutil_process_iter = _teardown_psutil.process_iter
+        real_psutil_children = _teardown_psutil.Process.children
     except ImportError:
         real_psutil_process = None
-        real_psutil_process_iter = None
+        real_psutil_children = None
+
+    def _start_owned_group_monitor(pgid: int, record: dict) -> None:
+        """Track exact descendants while their original ancestry is provable."""
+        if real_psutil_process is None or real_psutil_children is None:
+            raise RuntimeError("psutil is required for owned process-group monitoring")
+
+        stop_event = threading.Event()
+        descendant_identities: dict[int, float] = {}
+        record["monitor_stop"] = stop_event
+        record["descendant_identities"] = descendant_identities
+        record["monitor_error"] = None
+
+        def snapshot() -> None:
+            roots = []
+            try:
+                leader = real_psutil_process(pgid)
+                if leader.create_time() == record.get("leader_created_at"):
+                    roots.append(leader)
+            except (
+                _teardown_psutil.NoSuchProcess,
+                _teardown_psutil.AccessDenied,
+                OSError,
+            ):
+                pass
+            for pid, created_at in tuple(descendant_identities.items()):
+                try:
+                    candidate = real_psutil_process(pid)
+                    if candidate.create_time() == created_at:
+                        roots.append(candidate)
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    continue
+            for root in roots:
+                try:
+                    descendants = real_psutil_children(root, recursive=True)
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    continue
+                for descendant in descendants:
+                    try:
+                        pid = int(descendant.pid)
+                        created_at = float(descendant.create_time())
+                    except (
+                        _teardown_psutil.NoSuchProcess,
+                        _teardown_psutil.AccessDenied,
+                        OSError,
+                    ):
+                        continue
+                    descendant_identities[pid] = created_at
+                    owned_process_identity_registry[pid] = created_at
+
+        def monitor() -> None:
+            try:
+                while not stop_event.is_set():
+                    snapshot()
+                    stop_event.wait(0.01)
+                snapshot()
+            except Exception as exc:
+                record["monitor_error"] = repr(exc)
+
+        monitor_thread = threading.Thread(
+            target=monitor,
+            name=f"live-system-group-{pgid}",
+            daemon=True,
+        )
+        record["monitor_thread"] = monitor_thread
+        monitor_thread.start()
 
     def _is_live_direct_child(pid: int) -> bool:
         if pid not in owned_process_registry:
@@ -1768,30 +1842,10 @@ def _live_system_guard(
                         leader_created_at = None
                     owned_process_group_registry[int(self.pid)] = {
                         "leader_created_at": leader_created_at,
-                        "released_at": None,
                     }
-
-            def _record_group_release(self) -> None:
-                record = owned_process_group_registry.get(int(self.pid))
-                if record is not None and self.returncode is not None:
-                    record["released_at"] = time.time()
-
-            def poll(self):
-                result = super().poll()
-                self._record_group_release()
-                return result
-
-            def wait(self, *args, **kwargs):
-                try:
-                    return super().wait(*args, **kwargs)
-                finally:
-                    self._record_group_release()
-
-            def communicate(self, *args, **kwargs):
-                try:
-                    return super().communicate(*args, **kwargs)
-                finally:
-                    self._record_group_release()
+                    _start_owned_group_monitor(
+                        int(self.pid), owned_process_group_registry[int(self.pid)]
+                    )
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -1843,22 +1897,23 @@ def _live_system_guard(
     # pty.spawn — POSIX-only.
     try:
         import pty as _pty
+    except ImportError:
+        _pty = None
+    if _pty is not None and hasattr(_pty, "spawn"):
+        real_pty_spawn = _pty.spawn
 
-        if hasattr(_pty, "spawn"):
-            real_pty_spawn = _pty.spawn
+        def _guarded_pty_spawn(argv, *args, **kwargs):
+            _check_subprocess_cmd("pty.spawn", argv)
+            return real_pty_spawn(argv, *args, **kwargs)
 
-            def _guarded_pty_spawn(argv, *args, **kwargs):
-                _check_subprocess_cmd("pty.spawn", argv)
-                return real_pty_spawn(argv, *args, **kwargs)
-
-            monkeypatch.setattr(_pty, "spawn", _guarded_pty_spawn)
-    except Exception:
-        pass
+        monkeypatch.setattr(_pty, "spawn", _guarded_pty_spawn)
 
     # asyncio.create_subprocess_* — bypasses subprocess module entirely.
     try:
         import asyncio as _asyncio
-
+    except ImportError:
+        _asyncio = None
+    if _asyncio is not None:
         real_async_exec = _asyncio.create_subprocess_exec
         real_async_shell = _asyncio.create_subprocess_shell
 
@@ -1872,71 +1927,31 @@ def _live_system_guard(
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
-    except Exception:
-        pass
 
     try:
         yield
     finally:
 
-        def _retain_released_group_members(pgid, record):
-            """Bind surviving group members to exact identities before cleanup.
-
-            A session leader may already have been waited on while one of its
-            descendants keeps the original process group alive.  In that case
-            ``waitpid`` can no longer authenticate the group through the direct
-            child relationship.  A live process at the leader PID with a
-            different creation time proves the numeric PGID was reused, so the
-            group must not be touched.  If the original leader PID is absent,
-            POSIX cannot create a new group with that orphaned PGID; remaining
-            members are descendants of the registered group and are retained
-            by PID plus creation time for exact-identity signalling below.
-            """
-            if (
-                real_getpgid is None
-                or real_psutil_process is None
-                or real_psutil_process_iter is None
-            ):
-                pytest.fail(
-                    "tests/conftest.py live-system guard cannot authenticate "
-                    f"released process group {pgid}"
-                )
-            try:
-                leader = real_psutil_process(pgid)
-                if leader.create_time() != record.get("leader_created_at"):
-                    return
-            except _teardown_psutil.NoSuchProcess:
-                pass
-            except (_teardown_psutil.AccessDenied, OSError) as exc:
-                pytest.fail(
-                    "tests/conftest.py live-system guard cannot authenticate "
-                    f"released process group {pgid}: {exc}"
-                )
-
-            try:
-                candidates = tuple(real_psutil_process_iter(["pid", "create_time"]))
-            except (OSError, PermissionError) as exc:
-                pytest.fail(
-                    "tests/conftest.py live-system guard cannot enumerate "
-                    f"released process group {pgid}: {exc}"
-                )
-            for candidate in candidates:
-                pid = int(candidate.info["pid"])
-                if pid == pgid:
+        def _stop_group_monitors() -> None:
+            for record in owned_process_group_registry.values():
+                stop_event = record.get("monitor_stop")
+                if isinstance(stop_event, threading.Event):
+                    stop_event.set()
+            for pgid, record in owned_process_group_registry.items():
+                monitor_thread = record.get("monitor_thread")
+                if not isinstance(monitor_thread, threading.Thread):
                     continue
-                try:
-                    if int(real_getpgid(pid)) != pgid:
-                        continue
-                    created_at = candidate.info.get("create_time")
-                    if created_at is None:
-                        created_at = candidate.create_time()
-                except (
-                    _teardown_psutil.NoSuchProcess,
-                    _teardown_psutil.AccessDenied,
-                    OSError,
-                ):
-                    continue
-                owned_process_identity_registry[pid] = float(created_at)
+                monitor_thread.join(timeout=2.0)
+                if monitor_thread.is_alive():
+                    pytest.fail(
+                        "tests/conftest.py live-system guard descendant monitor "
+                        f"did not stop for process group {pgid}"
+                    )
+                if record.get("monitor_error") is not None:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard descendant monitor "
+                        f"failed for process group {pgid}: {record['monitor_error']}"
+                    )
 
         def _kill_retained_identities():
             """Kill only descendants whose PID and creation time still match."""
@@ -1982,18 +1997,44 @@ def _live_system_guard(
                     + ", ".join(str(pid) for pid in sorted(pending))
                 )
 
-        if _os.name == "posix" and "real_killpg" in locals():
+        _stop_group_monitors()
+        if _os.name == "posix" and teardown_killpg is not None:
             for pgid, record in tuple(owned_process_group_registry.items()):
                 try:
                     waited_pid, _status = real_waitpid(pgid, _os.WNOHANG)
                 except ChildProcessError:
-                    _retain_released_group_members(pgid, record)
                     continue
                 if waited_pid != 0:
-                    _retain_released_group_members(pgid, record)
                     continue
                 try:
-                    real_killpg(pgid, _signal.SIGKILL)
+                    leader = real_psutil_process(pgid)
+                    leader_created_at = leader.create_time()
+                except _teardown_psutil.NoSuchProcess:
+                    continue
+                except (_teardown_psutil.AccessDenied, OSError) as exc:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard cannot authenticate "
+                        f"live process-group leader {pgid}: {exc}"
+                    )
+                if leader_created_at != record.get("leader_created_at"):
+                    pytest.fail(
+                        "tests/conftest.py live-system guard refused reused live "
+                        f"process-group leader {pgid}"
+                    )
+                try:
+                    actual_pgid = real_getpgid(pgid)
+                except OSError as exc:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard cannot resolve live "
+                        f"process-group leader {pgid}: {exc}"
+                    )
+                if actual_pgid != pgid:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard refused non-leader "
+                        f"process group {pgid}"
+                    )
+                try:
+                    teardown_killpg(pgid, _signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 try:
