@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import pty
+import os
 from pathlib import Path
 
 import pytest
@@ -13,10 +13,14 @@ _MODE_PATH = Path.home() / ".continuity-guard-install-failure-mode"
 if _MODE_PATH.is_file():
     _MODE = _MODE_PATH.read_text(encoding="utf-8").strip()
     _ORIGINAL_SETATTR = pytest.MonkeyPatch.setattr
+    if _MODE == "pty" and os.name == "posix":
+        import pty as _pty
+    else:
+        _pty = None
 
     def _refusing_setattr(self, target, *args, **kwargs):
         name = args[0] if args else None
-        if (_MODE == "pty" and target is pty and name == "spawn") or (
+        if (_MODE == "pty" and target is _pty and name == "spawn") or (
             _MODE == "asyncio"
             and target is asyncio
             and name == "create_subprocess_exec"

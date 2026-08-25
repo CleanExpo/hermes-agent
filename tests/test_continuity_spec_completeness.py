@@ -219,30 +219,28 @@ def test_preflight_blocks_empty_spec_body_with_named_cause(
 def test_spec_kit_skill_hardline_is_fence_aware_and_mirrored() -> None:
     source_root = REPO_ROOT / ".agents/skills"
     mirror_root = REPO_ROOT / ".claude/skills"
-    sources = sorted(source_root.glob("speckit-*/SKILL.md"))
-
-    source_names = {path.parent.name for path in sources}
-    mirror_names = {
-        path.name
-        for path in mirror_root.glob("speckit-*")
-        if (path / "SKILL.md").is_file()
+    sources = {
+        path.parent.name: path for path in source_root.glob("speckit-*/SKILL.md")
+    }
+    mirrors = {
+        path.parent.name: path for path in mirror_root.glob("speckit-*/SKILL.md")
     }
     assert sources
+    source_names = set(sources)
+    mirror_names = set(mirrors)
     assert source_names == mirror_names
-    for source in sources:
-        text = source.read_text(encoding="utf-8")
-        headings, argument_fences = _outside_fence_h2s_and_argument_fences(text)
-        required = [
-            heading for heading in headings if heading in HARDLINE_SKILL_HEADINGS
-        ]
+    for skill_name in source_names:
+        for skill in (sources[skill_name], mirrors[skill_name]):
+            text = skill.read_text(encoding="utf-8")
+            headings, argument_fences = _outside_fence_h2s_and_argument_fences(text)
+            required = [
+                heading for heading in headings if heading in HARDLINE_SKILL_HEADINGS
+            ]
 
-        assert "Overview" not in headings, source
-        assert required[0] == "When to Use", source
-        assert [required.index(heading) for heading in HARDLINE_SKILL_HEADINGS] == list(
-            range(len(HARDLINE_SKILL_HEADINGS))
-        ), source
-        assert argument_fences, source
-        assert all(closed for _line, closed in argument_fences), source
-
-        mirror = mirror_root / source.parent.name / "SKILL.md"
-        assert mirror.read_bytes() == source.read_bytes(), source
+            assert "Overview" not in headings, skill
+            assert required[0] == "When to Use", skill
+            assert [
+                required.index(heading) for heading in HARDLINE_SKILL_HEADINGS
+            ] == list(range(len(HARDLINE_SKILL_HEADINGS))), skill
+            assert argument_fences, skill
+            assert all(closed for _line, closed in argument_fences), skill

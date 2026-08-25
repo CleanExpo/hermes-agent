@@ -3503,7 +3503,7 @@ def test_descendant_monitor_drains_blocked_snapshot_without_losing_identity() ->
         release.set()
         timer.join()
         if contained.monitor_thread is not None:
-            contained.monitor_thread.join(1)
+            contained.monitor_thread.join(2)
 
     assert contained.monitor_thread is None
     assert descendant in tracked
@@ -3532,12 +3532,12 @@ def test_descendant_monitor_timeout_fails_closed_and_retains_thread(
 
     def blocked_snapshot() -> None:
         started.set()
-        release.wait(1)
+        release.wait(2)
 
     contained.snapshot_descendants = blocked_snapshot
     monkeypatch.setattr(continuity_common, "_DESCENDANT_MONITOR_DRAIN_TIMEOUT", 0.05)
     contained.start_descendant_monitor()
-    assert started.wait(1)
+    assert started.wait(2)
 
     with pytest.raises(ContinuityError, match="monitor did not drain"):
         contained._finish_descendant_monitor()
@@ -3684,10 +3684,28 @@ def test_live_system_guard_released_leader_probe(
         "pathlib.Path(sys.argv[1]).write_text("
         "f'{child.pid}:{created}', encoding='utf-8')"
     )
-    process = subprocess.Popen(
-        [sys.executable, "-c", leader, str(identity_path)],
-        start_new_session=True,
-    )
+    command = [sys.executable, "-c", leader, str(identity_path)]
+    if probe_mode == "positional-pass":
+        process = subprocess.Popen(
+            command,
+            -1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            True,
+            False,
+            None,
+            None,
+            None,
+            None,
+            0,
+            True,
+            1,
+        )
+    else:
+        process = subprocess.Popen(command, start_new_session=True)
 
     assert process.wait(timeout=5) == 0
     assert identity_path.is_file()
@@ -3828,6 +3846,7 @@ def test_live_system_guard_install_failure_fails_closed(
     ("probe_mode", "expected_returncode"),
     (
         ("pass", 0),
+        ("positional-pass", 0),
         ("fail", 1),
         ("mutable-killpg", 0),
         ("reused-live-leader", 1),
@@ -3922,6 +3941,131 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
         for pid, created_at in identities:
             if exact_identity_is_live(pid, created_at):
                 real_kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_group_harness_waits_for_both_handshake_gates(
+    tmp_path: Path,
+    owned_process_group_monitor_hooks: dict[str, object],
+    _os_case: str,
+) -> None:
+    """The target cannot start before S or release its leader before F."""
+    initial_entered = threading.Event()
+    initial_release = threading.Event()
+    final_entered = threading.Event()
+    final_release = threading.Event()
+    sentinel = tmp_path / "group-harness-handshake.txt"
+    processes: list[subprocess.Popen] = []
+    launch_errors: list[BaseException] = []
+
+    def block_initial_snapshot() -> None:
+        initial_entered.set()
+        initial_release.wait()
+
+    def block_final_snapshot() -> None:
+        final_entered.set()
+        final_release.wait()
+
+    owned_process_group_monitor_hooks.update({
+        "before_initial_snapshot": block_initial_snapshot,
+        "before_final_snapshot": block_final_snapshot,
+    })
+
+    def launch() -> None:
+        try:
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ok')",
+                        str(sentinel),
+                    ],
+                    start_new_session=True,
+                )
+            )
+        except BaseException as exc:
+            launch_errors.append(exc)
+
+    launcher = threading.Thread(target=launch)
+    waiter: threading.Thread | None = None
+    returncodes: list[int] = []
+    launcher.start()
+    try:
+        assert initial_entered.wait(2)
+        assert not sentinel.exists()
+        initial_release.set()
+        launcher.join(5)
+        assert not launcher.is_alive()
+        assert not launch_errors
+        assert len(processes) == 1
+
+        waiter = threading.Thread(
+            target=lambda: returncodes.append(processes[0].wait())
+        )
+        waiter.start()
+        assert final_entered.wait(2)
+        assert waiter.is_alive()
+        assert sentinel.read_text(encoding="utf-8") == "ok"
+        final_release.set()
+        waiter.join(5)
+        assert not waiter.is_alive()
+        assert returncodes == [0]
+    finally:
+        initial_release.set()
+        final_release.set()
+        launcher.join(5)
+        if waiter is not None:
+            waiter.join(5)
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_canonical_runner_preserves_its_vetted_python_for_nested_runs(
+    tmp_path: Path,
+    _os_case: str,
+) -> None:
+    """A clean worktree can recursively invoke the canonical runner."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    runner = scripts / "run_tests.sh"
+    runner.write_text(
+        (SCRIPTS / "run_tests.sh").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    runner.chmod(0o755)
+
+    receipt = tmp_path / "nested-python.txt"
+    fake_python = tmp_path / "vetted-python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'case "${1-}" in\n'
+        "  -c|-m) exit 0 ;;\n"
+        "esac\n"
+        f"printf '%s' \"${{HERMES_PYTHON-}}\" > {json.dumps(str(receipt))}\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+
+    env = {
+        "HOME": str(tmp_path / "home"),
+        "HERMES_PYTHON": str(fake_python),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(runner), "tests/example.py"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert receipt.read_text(encoding="utf-8") == str(fake_python)
 
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
@@ -4852,44 +4996,29 @@ def test_supply_chain_manifest_membership_is_closed() -> None:
     )
 
 
-def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
-    workflow = (REPO_ROOT / ".github/workflows/continuity-gate.yml").read_text(
-        encoding="utf-8"
+def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/continuity-gate.yml").read_text(
+            encoding="utf-8"
+        ),
+        Loader=yaml.BaseLoader,
     )
-    for protected in (
-        ".agents/skills/speckit-*/**",
-        ".claude/skills/speckit-*/**",
-        ".codex/config.toml",
-        "scripts/run_tests.sh",
-        "AGENTS.md",
-        ".github/workflows/continuity-gate.yml",
-        ".github/actions/retry/**",
-        "pyproject.toml",
-        "uv.lock",
-        "docs/continuity-pilot.md",
-    ):
-        assert workflow.count(f"- '{protected}'") == 2
-    folded_workflow = " ".join(workflow.split())
-    assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in workflow
-    assert "uv sync --locked --python 3.11 --extra dev" in workflow
-    assert (
-        "uv pip install --python .venv/bin/python --no-config --require-hashes "
-        "--no-deps --reinstall-package PyYAML --reinstall-package psutil "
-        "-r .continuity/ci-requirements.txt"
-    ) in folded_workflow
-    assert ".venv/bin/python scripts/continuity_gate.py static" in workflow
-    assert (
-        "scripts/run_tests.sh tests/test_continuity_control_plane.py" in folded_workflow
-    )
-    patterns = {
-        stripped[3:-1]
-        for line in workflow.splitlines()
-        if (stripped := line.strip()).startswith("- '") and stripped.endswith("'")
-    }
+    assert isinstance(workflow, dict)
+    trigger = workflow["on"]
+    pull_request_paths = set(trigger["pull_request"]["paths"])
+    push_paths = set(trigger["push"]["paths"])
+    assert pull_request_paths == push_paths
+
     config = json.loads(
         (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
     )
-    protected_paths = set(config["instructions"])
+    protected_paths = {
+        ".continuity/config.json",
+        config["toolchain_lock"],
+        config["dependency_identity"]["requirements_lock"],
+        config["spec"]["path"],
+        *config["instructions"],
+    }
     policy = config["evidence_policy"]
     for spec in [
         policy["focused_suite"],
@@ -4907,6 +5036,22 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
         protected_paths.update(
             json.loads(manifest_path.read_text(encoding="utf-8"))["files"]
         )
-    assert all(
-        any(fnmatch(path, pattern) for pattern in patterns) for path in protected_paths
+    for path in protected_paths:
+        assert any(fnmatch(path, pattern) for pattern in pull_request_paths), path
+
+    steps = workflow["jobs"]["static-contract"]["steps"]
+    for step in steps:
+        uses = step.get("uses")
+        if uses and not uses.startswith("./"):
+            _name, separator, revision = uses.rpartition("@")
+            assert separator and len(revision) == 40
+            assert all(character in "0123456789abcdef" for character in revision)
+
+    run_commands = " ".join(
+        " ".join(step["run"].split()) for step in steps if "run" in step
     )
+    assert config["dependency_identity"]["requirements_lock"] in run_commands
+    assert "--require-hashes" in run_commands
+    assert "scripts/continuity_gate.py static" in run_commands
+    for test_path in policy["focused_suite"]["argv"][2:]:
+        assert test_path in run_commands

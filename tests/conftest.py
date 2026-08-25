@@ -21,6 +21,7 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import inspect
 import json
 import os
 import shutil
@@ -1313,6 +1314,12 @@ def owned_process_group_registry():
 
 
 @pytest.fixture
+def owned_process_group_monitor_hooks():
+    """Expose deterministic test-only gates around the group handshake."""
+    return {}
+
+
+@pytest.fixture
 def _live_system_signal_primitives():
     """Retain exact signal primitives so refusal paths can be tested safely."""
     return {
@@ -1368,6 +1375,7 @@ def _live_system_guard(
     owned_process_identity_registry,
     owned_process_creation_registry,
     owned_process_group_registry,
+    owned_process_group_monitor_hooks,
     _live_system_signal_primitives,
 ):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
@@ -1531,6 +1539,11 @@ def _live_system_guard(
 
         def monitor() -> None:
             try:
+                before_initial_snapshot = owned_process_group_monitor_hooks.get(
+                    "before_initial_snapshot"
+                )
+                if callable(before_initial_snapshot):
+                    before_initial_snapshot()
                 if not snapshot_descendants():
                     raise RuntimeError(
                         f"process-group leader {pgid} was not authenticated at startup"
@@ -1543,6 +1556,13 @@ def _live_system_guard(
                         if readable:
                             marker = real_os_read(done_read, 1)
                             if marker == b"D":
+                                before_final_snapshot = (
+                                    owned_process_group_monitor_hooks.get(
+                                        "before_final_snapshot"
+                                    )
+                                )
+                                if callable(before_final_snapshot):
+                                    before_final_snapshot()
                                 if not snapshot_group():
                                     raise RuntimeError(
                                         f"process-group leader {pgid} vanished before "
@@ -1951,6 +1971,7 @@ def _live_system_guard(
     def _wrap_popen():
         """Subclass Popen so isinstance checks AND Popen[bytes] still work."""
         real = _subprocess.Popen
+        popen_signature = inspect.signature(real)
         group_harness = (
             "import json,os,signal,subprocess,sys,traceback\n"
             "control_read=int(sys.argv[1]); done_write=int(sys.argv[2])\n"
@@ -1988,9 +2009,12 @@ def _live_system_guard(
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
-                use_group_harness = (
-                    _os.name == "posix" and kwargs.get("start_new_session") is True
+                bound = popen_signature.bind_partial(cmd, *args, **kwargs)
+                call_arguments = dict(bound.arguments)
+                bound_cmd = call_arguments.pop("args")
+                _check_subprocess_cmd("Popen", bound_cmd)
+                use_group_harness = _os.name == "posix" and bool(
+                    call_arguments.get("start_new_session", False)
                 )
                 if not use_group_harness:
                     super().__init__(cmd, *args, **kwargs)
@@ -1999,19 +2023,19 @@ def _live_system_guard(
 
                 control_read, control_write = _os.pipe()
                 done_read, done_write = _os.pipe()
-                original_pass_fds = tuple(kwargs.get("pass_fds", ()))
+                original_pass_fds = tuple(call_arguments.get("pass_fds", ()))
                 payload = {
-                    "cmd": normalize_command(cmd),
-                    "shell": bool(kwargs.get("shell", False)),
+                    "cmd": normalize_command(bound_cmd),
+                    "shell": bool(call_arguments.get("shell", False)),
                     "executable": (
-                        _os.fsdecode(kwargs["executable"])
-                        if kwargs.get("executable") is not None
+                        _os.fsdecode(call_arguments["executable"])
+                        if call_arguments.get("executable") is not None
                         else None
                     ),
-                    "close_fds": bool(kwargs.get("close_fds", True)),
+                    "close_fds": bool(call_arguments.get("close_fds", True)),
                     "pass_fds": [int(fd) for fd in original_pass_fds],
                 }
-                harness_kwargs = dict(kwargs)
+                harness_kwargs = dict(call_arguments)
                 harness_kwargs["shell"] = False
                 harness_kwargs.pop("executable", None)
                 harness_kwargs["close_fds"] = True
@@ -2027,7 +2051,7 @@ def _live_system_guard(
                     json.dumps(payload, separators=(",", ":")),
                 ]
                 try:
-                    super().__init__(harness_cmd, *args, **harness_kwargs)
+                    super().__init__(harness_cmd, **harness_kwargs)
                 except BaseException:
                     for descriptor in (
                         control_read,
