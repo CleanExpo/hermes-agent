@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 
 import pytest
 
 
-_MODE_PATH = Path.home() / ".continuity-guard-install-failure-mode"
-if _MODE_PATH.is_file():
-    _MODE = _MODE_PATH.read_text(encoding="utf-8").strip()
+_MODE = os.environ.get("CONTINUITY_GUARD_INSTALL_FAILURE_MODE", "").strip()
+if _MODE:
     _ORIGINAL_SETATTR = pytest.MonkeyPatch.setattr
     if _MODE == "pty" and os.name == "posix":
         import pty as _pty

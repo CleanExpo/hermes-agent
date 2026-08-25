@@ -67,6 +67,10 @@ POSIX_CASES = (
     pytest.param("linux", marks=pytest.mark.linux_only),
     pytest.param("macos", marks=pytest.mark.macos_only),
 )
+NATIVE_OS_CASES = (
+    *POSIX_CASES,
+    pytest.param("windows", marks=pytest.mark.windows_only),
+)
 SPECIAL_LEAF_CASES = (
     pytest.param("symlink", marks=pytest.mark.require_symlinks),
     pytest.param("fifo", id="fifo-linux", marks=pytest.mark.linux_only),
@@ -3626,6 +3630,7 @@ def test_live_system_guard_released_leader_probe(
     monkeypatch: pytest.MonkeyPatch,
     _live_system_signal_primitives: dict[str, object],
     owned_process_group_registry: dict[int, dict[str, object]],
+    owned_process_group_monitor_hooks: dict[str, object],
 ) -> None:
     """Nested-pytest helper for the released-leader teardown regression."""
     control_path = Path.home() / ".continuity-released-leader-probe.json"
@@ -3685,6 +3690,8 @@ def test_live_system_guard_released_leader_probe(
         "f'{child.pid}:{created}', encoding='utf-8')"
     )
     command = [sys.executable, "-c", leader, str(identity_path)]
+    if probe_mode == "closed-final-ack":
+        owned_process_group_monitor_hooks["write_final_ack"] = os.close
     if probe_mode == "positional-pass":
         process = subprocess.Popen(
             command,
@@ -3704,6 +3711,8 @@ def test_live_system_guard_released_leader_probe(
             True,
             1,
         )
+    elif probe_mode == "keyword-args-pass":
+        process = subprocess.Popen(args=command, start_new_session=1)
     else:
         process = subprocess.Popen(command, start_new_session=True)
 
@@ -3765,6 +3774,7 @@ def test_live_system_guard_refuses_reused_direct_pid_at_teardown(
     )
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
+    env["HERMES_TEST_SKIP_PRECOMPILE"] = "1"
     result = subprocess.run(
         [
             str(REPO_ROOT / "scripts" / "run_tests.sh"),
@@ -3806,19 +3816,11 @@ def test_live_system_guard_refuses_reused_direct_pid_at_teardown(
             real_kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
-@pytest.mark.parametrize("guard_name", ("pty", "asyncio"))
-def test_live_system_guard_install_failure_fails_closed(
-    tmp_path: Path, guard_name: str
-) -> None:
-    """Unexpected monkeypatch wiring errors must fail fixture setup."""
-    if guard_name == "pty" and os.name != "posix":
-        pytest.skip("pty.spawn is POSIX-only")
-
-    (tmp_path / ".continuity-guard-install-failure-mode").write_text(
-        guard_name, encoding="utf-8"
-    )
+def _assert_live_system_guard_install_failure(tmp_path: Path, guard_name: str) -> None:
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
+    env["HERMES_TEST_SKIP_PRECOMPILE"] = "1"
+    env["CONTINUITY_GUARD_INSTALL_FAILURE_MODE"] = guard_name
     result = subprocess.run(
         [
             str(REPO_ROOT / "scripts" / "run_tests.sh"),
@@ -3842,11 +3844,29 @@ def test_live_system_guard_install_failure_fails_closed(
     assert f"injected {guard_name} guard install failure" in output
 
 
+@pytest.mark.parametrize("_os_case", NATIVE_OS_CASES)
+def test_live_system_guard_asyncio_install_failure_fails_closed(
+    tmp_path: Path, _os_case: str
+) -> None:
+    """The cross-platform asyncio guard must fail closed during fixture setup."""
+    _assert_live_system_guard_install_failure(tmp_path, "asyncio")
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_pty_install_failure_fails_closed(
+    tmp_path: Path, _os_case: str
+) -> None:
+    """The native POSIX pty guard must fail closed during fixture setup."""
+    _assert_live_system_guard_install_failure(tmp_path, "pty")
+
+
 @pytest.mark.parametrize(
     ("probe_mode", "expected_returncode"),
     (
         ("pass", 0),
         ("positional-pass", 0),
+        ("keyword-args-pass", 0),
+        ("closed-final-ack", 1),
         ("fail", 1),
         ("mutable-killpg", 0),
         ("reused-live-leader", 1),
@@ -3870,6 +3890,7 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
     )
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
+    env["HERMES_TEST_SKIP_PRECOMPILE"] = "1"
     nested_stdout = tmp_path / f"released-leader-{probe_mode}.stdout"
     nested_stderr = tmp_path / f"released-leader-{probe_mode}.stderr"
     timed_out = False
@@ -4028,10 +4049,7 @@ def test_canonical_runner_preserves_its_vetted_python_for_nested_runs(
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     runner = scripts / "run_tests.sh"
-    runner.write_text(
-        (SCRIPTS / "run_tests.sh").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    runner.chmod(0o755)
+    runner.symlink_to(SCRIPTS / "run_tests.sh")
 
     receipt = tmp_path / "nested-python.txt"
     fake_python = tmp_path / "vetted-python"
@@ -5009,6 +5027,10 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
     push_paths = set(trigger["push"]["paths"])
     assert pull_request_paths == push_paths
 
+    steps = workflow["jobs"]["static-contract"]["steps"]
+    run_commands = " ".join(
+        " ".join(step["run"].split()) for step in steps if "run" in step
+    )
     config = json.loads(
         (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
     )
@@ -5017,8 +5039,16 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
         config["toolchain_lock"],
         config["dependency_identity"]["requirements_lock"],
         config["spec"]["path"],
+        ".github/workflows/continuity-gate.yml",
         *config["instructions"],
     }
+    if "uv sync --locked" in run_commands:
+        protected_paths.update({"pyproject.toml", "uv.lock"})
+    for step in steps:
+        uses = step.get("uses", "")
+        if uses.startswith("./"):
+            action_path = uses.removeprefix("./").rstrip("/")
+            protected_paths.add(f"{action_path}/action.yml")
     policy = config["evidence_policy"]
     for spec in [
         policy["focused_suite"],
@@ -5039,7 +5069,6 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
     for path in protected_paths:
         assert any(fnmatch(path, pattern) for pattern in pull_request_paths), path
 
-    steps = workflow["jobs"]["static-contract"]["steps"]
     for step in steps:
         uses = step.get("uses")
         if uses and not uses.startswith("./"):
@@ -5047,9 +5076,6 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
             assert separator and len(revision) == 40
             assert all(character in "0123456789abcdef" for character in revision)
 
-    run_commands = " ".join(
-        " ".join(step["run"].split()) for step in steps if "run" in step
-    )
     assert config["dependency_identity"]["requirements_lock"] in run_commands
     assert "--require-hashes" in run_commands
     assert "scripts/continuity_gate.py static" in run_commands

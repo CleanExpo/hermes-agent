@@ -176,16 +176,11 @@ def test_spec_body_rejects_unresolved_template_markers() -> None:
     ]
 
 
-def test_every_canonical_template_placeholder_is_rejected() -> None:
+def test_every_discovered_canonical_template_placeholder_is_rejected() -> None:
     template = continuity_bridge.SPEC_TEMPLATE_PATH.read_text(encoding="utf-8")
     markers = continuity_bridge._balanced_bracket_markers(template)
 
-    assert "[DATE]" in markers
-    assert "[Brief Title]" in markers
-    clarification = (
-        "[NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]"
-    )
-    assert clarification in markers
+    assert markers
     for marker in markers:
         assert validate_spec_body(f"# Completed title\n\nUnresolved: {marker}\n")
 

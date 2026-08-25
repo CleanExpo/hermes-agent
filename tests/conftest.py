@@ -1570,7 +1570,15 @@ def _live_system_guard(
                                     )
                                 control_write = record.get("control_write")
                                 if isinstance(control_write, int):
-                                    real_os_write(control_write, b"F")
+                                    write_final_ack = (
+                                        owned_process_group_monitor_hooks.get(
+                                            "write_final_ack"
+                                        )
+                                    )
+                                    if callable(write_final_ack):
+                                        write_final_ack(control_write)
+                                    else:
+                                        real_os_write(control_write, b"F")
                                 return
                             if marker == b"":
                                 return
@@ -1993,9 +2001,11 @@ def _live_system_guard(
             "finally:\n"
             "    try: os.write(done_write, b'D')\n"
             "    except OSError: pass\n"
-            "    try: os.read(control_read, 1)\n"
+            "    final_marker=b''\n"
+            "    try: final_marker=os.read(control_read, 1)\n"
             "    except OSError: pass\n"
             "    os.close(control_read); os.close(done_write)\n"
+            "    if final_marker != b'F': os._exit(125)\n"
             "if returncode < 0:\n"
             "    signum=-returncode; signal.signal(signum, signal.SIG_DFL); "
             "os.kill(os.getpid(), signum)\n"
@@ -2008,8 +2018,8 @@ def _live_system_guard(
             return [_os.fsdecode(part) for part in cmd]
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
-            def __init__(self, cmd, *args, **kwargs):
-                bound = popen_signature.bind_partial(cmd, *args, **kwargs)
+            def __init__(self, *popen_args, **kwargs):
+                bound = popen_signature.bind(*popen_args, **kwargs)
                 call_arguments = dict(bound.arguments)
                 bound_cmd = call_arguments.pop("args")
                 _check_subprocess_cmd("Popen", bound_cmd)
@@ -2017,7 +2027,7 @@ def _live_system_guard(
                     call_arguments.get("start_new_session", False)
                 )
                 if not use_group_harness:
-                    super().__init__(cmd, *args, **kwargs)
+                    super().__init__(*popen_args, **kwargs)
                     _record_owned_process(self.pid)
                     return
 
@@ -2066,7 +2076,7 @@ def _live_system_guard(
                     raise
                 real_os_close(control_read)
                 real_os_close(done_write)
-                self.args = cmd
+                self.args = bound_cmd
                 _record_owned_process(self.pid)
                 try:
                     leader_created_at = real_psutil_process(self.pid).create_time()
