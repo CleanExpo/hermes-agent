@@ -72,6 +72,7 @@ SENSITIVE_ARG = re.compile(
 CANONICAL_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / ".continuity/config.json"
 )
+REQUIRED_NATIVE_SURFACES = frozenset({"claude", "codex", "hermes"})
 
 
 def _native_adapter_path(
@@ -997,6 +998,28 @@ def verify_receipt(
     if current.root != str(Path(config["expected_repo_root"]).resolve()):
         errors.append("current repository root does not match continuity config")
     receipt = confined_load_json(config, receipt_path)
+    errors.extend(receipt_policy_errors(config, receipt, current, repo_root))
+    authority = strict_authority_check(
+        config_path,
+        cwd=cwd,
+        require_mounted_volume=True,
+        allow_closed_task=receipt.get("lifecycle_target") == "ENFORCED",
+        allow_recovery_journal=allow_recovery_journal,
+    )
+    if not authority.get("passed"):
+        errors.append("current strict authority check failed")
+        errors.extend(authority.get("errors") or [])
+    return errors
+
+
+def receipt_policy_errors(
+    config: dict[str, Any],
+    receipt: dict[str, Any],
+    current: Any,
+    repo_root: Path,
+) -> list[str]:
+    """Apply the complete receipt policy shared by preflight and promotion."""
+    errors: list[str] = []
     errors.extend(receipt_signature_errors(config, receipt))
     if receipt.get("project") != config.get("project"):
         errors.append("receipt project does not match continuity config")
@@ -1014,16 +1037,6 @@ def verify_receipt(
             errors.append("resolved dependency identity is stale")
     except ContinuityError as exc:
         errors.append(str(exc))
-    authority = strict_authority_check(
-        config_path,
-        cwd=cwd,
-        require_mounted_volume=True,
-        allow_closed_task=receipt.get("lifecycle_target") == "ENFORCED",
-        allow_recovery_journal=allow_recovery_journal,
-    )
-    if not authority.get("passed"):
-        errors.append("current strict authority check failed")
-        errors.extend(authority.get("errors") or [])
     errors.extend(receipt_errors(receipt, current))
     errors.extend(_native_observation_errors(config, receipt, current))
     if receipt.get("result") != "PASS":
@@ -1363,11 +1376,21 @@ def static_validate(config_path: Path) -> list[str]:
         "external_volume",
         "integration_ref",
         "toolchain_lock",
+        "hermes_home",
     ):
         if not config.get(key):
             errors.append(f"config missing {key}")
     if config.get("risk_tier") != "T3":
         errors.append("continuity pilot risk_tier must remain T3")
+    try:
+        state_root = Path(str(config["state_root"])).resolve()
+        hermes_home = Path(str(config["hermes_home"])).resolve()
+        if hermes_home != state_root / "hermes-home" / ".hermes":
+            errors.append(
+                "Hermes home must be the canonical isolated pilot home under state_root"
+            )
+    except (KeyError, TypeError, ValueError):
+        errors.append("Hermes home configuration is invalid")
     native_policy = config.get("native_observation_policy")
     if not isinstance(native_policy, dict) or set(native_policy) != {
         "required_surfaces",
@@ -1405,6 +1428,14 @@ def static_validate(config_path: Path) -> list[str]:
             required_native_surfaces = set()
         else:
             required_native_surfaces = set(surfaces)
+            if (
+                required_native_surfaces != REQUIRED_NATIVE_SURFACES
+                or set(hosts) != REQUIRED_NATIVE_SURFACES
+            ):
+                errors.append(
+                    "native observation required surfaces must be exactly "
+                    "claude, codex, hermes"
+                )
     dependency_policy = config.get("dependency_identity")
     if not isinstance(dependency_policy, dict) or set(dependency_policy) != {
         "python",
@@ -1490,6 +1521,11 @@ def static_validate(config_path: Path) -> list[str]:
         if native_runtime_surfaces != required_native_surfaces:
             errors.append(
                 "native observation runtime surfaces do not match required surfaces"
+            )
+        if native_runtime_surfaces != REQUIRED_NATIVE_SURFACES:
+            errors.append(
+                "native observation runtime surfaces must be exactly "
+                "claude, codex, hermes"
             )
         if len(native_runtime_surfaces) != len(policy["runtime_checks"]):
             errors.append("native observation runtime surfaces are duplicated")

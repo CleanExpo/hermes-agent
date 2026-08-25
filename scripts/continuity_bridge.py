@@ -22,8 +22,6 @@ from continuity_common import (
     minimal_child_env,
     parse_markdown_frontmatter,
     read_markdown_frontmatter,
-    receipt_errors,
-    receipt_signature_errors,
     run_command,
     verify_pinned_executable,
 )
@@ -392,16 +390,9 @@ def build_preflight(
         elif state:
             try:
                 receipt = confined_load_json(config, Path(receipt_path))
-                errors.extend(receipt_signature_errors(config, receipt))
-                errors.extend(receipt_errors(receipt, state))
-                try:
-                    current_inputs = external_input_digests(config, repo_root)
-                    if receipt.get("external_inputs") != current_inputs:
-                        errors.append(
-                            "terminal receipt external instruction or executable identity is stale"
-                        )
-                except ContinuityError as exc:
-                    errors.append(str(exc))
+                from continuity_gate import receipt_policy_errors
+
+                errors.extend(receipt_policy_errors(config, receipt, state, repo_root))
                 if receipt.get("lifecycle_target") != card_state:
                     errors.append(
                         "receipt lifecycle target does not match authority state"

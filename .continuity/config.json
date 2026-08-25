@@ -9,6 +9,7 @@
   "expected_repo_root": "/Volumes/Storage Unit/Application-Data/Codex/worktrees/hermes-continuity-pilot-20260824",
   "external_volume": "/Volumes/Storage Unit",
   "state_root": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824",
+  "hermes_home": "/Volumes/Storage Unit/Application-Data/Continuity-Pilot/hermes-20260824/hermes-home/.hermes",
   "max_output_chars": 8000,
   "basic_memory": {
     "project": "hermes-continuity-pilot",

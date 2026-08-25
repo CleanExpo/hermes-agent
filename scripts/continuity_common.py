@@ -945,6 +945,7 @@ def _terminate_process_tree(
     *,
     process_group: int | None = None,
     tracked_descendants: tuple[psutil.Process, ...] = (),
+    include_parent: bool = True,
 ) -> None:
     """Boundedly terminate a command and its snapshotted descendants.
 
@@ -956,13 +957,17 @@ def _terminate_process_tree(
     additionally covers descendants after their leader exits; Windows callers
     use a kill-on-close Job Object established before the child is resumed.
     """
-    try:
-        parent = psutil.Process(process.pid)
-        current_descendants = parent.children(recursive=True)
-    except psutil.NoSuchProcess:
-        current_descendants = []
-        parent = None
-    except (psutil.AccessDenied, OSError):
+    if include_parent:
+        try:
+            parent = psutil.Process(process.pid)
+            current_descendants = parent.children(recursive=True)
+        except psutil.NoSuchProcess:
+            current_descendants = []
+            parent = None
+        except (psutil.AccessDenied, OSError):
+            current_descendants = []
+            parent = None
+    else:
         current_descendants = []
         parent = None
     descendants = list(dict.fromkeys((*tracked_descendants, *current_descendants)))
@@ -1493,10 +1498,12 @@ class _ContainedProcess:
                 # signal its released process-group number, which may be reused.
                 self._require_linux_cleanup_ack(fallback_kill=linux_fallback_kill)
             else:
+                leader_running = self.process.poll() is None
                 _terminate_process_tree(
                     self.process,
-                    process_group=self.process_group,
+                    process_group=self.process_group if leader_running else None,
                     tracked_descendants=tracked_descendants,
+                    include_parent=leader_running,
                 )
             if os.name == "posix" and self.process_group is None:
                 self.snapshot_process_family()

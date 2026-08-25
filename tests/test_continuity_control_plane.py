@@ -273,6 +273,25 @@ def _canary_hits(
     return hits
 
 
+def _dispatcher_writable_roots(
+    pilot: dict[str, Path], env: dict[str, str]
+) -> list[Path]:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    candidates = [
+        pilot["repo"],
+        pilot["state"],
+        Path(config["receipt_dir"]),
+        *(Path(env[name]) for name in ("HOME", "HERMES_HOME", "TMPDIR", "TEMP", "TMP")),
+    ]
+    roots: list[Path] = []
+    for candidate in sorted(
+        {path.resolve() for path in candidates}, key=lambda path: len(path.parts)
+    ):
+        if not any(candidate.is_relative_to(root) for root in roots):
+            roots.append(candidate)
+    return roots
+
+
 def _lock_fake_bd(lock_path: Path, fake_bd: Path) -> None:
     import platform
 
@@ -445,7 +464,13 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
             "surfaces": {
                 "claude": ["session_start"],
                 "codex": ["session_start"],
-                "hermes": ["pre_llm_call"],
+                "hermes": [
+                    "on_session_start",
+                    "pre_llm_call",
+                    "pre_tool_call",
+                    "post_tool_call",
+                    "on_session_end",
+                ],
             },
         },
     )
@@ -489,6 +514,7 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
         "expected_repo_root": str(repo.resolve()),
         "external_volume": "/",
         "state_root": str(state),
+        "hermes_home": str(state / "hermes-home/.hermes"),
         "max_output_chars": 8000,
         "basic_memory": {"project": "pilot", "card_path": str(card_path)},
         "beads": {
@@ -628,6 +654,29 @@ def _passing_receipt(pilot: dict[str, Path], target: str = "TESTED") -> dict:
         rollback=policy["rollback_check"],
         require_mounted_volume=False,
     )
+
+
+def _pilot_hermes_home(pilot: dict[str, Path]) -> Path:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    hermes_home = Path(config["hermes_home"])
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    return hermes_home
+
+
+def _bind_terminal_card(
+    pilot: dict[str, Path], *, state: str, receipt_path: Path
+) -> None:
+    card, body = read_markdown_frontmatter(pilot["card"])
+    card["state"] = state
+    card["evidence"] = {
+        "commit": _git(pilot["repo"], "rev-parse", "HEAD"),
+        "receipt": str(receipt_path),
+    }
+    pilot["card"].write_text(render_markdown_frontmatter(card, body), encoding="utf-8")
+    if state == "ENFORCED":
+        task = json.loads(pilot["issues"].read_text(encoding="utf-8"))
+        task["status"] = "closed"
+        pilot["issues"].write_text(json.dumps(task) + "\n", encoding="utf-8")
 
 
 def test_healthy_preflight_recovers_exact_scope(pilot: dict[str, Path]) -> None:
@@ -1639,6 +1688,42 @@ def test_failed_test_and_changed_sha_invalidate_receipt(pilot: dict[str, Path]) 
     )
 
 
+def test_terminal_preflight_rejects_authenticated_failed_receipt(
+    pilot: dict[str, Path],
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    receipt = _passing_receipt(pilot)
+    receipt["result"] = "FAIL"
+    receipt["auth"] = sign_receipt(config, receipt)
+    receipt_path = pilot["state"] / "receipts/authenticated-fail.json"
+    atomic_write_json(receipt_path, receipt)
+    _bind_terminal_card(pilot, state="TESTED", receipt_path=receipt_path)
+
+    result = _preflight(pilot)
+
+    assert result["completion_allowed"] is False
+    assert "receipt result is not PASS" in result["errors"]
+
+
+def test_terminal_preflight_rejects_stale_native_observation(
+    pilot: dict[str, Path],
+) -> None:
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    receipt = _passing_receipt(pilot, target="ENFORCED")
+    receipt["runtime_checks"][0]["native_observation"]["observed_at"] = (
+        "2000-01-01T00:00:00+00:00"
+    )
+    receipt["auth"] = sign_receipt(config, receipt)
+    receipt_path = pilot["state"] / "receipts/stale-native.json"
+    atomic_write_json(receipt_path, receipt)
+    _bind_terminal_card(pilot, state="ENFORCED", receipt_path=receipt_path)
+
+    result = _preflight(pilot)
+
+    assert result["completion_allowed"] is False
+    assert any("native observation is stale" in error for error in result["errors"])
+
+
 def test_signed_receipt_rejects_forged_evidence(pilot: dict[str, Path]) -> None:
     receipt_path = pilot["state"] / "receipts/signed.json"
     receipt = _passing_receipt(pilot)
@@ -2049,6 +2134,30 @@ def test_static_gate_rejects_native_observation_surface_gap(
     )
 
 
+@pytest.mark.parametrize("removed_surface", ("claude", "codex", "hermes"))
+def test_static_gate_pins_each_required_native_surface(
+    tmp_path: Path, removed_surface: str
+) -> None:
+    config = json.loads(
+        (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
+    )
+    config["native_observation_policy"]["required_surfaces"].remove(removed_surface)
+    del config["native_observation_policy"]["hosts"][removed_surface]
+    config["evidence_policy"]["runtime_checks"] = [
+        check
+        for check in config["evidence_policy"]["runtime_checks"]
+        if check["surface"] != removed_surface
+    ]
+    config_path = tmp_path / ".continuity/config.json"
+    config_path.parent.mkdir()
+    atomic_write_json(config_path, config)
+
+    assert (
+        "native observation required surfaces must be exactly claude, codex, hermes"
+        in static_validate(config_path)
+    )
+
+
 def test_pinned_inputs_invalidate_preflight_and_receipt(pilot: dict[str, Path]) -> None:
     instruction = pilot["state"] / "external-skill.md"
     instruction.write_text("v1\n", encoding="utf-8")
@@ -2369,8 +2478,7 @@ def test_codex_native_observer_rejects_linked_worktree_provenance(
 def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
-    hermes_home = tmp_path / "native-hermes-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     install_hermes_adapter(pilot["repo"], hermes_home)
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     config["evidence_policy"]["runtime_checks"].append({
@@ -2422,8 +2530,7 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
 def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
-    hermes_home = tmp_path / "forged-hermes-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     install_hermes_adapter(pilot["repo"], hermes_home)
     manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2452,36 +2559,56 @@ def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
         )
 
 
-def test_hermes_manifest_rejects_authenticated_forged_rollback_authority(
-    tmp_path: Path,
+@pytest.mark.parametrize("home_shape", ("outside-state", "home/.hermes"))
+def test_hermes_adapter_apply_rejects_noncanonical_home(
+    tmp_path: Path, home_shape: str
 ) -> None:
-    hermes_home = tmp_path / "forged-rollback-home"
-    hermes_home.mkdir()
+    candidate = tmp_path / home_shape
+    candidate.mkdir(parents=True)
+
+    with pytest.raises(ContinuityError, match="canonical isolated pilot home"):
+        install_hermes_adapter(REPO_ROOT, candidate)
+
+
+@pytest.mark.parametrize("home_shape", ("outside-state", "home/.hermes"))
+def test_hermes_adapter_rollback_rejects_noncanonical_home(
+    tmp_path: Path, home_shape: str
+) -> None:
+    candidate = tmp_path / home_shape
+    candidate.mkdir(parents=True)
+
+    with pytest.raises(ContinuityError, match="canonical isolated pilot home"):
+        rollback_hermes_adapter(REPO_ROOT, candidate, apply=False)
+
+
+def test_hermes_manifest_rejects_authenticated_forged_rollback_authority(
+    pilot: dict[str, Path],
+) -> None:
+    hermes_home = _pilot_hermes_home(pilot)
     config_path = hermes_home / "config.yaml"
     config_path.write_text(
         yaml.safe_dump({"hooks": {"pre_tool_call": [{"command": "original"}]}}),
         encoding="utf-8",
     )
-    install_hermes_adapter(REPO_ROOT, hermes_home)
+    install_hermes_adapter(pilot["repo"], hermes_home)
     manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["before_hooks"] = {}
     manifest["absent_before"] = []
     manifest["auth"] = sign_receipt(
-        json.loads((REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")),
+        json.loads(pilot["config"].read_text(encoding="utf-8")),
         manifest,
     )
     atomic_write_json(manifest_path, manifest)
 
     with pytest.raises(ContinuityError, match="before-image is malformed"):
-        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=False)
+        rollback_hermes_adapter(pilot["repo"], hermes_home, apply=False)
 
 
 def test_hermes_adapter_has_owned_reversible_before_image(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
-    hermes_home = tmp_path / "hermes-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     original = {
         "model": "fixture",
         "hooks": {
@@ -2493,26 +2620,27 @@ def test_hermes_adapter_has_owned_reversible_before_image(
     import yaml
 
     config_path.write_text(yaml.safe_dump(original, sort_keys=False), encoding="utf-8")
-    installed = install_hermes_adapter(REPO_ROOT, hermes_home)
+    installed = install_hermes_adapter(pilot["repo"], hermes_home)
     assert installed["changed"] is True
     active = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert active["hooks"]["pre_tool_call"][0]["fail_closed"] is True
     assert (
-        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=False)["rollback_valid"]
+        rollback_hermes_adapter(pilot["repo"], hermes_home, apply=False)[
+            "rollback_valid"
+        ]
         is True
     )
-    rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
     restored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert restored == original
 
 
 def test_interrupted_hermes_install_remains_rollback_safe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import yaml
 
-    hermes_home = tmp_path / "interrupted-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     config_path = hermes_home / "config.yaml"
     original = {"model": "fixture", "hooks": {"unrelated": [{"command": "keep"}]}}
     config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
@@ -2530,26 +2658,25 @@ def test_interrupted_hermes_install_remains_rollback_safe(
         continuity_adapters, "atomic_write_text", interrupt_final_manifest
     )
     with pytest.raises(OSError, match="finalization interruption"):
-        install_hermes_adapter(REPO_ROOT, hermes_home)
+        install_hermes_adapter(pilot["repo"], hermes_home)
     monkeypatch.setattr(continuity_adapters, "atomic_write_text", real_write)
-    assert rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=False)[
+    assert rollback_hermes_adapter(pilot["repo"], hermes_home, apply=False)[
         "rollback_valid"
     ]
-    rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
 
 
 def test_interrupted_hermes_rollback_finalization_is_retryable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import yaml
 
-    hermes_home = tmp_path / "rollback-interrupted-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     config_path = hermes_home / "config.yaml"
     original = {"model": "fixture", "hooks": {"unrelated": [{"command": "keep"}]}}
     config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
-    install_hermes_adapter(REPO_ROOT, hermes_home)
+    install_hermes_adapter(pilot["repo"], hermes_home)
     real_write = continuity_adapters.atomic_write_text
 
     def interrupt_rolled_back_manifest(path: Path, content: str) -> None:
@@ -2564,31 +2691,30 @@ def test_interrupted_hermes_rollback_finalization_is_retryable(
         continuity_adapters, "atomic_write_text", interrupt_rolled_back_manifest
     )
     with pytest.raises(OSError, match="rollback finalization interruption"):
-        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+        rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
 
     monkeypatch.setattr(continuity_adapters, "atomic_write_text", real_write)
-    assert rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)["applied"]
+    assert rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)["applied"]
 
 
 def test_rollback_apply_is_idempotent_after_lost_acknowledgement(
-    tmp_path: Path,
+    pilot: dict[str, Path],
 ) -> None:
     import yaml
 
-    hermes_home = tmp_path / "rollback-replay-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     config_path = hermes_home / "config.yaml"
     original = {"model": "fixture", "hooks": {"unrelated": [{"command": "keep"}]}}
     config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
-    install_hermes_adapter(REPO_ROOT, hermes_home)
+    install_hermes_adapter(pilot["repo"], hermes_home)
 
-    first = rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    first = rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
     restored_config = config_path.read_bytes()
     manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
     restored_manifest = manifest_path.read_bytes()
 
-    second = rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    second = rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
 
     assert first["applied"] is True
     assert first["already_rolled_back"] is False
@@ -2599,15 +2725,14 @@ def test_rollback_apply_is_idempotent_after_lost_acknowledgement(
     assert manifest_path.read_bytes() == restored_manifest
 
 
-def test_rollback_replay_names_managed_hook_drift(tmp_path: Path) -> None:
+def test_rollback_replay_names_managed_hook_drift(pilot: dict[str, Path]) -> None:
     import yaml
 
-    hermes_home = tmp_path / "rollback-drift-home"
-    hermes_home.mkdir()
+    hermes_home = _pilot_hermes_home(pilot)
     config_path = hermes_home / "config.yaml"
     config_path.write_text(yaml.safe_dump({"model": "fixture"}), encoding="utf-8")
-    install_hermes_adapter(REPO_ROOT, hermes_home)
-    rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+    install_hermes_adapter(pilot["repo"], hermes_home)
+    rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
 
     drifted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     drifted.setdefault("hooks", {})["pre_tool_call"] = [{"command": "drifted"}]
@@ -2617,7 +2742,7 @@ def test_rollback_replay_names_managed_hook_drift(tmp_path: Path) -> None:
         ContinuityError,
         match="changed after rollback: pre_tool_call; recovery:",
     ):
-        rollback_hermes_adapter(REPO_ROOT, hermes_home, apply=True)
+        rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
 
 
 @pytest.mark.live_system_guard_bypass
@@ -3111,6 +3236,36 @@ def test_fast_commands_leave_no_descendant_monitor_threads(tmp_path: Path) -> No
     assert after == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_completed_command_does_not_signal_released_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signalled: list[tuple[int, int]] = []
+    cleanup_modes: list[bool] = []
+    real_terminate = continuity_common._terminate_process_tree
+
+    def record_released_group(pgid: int, signum: int) -> None:
+        signalled.append((pgid, signum))
+
+    def record_cleanup_mode(*args, **kwargs) -> None:
+        cleanup_modes.append(kwargs.get("include_parent", True))
+        real_terminate(*args, **kwargs)
+
+    monkeypatch.setattr(os, "killpg", record_released_group)
+    monkeypatch.setattr(
+        continuity_common, "_terminate_process_tree", record_cleanup_mode
+    )
+
+    result = run_command(
+        [sys.executable, "-c", "print('completed')"], cwd=tmp_path, timeout=5
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "completed"
+    assert signalled == []
+    assert cleanup_modes == [False]
+
+
 def test_empty_child_environment_does_not_inherit_ambient_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3545,6 +3700,18 @@ def test_cross_surface_privacy_canary_covers_all_configured_events(
     entry = REPO_ROOT / ".specify/events.py"
     env = os.environ.copy()
     env["CONTINUITY_PRIVACY_CREDENTIAL"] = sentinels[5]
+    privacy_sandbox = pilot["state"] / "privacy-sandbox"
+    for name, relative in {
+        "HOME": "home",
+        "HERMES_HOME": "hermes-home",
+        "TMPDIR": "tmp",
+        "TEMP": "tmp",
+        "TMP": "tmp",
+    }.items():
+        path = privacy_sandbox / relative
+        path.mkdir(parents=True, exist_ok=True)
+        env[name] = str(path)
+    writable_roots = _dispatcher_writable_roots(pilot, env)
     outputs: list[str] = []
 
     for surface, events in contract["surfaces"].items():
@@ -3615,9 +3782,7 @@ def test_cross_surface_privacy_canary_covers_all_configured_events(
         assert result.returncode in {0, 2}
         outputs.extend((result.stdout, result.stderr))
 
-    assert (
-        _canary_hits(sentinels, outputs=outputs, writable_roots=[pilot["state"]]) == []
-    )
+    assert _canary_hits(sentinels, outputs=outputs, writable_roots=writable_roots) == []
 
 
 def test_privacy_canary_oracle_detects_mutated_adapter_write(
@@ -3639,8 +3804,35 @@ def test_privacy_canary_oracle_detects_mutated_adapter_write(
         {"tool_output": sentinel},
     )
 
-    hits = _canary_hits([sentinel], outputs=[], writable_roots=[pilot["state"]])
+    hits = _canary_hits(
+        [sentinel], outputs=[], writable_roots=[pilot["state"], pilot["repo"]]
+    )
     assert hits == [f"{pilot['state'] / 'mutated-debug.log'}:{sentinel}"]
+
+
+def test_privacy_canary_oracle_detects_outside_state_mutated_adapter_write(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "OUTSIDE-STATE-MUTATION-CONTROL-CANARY-734c"
+    mutant_path = pilot["repo"] / ".mutated-raw-payload.json"
+    real_append = continuity_event._append_redacted_event
+
+    def leaky_append(config: dict, event: dict) -> None:
+        real_append(config, event)
+        mutant_path.write_text(json.dumps({"payload": sentinel}), encoding="utf-8")
+
+    monkeypatch.setattr(continuity_event, "_append_redacted_event", leaky_append)
+    continuity_event.dispatch(
+        "post_tool_call",
+        "hermes",
+        pilot["config"],
+        {"tool_output": sentinel},
+    )
+
+    hits = _canary_hits(
+        [sentinel], outputs=[], writable_roots=[pilot["state"], pilot["repo"]]
+    )
+    assert hits == [f"{mutant_path}:{sentinel}"]
 
 
 def test_unmounted_volume_causes_no_state_writes(
@@ -3844,6 +4036,7 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
     for protected in (
         ".agents/skills/speckit-*/**",
         ".claude/skills/speckit-*/**",
+        ".codex/config.toml",
         "scripts/run_tests.sh",
         "AGENTS.md",
         ".github/workflows/continuity-gate.yml",
@@ -3878,6 +4071,10 @@ def test_continuity_workflow_covers_authority_and_supply_chain_paths() -> None:
     ]:
         if len(spec["argv"]) > 1 and not Path(spec["argv"][1]).is_absolute():
             protected_paths.add(spec["argv"][1])
+    for runtime in policy["runtime_checks"]:
+        for token in [runtime["adapter_path"], *runtime.get("bound_paths", [])]:
+            if not Path(token).is_absolute():
+                protected_paths.add(token)
     for manifest_path in (REPO_ROOT / ".specify/integrations").glob("*.manifest.json"):
         protected_paths.update(
             json.loads(manifest_path.read_text(encoding="utf-8"))["files"]

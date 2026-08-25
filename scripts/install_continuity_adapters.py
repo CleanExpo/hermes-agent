@@ -138,6 +138,20 @@ def _load_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
     return loaded, text
 
 
+def _require_canonical_hermes_home(repo_root: Path, hermes_home: Path) -> Path:
+    config = load_json(repo_root.resolve() / ".continuity/config.json")
+    state_root = Path(str(config.get("state_root", ""))).resolve()
+    configured = Path(str(config.get("hermes_home", ""))).resolve()
+    expected = state_root / "hermes-home" / ".hermes"
+    candidate = hermes_home.resolve()
+    if configured != expected or candidate != configured:
+        raise ContinuityError(
+            "Hermes operations require the canonical isolated pilot home "
+            f"under the configured state root: {expected}"
+        )
+    return candidate
+
+
 def _managed_hermes_hooks(repo_root: Path) -> dict[str, Any]:
     rendered = yaml.safe_load(render_hermes_config(repo_root)) or {}
     return dict(rendered.get("hooks") or {})
@@ -164,6 +178,7 @@ def validate_hermes_manifest(
     repo_root: Path, hermes_home: Path, manifest: dict[str, Any]
 ) -> dict[str, Any]:
     """Authenticate and semantically validate the complete rollback authority."""
+    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
     status = manifest.get("status")
     allowed_keys = set(HERMES_MANIFEST_BASE_KEYS)
     if status == "ROLLED_BACK":
@@ -230,8 +245,9 @@ def validate_hermes_manifest(
 
 
 def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
-    target = hermes_home.resolve() / "config.yaml"
-    manifest_path = hermes_home.resolve() / HERMES_MANIFEST
+    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
+    target = hermes_home / "config.yaml"
+    manifest_path = hermes_home / HERMES_MANIFEST
     existing, before_text = _load_yaml_mapping(target)
     installed_hooks = _managed_hermes_hooks(repo_root)
     hooks = dict(existing.get("hooks") or {})
@@ -301,7 +317,8 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
 def rollback_hermes_adapter(
     repo_root: Path, hermes_home: Path, *, apply: bool
 ) -> dict[str, Any]:
-    manifest_path = hermes_home.resolve() / HERMES_MANIFEST
+    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
+    manifest_path = hermes_home / HERMES_MANIFEST
     manifest = load_json(manifest_path)
     validate_hermes_manifest(repo_root, hermes_home, manifest)
     status = manifest.get("status")
