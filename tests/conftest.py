@@ -21,11 +21,15 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import inspect
+import json
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -548,6 +552,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    singleton might still be cached from a previous test).
     try:
         import hermes_cli.plugins as _plugins_mod
+
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
         # Also clear the keyed per-home manager cache (and any plugin
         # submodules it left in sys.modules) so a manager built for a
@@ -676,6 +681,7 @@ def _capture_real_kanban_root() -> Path:
         # honor it via the normal resolver (it may be a profile dir whose
         # root matters).
         from hermes_constants import get_default_hermes_root
+
         return get_default_hermes_root().resolve()
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
@@ -720,9 +726,7 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
             resolved = Path(db_path).expanduser().resolve()
         else:
             resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
+                _kdb.kanban_db_path(board=kwargs.get("board")).expanduser().resolve()
             )
         try:
             resolved.relative_to(_REAL_KANBAN_ROOT)
@@ -769,12 +773,8 @@ def _state_db_write_guard(request, monkeypatch):
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
     ):
-        extra_roots.append(
-            Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
-        )
-    monkeypatch.setattr(
-        _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
-    )
+        extra_roots.append(Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve())
+    monkeypatch.setattr(_hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots))
     yield
 
 
@@ -1192,7 +1192,10 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # raises AttributeError at timer setup and the whole run aborts before any
     # test executes. Fall back to the thread-based timer on Windows so the
     # suite runs natively there (POSIX keeps the more reliable signal method).
-    if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
+    if (
+        sys.platform == "win32"
+        and getattr(config.option, "timeout_method", None) == "signal"
+    ):
         config.option.timeout_method = "thread"
 
 
@@ -1286,8 +1289,95 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
             item.add_marker(skip_marker)
 
 
+@pytest.fixture
+def owned_process_registry():
+    """Track exact child PIDs captured by test-local spawn primitives."""
+    return set()
+
+
+@pytest.fixture
+def owned_process_identity_registry():
+    """Track retained PID and creation-time identities for owned descendants."""
+    return {}
+
+
+@pytest.fixture
+def owned_process_creation_registry():
+    """Bind every directly spawned child PID to its creation time."""
+    return {}
+
+
+@pytest.fixture
+def owned_process_group_registry():
+    """Track exact session leaders and authenticated descendant monitors."""
+    return {}
+
+
+@pytest.fixture
+def owned_process_group_monitor_hooks():
+    """Expose deterministic test-only gates around the group handshake."""
+    return {}
+
+
+@pytest.fixture
+def _live_system_signal_primitives():
+    """Retain exact signal primitives so refusal paths can be tested safely."""
+    return {
+        "kill": os.kill,
+        "killpg": getattr(os, "killpg", None),
+    }
+
+
+@pytest.fixture
+def register_owned_process_group(owned_process_registry, owned_process_group_registry):
+    """Register a session leader captured at fork/spawn time."""
+
+    def register(pgid: int) -> int:
+        candidate = int(pgid)
+        if candidate not in owned_process_registry:
+            raise RuntimeError(
+                f"PGID {candidate} was not captured as an exact test child"
+            )
+        if os.name != "posix":
+            raise RuntimeError("process-group registration requires POSIX")
+        try:
+            waited_pid, _status = os.waitpid(candidate, os.WNOHANG)
+        except ChildProcessError as exc:
+            raise RuntimeError(f"PGID {candidate} is not a direct child") from exc
+        if waited_pid != 0:
+            raise RuntimeError(f"PGID {candidate} is no longer a live direct child")
+        try:
+            actual_pgid = os.getpgid(candidate)
+        except OSError as exc:
+            raise RuntimeError(f"PGID {candidate} is no longer live") from exc
+        if actual_pgid != candidate:
+            raise RuntimeError(f"PID {candidate} is not its own process-group leader")
+        try:
+            import psutil as _psutil
+
+            leader_created_at = _psutil.Process(candidate).create_time()
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError) as exc:
+            raise RuntimeError(f"PGID {candidate} identity is unavailable") from exc
+        owned_process_group_registry[candidate] = {
+            "leader_created_at": leader_created_at,
+            "expected_pgid": candidate,
+        }
+        return candidate
+
+    return register
+
+
 @pytest.fixture(autouse=True)
-def _live_system_guard(request, monkeypatch):
+def _live_system_guard(
+    request,
+    monkeypatch,
+    owned_process_registry,
+    owned_process_identity_registry,
+    owned_process_creation_registry,
+    owned_process_group_registry,
+    owned_process_group_monitor_hooks,
+    _live_system_signal_primitives,
+):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
     See block comment above for the why. Tests that genuinely need
@@ -1313,49 +1403,280 @@ def _live_system_guard(request, monkeypatch):
         return
 
     import os as _os
+    import errno as _errno
+    import select as _select
     import shlex as _shlex
+    import signal as _signal
+    import struct as _struct
     import subprocess as _subprocess
 
-    test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    real_kill = _live_system_signal_primitives["kill"]
+    teardown_killpg = getattr(_os, "killpg", None)
+    real_waitpid = getattr(_os, "waitpid", None)
+    real_getpgid = getattr(_os, "getpgid", None)
+    real_os_close = _os.close
+    real_os_fstat = _os.fstat
+    real_os_listdir = _os.listdir
+    real_os_read = _os.read
+    real_os_write = _os.write
+    real_select = _select.select
     try:
-        import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
-    except Exception:
-        _psutil = None
-        _initial_children = set()
+        import psutil as _teardown_psutil
 
-    def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
-        if pid == 0:
+        real_psutil_process = _teardown_psutil.Process
+        real_psutil_children = _teardown_psutil.Process.children
+        real_psutil_pids = _teardown_psutil.pids
+    except ImportError:
+        real_psutil_process = None
+        real_psutil_children = None
+        real_psutil_pids = None
+
+    def _record_owned_process(pid: int) -> None:
+        candidate = int(pid)
+        owned_process_registry.add(candidate)
+        if real_psutil_process is None:
+            return
+        try:
+            owned_process_creation_registry[candidate] = float(
+                real_psutil_process(candidate).create_time()
+            )
+        except (
+            _teardown_psutil.NoSuchProcess,
+            _teardown_psutil.AccessDenied,
+            OSError,
+        ):
+            pass
+
+    def _start_owned_group_monitor(pgid: int, record: dict) -> None:
+        """Freeze exact group identities before the authenticated leader exits."""
+        if (
+            real_psutil_process is None
+            or real_psutil_children is None
+            or real_psutil_pids is None
+            or real_getpgid is None
+        ):
+            raise RuntimeError("psutil is required for owned process-group monitoring")
+
+        stop_event = threading.Event()
+        ready_event = threading.Event()
+        descendant_identities: dict[int, float] = {}
+        record["monitor_stop"] = stop_event
+        record["monitor_ready"] = ready_event
+        record["descendant_identities"] = descendant_identities
+        record["monitor_error"] = None
+
+        def authenticated_leader():
+            try:
+                leader = real_psutil_process(pgid)
+                if (
+                    leader.create_time() != record.get("leader_created_at")
+                    or int(real_getpgid(pgid)) != pgid
+                ):
+                    return None
+                return leader
+            except (
+                _teardown_psutil.NoSuchProcess,
+                _teardown_psutil.AccessDenied,
+                OSError,
+            ):
+                return None
+
+        def retain(pid: int) -> None:
+            if pid == pgid:
+                return
+            try:
+                candidate = real_psutil_process(pid)
+                created_at = float(candidate.create_time())
+            except (
+                _teardown_psutil.NoSuchProcess,
+                _teardown_psutil.AccessDenied,
+                OSError,
+            ):
+                return
+            descendant_identities[pid] = created_at
+            owned_process_identity_registry[pid] = created_at
+
+        def snapshot_descendants() -> bool:
+            roots = []
+            leader = authenticated_leader()
+            if leader is None:
+                return False
+            roots.append(leader)
+            for pid, created_at in tuple(descendant_identities.items()):
+                try:
+                    candidate = real_psutil_process(pid)
+                    if candidate.create_time() == created_at:
+                        roots.append(candidate)
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    continue
+            for root in roots:
+                try:
+                    descendants = real_psutil_children(root, recursive=True)
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    continue
+                for descendant in descendants:
+                    retain(int(descendant.pid))
             return True
-        if pid < 0:
+
+        def snapshot_group() -> bool:
+            """Enumerate a numeric group only while its exact leader is live."""
+            if authenticated_leader() is None:
+                return False
+            for pid in tuple(real_psutil_pids()):
+                if pid == pgid:
+                    continue
+                try:
+                    if int(real_getpgid(pid)) != pgid:
+                        continue
+                except OSError:
+                    continue
+                retain(int(pid))
+            return True
+
+        def monitor() -> None:
+            try:
+                before_initial_snapshot = owned_process_group_monitor_hooks.get(
+                    "before_initial_snapshot"
+                )
+                if callable(before_initial_snapshot):
+                    before_initial_snapshot()
+                if not snapshot_descendants():
+                    raise RuntimeError(
+                        f"process-group leader {pgid} was not authenticated at startup"
+                    )
+                ready_event.set()
+                while not stop_event.is_set():
+                    done_read = record.get("done_read")
+                    if isinstance(done_read, int):
+                        readable, _, _ = real_select((done_read,), (), (), 0)
+                        if readable:
+                            marker = real_os_read(done_read, 1)
+                            if marker == b"D":
+                                before_final_snapshot = (
+                                    owned_process_group_monitor_hooks.get(
+                                        "before_final_snapshot"
+                                    )
+                                )
+                                if callable(before_final_snapshot):
+                                    before_final_snapshot()
+                                if not snapshot_group():
+                                    raise RuntimeError(
+                                        f"process-group leader {pgid} vanished before "
+                                        "the final authenticated snapshot"
+                                    )
+                                control_write = record.get("control_write")
+                                if isinstance(control_write, int):
+                                    write_final_ack = (
+                                        owned_process_group_monitor_hooks.get(
+                                            "write_final_ack"
+                                        )
+                                    )
+                                    if callable(write_final_ack):
+                                        write_final_ack(control_write)
+                                    else:
+                                        real_os_write(control_write, b"F")
+                                return
+                            if marker == b"":
+                                return
+                    snapshot_descendants()
+                    stop_event.wait(0.01)
+                if snapshot_group():
+                    control_write = record.get("control_write")
+                    if isinstance(control_write, int):
+                        real_os_write(control_write, b"F")
+            except Exception as exc:
+                record["monitor_error"] = repr(exc)
+            finally:
+                ready_event.set()
+                signal_owner = record.pop("signal_owner", None)
+                close_signal_channel = getattr(
+                    signal_owner, "_close_guarded_signal_channel", None
+                )
+                if callable(close_signal_channel):
+                    close_signal_channel()
+                for key in ("done_read", "control_write"):
+                    descriptor = record.pop(key, None)
+                    if isinstance(descriptor, int):
+                        try:
+                            real_os_close(descriptor)
+                        except OSError:
+                            pass
+
+        monitor_thread = threading.Thread(
+            target=monitor,
+            name=f"live-system-group-{pgid}",
+            daemon=True,
+        )
+        record["monitor_thread"] = monitor_thread
+        monitor_thread.start()
+        if not ready_event.wait(2.0):
+            raise RuntimeError(
+                f"owned process-group monitor did not start for leader {pgid}"
+            )
+        if record.get("monitor_error") is not None:
+            raise RuntimeError(
+                "owned process-group monitor failed at startup for leader "
+                f"{pgid}: {record['monitor_error']}"
+            )
+
+    def _is_live_direct_child(pid: int) -> bool:
+        if pid not in owned_process_registry:
             return False
-        if pid == test_pid or pid in _initial_children:
-            return True
-        if _psutil is None:
+        if _os.name == "posix":
+            try:
+                waited_pid, _status = _os.waitpid(pid, _os.WNOHANG)
+            except ChildProcessError:
+                return False
+            if waited_pid != 0:
+                return False
+        created_at = owned_process_creation_registry.get(pid)
+        if created_at is None or real_psutil_process is None:
             return False
         try:
-            walker = _psutil.Process(pid)
-        except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
-        try:
-            for parent in walker.parents():
-                if parent.pid == test_pid:
+            return real_psutil_process(pid).create_time() == created_at
+        except (
+            _teardown_psutil.NoSuchProcess,
+            _teardown_psutil.AccessDenied,
+            OSError,
+        ):
+            return False
+
+    def _belongs_to_owned_process_group(pid: int) -> bool:
+        if _os.name != "posix" or pid <= 0:
+            return False
+        retained_created_at = owned_process_identity_registry.get(pid)
+        if retained_created_at is not None:
+            try:
+                import psutil as _psutil
+
+                if _psutil.Process(pid).create_time() == retained_created_at:
                     return True
-        except Exception:
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                return False
+        try:
+            pgid = int(_os.getpgid(pid))
+        except OSError:
             return False
-        return False
+        record = owned_process_group_registry.get(pgid)
+        if record is None:
+            return False
+        if _is_live_direct_child(pgid):
+            return True
+        try:
+            import psutil as _psutil
 
-    real_kill = _os.kill
+            candidate_created_at = _psutil.Process(pid).create_time()
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+            return False
+        return owned_process_identity_registry.get(pid) == candidate_created_at
 
     def _guarded_kill(pid, sig, *args, **kwargs):
         # Signal 0 is a pure liveness probe — it cannot terminate anything.
@@ -1363,13 +1684,33 @@ def _live_system_guard(request, monkeypatch):
         # just-killed grandchild that was reparented to init (zombie with a
         # foreign parent chain) must not trip the guard. Flaked in CI on
         # test_entire_tree_is_sigkilled_not_just_parent.
+        if int(sig) == 0 and _os.name == "posix":
+            return real_kill(pid, sig, *args, **kwargs)
         if int(sig) == 0:
+            import psutil as _psutil
+
+            if _psutil.pid_exists(int(pid)):
+                return None
+            raise ProcessLookupError(int(pid))
+        candidate = int(pid)
+        if _is_live_direct_child(candidate) or _belongs_to_owned_process_group(
+            candidate
+        ):
             return real_kill(pid, sig, *args, **kwargs)
-        if _is_own_subtree(int(pid)):
-            return real_kill(pid, sig, *args, **kwargs)
+        if candidate in owned_process_registry:
+            raise ProcessLookupError(candidate)
+        if candidate in owned_process_identity_registry:
+            raise ProcessLookupError(candidate)
+        try:
+            candidate_pgid = _os.getpgid(candidate)
+        except OSError:
+            candidate_pgid = None
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
-            f"{pid}, {sig}) — PID is outside the test process subtree. "
+            f"{pid}, {sig}) — PID was not captured as an exact test child. "
+            f"Observed PGID={candidate_pgid}, registered_group="
+            f"{candidate_pgid in owned_process_group_registry}, "
+            f"retained_identity={candidate in owned_process_identity_registry}. "
             "If this fired in CI it means the test reached a real "
             "kill_gateway_processes / stop_profile_gateway / cmd_update "
             "code path without mocking find_gateway_pids and os.kill. "
@@ -1383,25 +1724,89 @@ def _live_system_guard(request, monkeypatch):
     # ``os.killpg`` is the same risk class — sends a signal to every
     # process in a group. The gateway is a session leader (its own
     # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # kill of the live process. Allow it only when the target PGID was
+    # explicitly registered from an exact child captured at spawn time.
     if hasattr(_os, "killpg"):
-        real_killpg = _os.killpg
-        own_pgid = _os.getpgrp()
+
+        def real_killpg(pgid, sig, *args, **kwargs):
+            primitive = _live_system_signal_primitives["killpg"]
+            if primitive is None:
+                raise AttributeError("process-group signals are unavailable")
+            return primitive(pgid, sig, *args, **kwargs)
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            candidate = int(pgid)
+            if candidate in owned_process_group_registry and _is_live_direct_child(
+                candidate
+            ):
                 return real_killpg(pgid, sig, *args, **kwargs)
+            if candidate in owned_process_group_registry:
+                raise ProcessLookupError(candidate)
+            operation = ".".join(("os", "killpg"))
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
-                "process group. See _live_system_guard for the why."
+                f"{operation}({pgid}, {sig}) — PGID was not registered "
+                "as a test-owned process group. See _live_system_guard "
+                "for the why."
             )
 
         monkeypatch.setattr(_os, "killpg", _guarded_killpg)
+
+    if hasattr(_os, "fork"):
+        real_fork = _os.fork
+
+        def _guarded_fork(*args, **kwargs):
+            child_pid = real_fork(*args, **kwargs)
+            if child_pid > 0:
+                _record_owned_process(child_pid)
+            return child_pid
+
+        monkeypatch.setattr(_os, "fork", _guarded_fork)
+
+    try:
+        import multiprocessing.process as _multiprocessing_process
+        import psutil as _psutil
+
+        real_process_start = _multiprocessing_process.BaseProcess.start
+
+        def _guarded_process_start(self, *args, **kwargs):
+            result = real_process_start(self, *args, **kwargs)
+            if self.pid is not None:
+                _record_owned_process(self.pid)
+            return result
+
+        monkeypatch.setattr(
+            _multiprocessing_process.BaseProcess, "start", _guarded_process_start
+        )
+
+        real_process_children = _psutil.Process.children
+
+        def _guarded_process_children(self, *args, **kwargs):
+            descendants = real_process_children(self, *args, **kwargs)
+            record = owned_process_group_registry.get(int(self.pid))
+            if record is None:
+                return descendants
+            try:
+                leader_created_at = self.create_time()
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                return descendants
+            if leader_created_at != record.get("leader_created_at"):
+                return descendants
+            for descendant in descendants:
+                try:
+                    owned_process_identity_registry[int(descendant.pid)] = (
+                        descendant.create_time()
+                    )
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied, OSError):
+                    continue
+            return descendants
+
+        monkeypatch.setattr(_psutil.Process, "children", _guarded_process_children)
+    except (AttributeError, ImportError):
+        pass
 
     # ── Subprocess command-string inspection (whole-line) ──────────
     _HERMES_TOKENS = (
@@ -1413,16 +1818,38 @@ def _live_system_guard(request, monkeypatch):
         "hermes gateway",
     )
     _MUTATING_VERBS = (
-        "restart", "start", "stop", "kill", "reload",
-        "reset-failed", "enable", "disable", "mask", "unmask",
-        "daemon-reload", "try-restart", "reload-or-restart",
+        "restart",
+        "start",
+        "stop",
+        "kill",
+        "reload",
+        "reset-failed",
+        "enable",
+        "disable",
+        "mask",
+        "unmask",
+        "daemon-reload",
+        "try-restart",
+        "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
     # Shell/launcher executables whose arguments are themselves commands —
     # argv[0]-only scanning must not exempt what they wrap.
     _WRAPPER_COMMANDS = (
-        "sh", "bash", "zsh", "dash", "env", "nohup", "setsid",
-        "timeout", "sudo", "xargs", "nice", "ionice", "stdbuf", "flock",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "env",
+        "nohup",
+        "setsid",
+        "timeout",
+        "sudo",
+        "xargs",
+        "nice",
+        "ionice",
+        "stdbuf",
+        "flock",
     )
 
     def _cmd_to_string(cmd) -> str:
@@ -1548,6 +1975,7 @@ def _live_system_guard(request, monkeypatch):
         def _guarded(cmd, *args, **kwargs):
             _check_subprocess_cmd(name, cmd)
             return real(cmd, *args, **kwargs)
+
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
         # the wrapped object is. ``subprocess.Popen[bytes]`` is used as
@@ -1561,11 +1989,326 @@ def _live_system_guard(request, monkeypatch):
     def _wrap_popen():
         """Subclass Popen so isinstance checks AND Popen[bytes] still work."""
         real = _subprocess.Popen
+        popen_signature = inspect.signature(real)
+        group_harness = (
+            "import json,os,select,signal,struct,subprocess,sys,traceback\n"
+            "control_read=int(sys.argv[1]); done_write=int(sys.argv[2]); "
+            "target_pid_write=int(sys.argv[3]); signal_read=int(sys.argv[4]); "
+            "signal_ack_write=int(sys.argv[5])\n"
+            "payload=json.loads(sys.argv[6]); target=None; returncode=1\n"
+            "for descriptor in (control_read,done_write,target_pid_write,"
+            "signal_read,signal_ack_write): os.set_inheritable(descriptor,False)\n"
+            "def forward(signum, _frame):\n"
+            "    if target is not None and target.poll() is None:\n"
+            "        try: os.kill(target.pid, signum)\n"
+            "        except ProcessLookupError: pass\n"
+            "for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):\n"  # windows-footgun: ok -- POSIX harness
+            "    signal.signal(signum, forward)\n"
+            "if os.read(control_read, 1) != b'S': os._exit(126)\n"
+            "try:\n"
+            "    target=subprocess.Popen(payload['cmd'], shell=payload['shell'], "
+            "executable=payload['executable'], close_fds=payload['close_fds'], "
+            "pass_fds=tuple(payload['pass_fds']))\n"
+            "    os.write(target_pid_write, f'{target.pid}\\n'.encode('ascii'))\n"
+            "    os.close(target_pid_write); target_pid_write=-1\n"
+            "    while target.poll() is None:\n"
+            "        readable,_,_=select.select((signal_read,),(),(),0.02)\n"
+            "        if not readable: continue\n"
+            "        request=b''\n"
+            "        while len(request) < 4:\n"
+            "            chunk=os.read(signal_read, 4-len(request))\n"
+            "            if not chunk: break\n"
+            "            request += chunk\n"
+            "        if len(request) != 4: break\n"
+            "        signum=struct.unpack('!i', request)[0]\n"
+            "        delivered=b'N'\n"
+            "        if target.poll() is None:\n"
+            "            try:\n"
+            "                target.send_signal(signum); delivered=b'A'\n"
+            "            except (ProcessLookupError,OSError,ValueError): pass\n"
+            "        try: os.write(signal_ack_write, delivered)\n"
+            "        except OSError: break\n"
+            "    returncode=target.wait()\n"
+            "except BaseException:\n"
+            "    traceback.print_exc()\n"
+            "finally:\n"
+            "    if target_pid_write >= 0:\n"
+            "        try: os.close(target_pid_write)\n"
+            "        except OSError: pass\n"
+            "    for descriptor in (signal_read,signal_ack_write):\n"
+            "        try: os.close(descriptor)\n"
+            "        except OSError: pass\n"
+            "    try: os.write(done_write, b'D')\n"
+            "    except OSError: pass\n"
+            "    final_marker=b''\n"
+            "    try: final_marker=os.read(control_read, 1)\n"
+            "    except OSError: pass\n"
+            "    os.close(control_read); os.close(done_write)\n"
+            "    if final_marker != b'F': os._exit(125)\n"
+            "if returncode < 0:\n"
+            "    signum=-returncode\n"
+            "    if signum not in tuple(getattr(signal, name, None) for name in "
+            "('SIGKILL', 'SIGSTOP')): "
+            "signal.signal(signum, signal.SIG_DFL)\n"
+            "    os.kill(os.getpid(), signum)\n"
+            "raise SystemExit(returncode)\n"
+        )
+
+        def normalize_command(cmd):
+            if isinstance(cmd, (str, bytes, _os.PathLike)):
+                return _os.fsdecode(cmd)
+            return [_os.fsdecode(part) for part in cmd]
+
+        def inherited_caller_fds() -> tuple[int, ...]:
+            """Snapshot unnamed inheritable FDs for close_fds=False parity."""
+            for fd_root in ("/dev/fd", "/proc/self/fd"):
+                try:
+                    names = real_os_listdir(fd_root)
+                except OSError:
+                    continue
+                inherited = []
+                for name in names:
+                    try:
+                        descriptor = int(name)
+                    except ValueError:
+                        continue
+                    if descriptor <= 2:
+                        continue
+                    try:
+                        if _os.get_inheritable(descriptor):
+                            inherited.append(descriptor)
+                    except OSError:
+                        continue
+                return tuple(sorted(set(inherited)))
+            raise RuntimeError(
+                "cannot preserve close_fds=False without an open-FD directory"
+            )
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
-            def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
-                super().__init__(cmd, *args, **kwargs)
+            def __init__(self, *popen_args, **kwargs):
+                bound = popen_signature.bind(*popen_args, **kwargs)
+                call_arguments = dict(bound.arguments)
+                bound_cmd = call_arguments.pop("args")
+                _check_subprocess_cmd("Popen", bound_cmd)
+                use_group_harness = _os.name == "posix" and bool(
+                    call_arguments.get("start_new_session", False)
+                )
+                if not use_group_harness:
+                    super().__init__(*popen_args, **kwargs)
+                    _record_owned_process(self.pid)
+                    return
+
+                original_pass_fds = tuple(
+                    int(descriptor) for descriptor in call_arguments.get("pass_fds", ())
+                )
+                for descriptor in original_pass_fds:
+                    real_os_fstat(descriptor)
+                effective_close_fds = bool(
+                    call_arguments.get("close_fds", True) or original_pass_fds
+                )
+                caller_inheritable_fds = (
+                    () if effective_close_fds else inherited_caller_fds()
+                )
+                control_read, control_write = _os.pipe()
+                done_read, done_write = _os.pipe()
+                target_pid_read, target_pid_write = _os.pipe()
+                signal_read, signal_write = _os.pipe()
+                signal_ack_read, signal_ack_write = _os.pipe()
+                control_descriptors = (
+                    control_read,
+                    control_write,
+                    done_read,
+                    done_write,
+                    target_pid_read,
+                    target_pid_write,
+                    signal_read,
+                    signal_write,
+                    signal_ack_read,
+                    signal_ack_write,
+                )
+                if set(original_pass_fds).intersection(control_descriptors):
+                    for descriptor in control_descriptors:
+                        real_os_close(descriptor)
+                    raise OSError(
+                        _errno.EBADF,
+                        "caller pass_fds changed during guarded Popen setup",
+                    )
+                payload = {
+                    "cmd": normalize_command(bound_cmd),
+                    "shell": bool(call_arguments.get("shell", False)),
+                    "executable": (
+                        _os.fsdecode(call_arguments["executable"])
+                        if call_arguments.get("executable") is not None
+                        else None
+                    ),
+                    "close_fds": bool(call_arguments.get("close_fds", True)),
+                    "pass_fds": [int(fd) for fd in original_pass_fds],
+                }
+                harness_kwargs = dict(call_arguments)
+                harness_kwargs["shell"] = False
+                harness_kwargs.pop("executable", None)
+                harness_kwargs["close_fds"] = True
+                harness_kwargs["pass_fds"] = tuple(
+                    sorted({
+                        *original_pass_fds,
+                        *caller_inheritable_fds,
+                        control_read,
+                        done_write,
+                        target_pid_write,
+                        signal_read,
+                        signal_ack_write,
+                    })
+                )
+                harness_cmd = [
+                    sys.executable,
+                    "-c",
+                    group_harness,
+                    str(control_read),
+                    str(done_write),
+                    str(target_pid_write),
+                    str(signal_read),
+                    str(signal_ack_write),
+                    json.dumps(payload, separators=(",", ":")),
+                ]
+                try:
+                    super().__init__(harness_cmd, **harness_kwargs)
+                except BaseException:
+                    for descriptor in control_descriptors:
+                        try:
+                            real_os_close(descriptor)
+                        except OSError:
+                            pass
+                    raise
+                real_os_close(control_read)
+                real_os_close(done_write)
+                real_os_close(target_pid_write)
+                real_os_close(signal_read)
+                real_os_close(signal_ack_write)
+                self.args = bound_cmd
+                self._guarded_signal_lock = threading.Lock()
+                self._guarded_signal_write = signal_write
+                self._guarded_signal_ack_read = signal_ack_read
+                _record_owned_process(self.pid)
+                try:
+                    leader_created_at = real_psutil_process(self.pid).create_time()
+                except (
+                    _teardown_psutil.NoSuchProcess,
+                    _teardown_psutil.AccessDenied,
+                    OSError,
+                ):
+                    leader_created_at = None
+                owned_process_group_registry[int(self.pid)] = {
+                    "leader_created_at": leader_created_at,
+                    "expected_pgid": int(self.pid),
+                    "control_write": control_write,
+                    "done_read": done_read,
+                    "signal_owner": self,
+                }
+                try:
+                    _start_owned_group_monitor(
+                        int(self.pid), owned_process_group_registry[int(self.pid)]
+                    )
+                    real_os_write(control_write, b"S")
+                    target_pid_bytes = b""
+                    target_pid_deadline = time.monotonic() + 5.0
+                    while b"\n" not in target_pid_bytes:
+                        remaining = target_pid_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError(
+                                "owned process-group harness did not publish target PID"
+                            )
+                        readable, _, _ = real_select(
+                            (target_pid_read,), (), (), remaining
+                        )
+                        if not readable:
+                            continue
+                        chunk = real_os_read(target_pid_read, 64)
+                        if not chunk:
+                            raise RuntimeError(
+                                "owned process-group harness closed before target PID"
+                            )
+                        target_pid_bytes += chunk
+                    self._guarded_target_pid = int(target_pid_bytes.split(b"\n", 1)[0])
+                except BaseException:
+                    self._close_guarded_signal_channel()
+                    try:
+                        teardown_killpg(int(self.pid), _signal.SIGKILL)
+                    except (ProcessLookupError, TypeError):
+                        pass
+                    try:
+                        real_waitpid(int(self.pid), 0)
+                    except ChildProcessError:
+                        pass
+                    raise
+                finally:
+                    try:
+                        real_os_close(target_pid_read)
+                    except OSError:
+                        pass
+
+            def _close_guarded_signal_channel(self):
+                lock = getattr(self, "_guarded_signal_lock", None)
+                if lock is None:
+                    return
+                with lock:
+                    for attribute in (
+                        "_guarded_signal_write",
+                        "_guarded_signal_ack_read",
+                    ):
+                        descriptor = getattr(self, attribute, None)
+                        setattr(self, attribute, None)
+                        if isinstance(descriptor, int):
+                            try:
+                                real_os_close(descriptor)
+                            except OSError:
+                                pass
+
+            def send_signal(self, sig):
+                target_pid = getattr(self, "_guarded_target_pid", None)
+                if target_pid is None:
+                    return super().send_signal(sig)
+                if self.poll() is not None:
+                    return None
+                lock = self._guarded_signal_lock
+                with lock:
+                    signal_write = self._guarded_signal_write
+                    signal_ack_read = self._guarded_signal_ack_read
+                    if signal_write is None or signal_ack_read is None:
+                        return None
+                    try:
+                        real_os_write(signal_write, _struct.pack("!i", int(sig)))
+                        readable, _, _ = real_select((signal_ack_read,), (), (), 2.0)
+                        if not readable:
+                            raise RuntimeError(
+                                "owned process-group harness did not acknowledge signal"
+                            )
+                        acknowledgement = real_os_read(signal_ack_read, 1)
+                    except (BrokenPipeError, ProcessLookupError, OSError):
+                        return None
+                    if acknowledgement not in (b"", b"A", b"N"):
+                        raise RuntimeError(
+                            "owned process-group harness returned invalid signal acknowledgement"
+                        )
+                return None
+
+            def poll(self):
+                returncode = super().poll()
+                if returncode is not None:
+                    self._close_guarded_signal_channel()
+                return returncode
+
+            def wait(self, timeout=None):
+                try:
+                    return super().wait(timeout=timeout)
+                finally:
+                    if self.returncode is not None:
+                        self._close_guarded_signal_channel()
+
+            def terminate(self):
+                self.send_signal(_signal.SIGTERM)
+
+            def kill(self):
+                self.send_signal(_signal.SIGKILL)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -1617,27 +2360,28 @@ def _live_system_guard(request, monkeypatch):
     # pty.spawn — POSIX-only.
     try:
         import pty as _pty
-        if hasattr(_pty, "spawn"):
-            real_pty_spawn = _pty.spawn
+    except ImportError:
+        _pty = None
+    if _pty is not None and hasattr(_pty, "spawn"):
+        real_pty_spawn = _pty.spawn
 
-            def _guarded_pty_spawn(argv, *args, **kwargs):
-                _check_subprocess_cmd("pty.spawn", argv)
-                return real_pty_spawn(argv, *args, **kwargs)
+        def _guarded_pty_spawn(argv, *args, **kwargs):
+            _check_subprocess_cmd("pty.spawn", argv)
+            return real_pty_spawn(argv, *args, **kwargs)
 
-            monkeypatch.setattr(_pty, "spawn", _guarded_pty_spawn)
-    except Exception:
-        pass
+        monkeypatch.setattr(_pty, "spawn", _guarded_pty_spawn)
 
     # asyncio.create_subprocess_* — bypasses subprocess module entirely.
     try:
         import asyncio as _asyncio
+    except ImportError:
+        _asyncio = None
+    if _asyncio is not None:
         real_async_exec = _asyncio.create_subprocess_exec
         real_async_shell = _asyncio.create_subprocess_shell
 
         async def _guarded_async_exec(program, *args, **kwargs):
-            _check_subprocess_cmd(
-                "asyncio.create_subprocess_exec", [program, *args]
-            )
+            _check_subprocess_cmd("asyncio.create_subprocess_exec", [program, *args])
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
@@ -1645,13 +2389,158 @@ def _live_system_guard(request, monkeypatch):
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
-        monkeypatch.setattr(
-            _asyncio, "create_subprocess_shell", _guarded_async_shell
-        )
-    except Exception:
-        pass
+        monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
 
-    yield
+    try:
+        yield
+    finally:
+
+        def _stop_group_monitors() -> None:
+            for record in owned_process_group_registry.values():
+                stop_event = record.get("monitor_stop")
+                if isinstance(stop_event, threading.Event):
+                    stop_event.set()
+            for pgid, record in owned_process_group_registry.items():
+                monitor_thread = record.get("monitor_thread")
+                if not isinstance(monitor_thread, threading.Thread):
+                    continue
+                monitor_thread.join(timeout=2.0)
+                if monitor_thread.is_alive():
+                    pytest.fail(
+                        "tests/conftest.py live-system guard descendant monitor "
+                        f"did not stop for process group {pgid}"
+                    )
+                if record.get("monitor_error") is not None:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard descendant monitor "
+                        f"failed for process group {pgid}: {record['monitor_error']}"
+                    )
+
+        def _kill_retained_identities():
+            """Kill only descendants whose PID and creation time still match."""
+            if real_psutil_process is None:
+                pytest.fail(
+                    "tests/conftest.py live-system guard cannot verify exact "
+                    "owned descendant identities"
+                )
+
+            pending = dict(owned_process_identity_registry)
+            for pid, created_at in tuple(pending.items()):
+                try:
+                    candidate = real_psutil_process(pid)
+                    if candidate.create_time() != created_at:
+                        pending.pop(pid, None)
+                        continue
+                    real_kill(pid, _signal.SIGKILL)
+                except (_teardown_psutil.NoSuchProcess, ProcessLookupError):
+                    pending.pop(pid, None)
+                except (_teardown_psutil.AccessDenied, OSError):
+                    continue
+
+            deadline = time.monotonic() + 3.0
+            while pending and time.monotonic() < deadline:
+                for pid, created_at in tuple(pending.items()):
+                    try:
+                        candidate = real_psutil_process(pid)
+                        if (
+                            candidate.create_time() != created_at
+                            or candidate.status() == _teardown_psutil.STATUS_ZOMBIE
+                        ):
+                            pending.pop(pid, None)
+                    except _teardown_psutil.NoSuchProcess:
+                        pending.pop(pid, None)
+                    except (_teardown_psutil.AccessDenied, OSError):
+                        continue
+                if pending:
+                    time.sleep(0.02)
+            if pending:
+                pytest.fail(
+                    "tests/conftest.py live-system guard could not drain exact "
+                    "owned descendant identities: "
+                    + ", ".join(str(pid) for pid in sorted(pending))
+                )
+
+        _stop_group_monitors()
+        if _os.name == "posix" and teardown_killpg is not None:
+            for pgid, record in tuple(owned_process_group_registry.items()):
+                try:
+                    waited_pid, _status = real_waitpid(pgid, _os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                if waited_pid != 0:
+                    continue
+                try:
+                    leader = real_psutil_process(pgid)
+                    leader_created_at = leader.create_time()
+                except _teardown_psutil.NoSuchProcess:
+                    continue
+                except (_teardown_psutil.AccessDenied, OSError) as exc:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard cannot authenticate "
+                        f"live process-group leader {pgid}: {exc}"
+                    )
+                if leader_created_at != record.get("leader_created_at"):
+                    pytest.fail(
+                        "tests/conftest.py live-system guard refused reused live "
+                        f"process-group leader {pgid}"
+                    )
+                try:
+                    actual_pgid = real_getpgid(pgid)
+                except OSError as exc:
+                    pytest.fail(
+                        "tests/conftest.py live-system guard cannot resolve live "
+                        f"process-group leader {pgid}: {exc}"
+                    )
+                if actual_pgid != pgid or actual_pgid != record.get("expected_pgid"):
+                    pytest.fail(
+                        "tests/conftest.py live-system guard refused non-leader "
+                        f"process group {pgid}"
+                    )
+                try:
+                    teardown_killpg(pgid, _signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    real_waitpid(pgid, 0)
+                except ChildProcessError:
+                    pass
+            _kill_retained_identities()
+        if _os.name == "posix":
+            for pid in tuple(owned_process_registry):
+                try:
+                    waited_pid, _status = real_waitpid(pid, _os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                if waited_pid == 0:
+                    created_at = owned_process_creation_registry.get(pid)
+                    if created_at is None:
+                        pytest.fail(
+                            "tests/conftest.py live-system guard cannot authenticate "
+                            f"live direct child {pid}"
+                        )
+                    try:
+                        candidate = real_psutil_process(pid)
+                        current_created_at = candidate.create_time()
+                    except _teardown_psutil.NoSuchProcess:
+                        continue
+                    except (_teardown_psutil.AccessDenied, OSError) as exc:
+                        pytest.fail(
+                            "tests/conftest.py live-system guard cannot authenticate "
+                            f"live direct child {pid}: {exc}"
+                        )
+                    if current_created_at != created_at:
+                        pytest.fail(
+                            "tests/conftest.py live-system guard refused reused "
+                            f"direct-child PID {pid}"
+                        )
+                    try:
+                        real_kill(pid, _signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        real_waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
 
 
 @pytest.fixture(autouse=True)
