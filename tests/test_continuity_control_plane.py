@@ -55,6 +55,7 @@ from install_continuity_adapters import (
     install_hermes_adapter,
     render_project_adapters,
     rollback_hermes_adapter,
+    validate_hermes_manifest,
 )
 
 
@@ -2581,6 +2582,52 @@ def test_hermes_adapter_rollback_rejects_noncanonical_home(
         rollback_hermes_adapter(REPO_ROOT, candidate, apply=False)
 
 
+@pytest.mark.parametrize("operation", ("apply", "rollback", "validate", "observe"))
+def test_hermes_adapter_rejects_dirty_config_home_retarget(
+    pilot: dict[str, Path], tmp_path: Path, operation: str
+) -> None:
+    retargeted_state = tmp_path / "retargeted-state"
+    retargeted_state.mkdir()
+    retargeted_home = retargeted_state / "hermes-home/.hermes"
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+    config["state_root"] = str(retargeted_state)
+    config["hermes_home"] = str(retargeted_home)
+    atomic_write_json(pilot["config"], config)
+
+    with pytest.raises(ContinuityError, match="committed HEAD"):
+        if operation == "apply":
+            install_hermes_adapter(pilot["repo"], retargeted_home)
+        elif operation == "rollback":
+            rollback_hermes_adapter(pilot["repo"], retargeted_home, apply=False)
+        elif operation == "validate":
+            validate_hermes_manifest(pilot["repo"], retargeted_home, {})
+        else:
+            continuity_native_observation.observe_hermes_hook(
+                pilot["repo"], pilot["config"], retargeted_home
+            )
+
+    assert not retargeted_home.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation semantics")
+def test_hermes_adapter_rejects_canonical_home_symlink_escape(
+    pilot: dict[str, Path], tmp_path: Path
+) -> None:
+    escape = tmp_path / "symlink-escape"
+    escape.mkdir()
+    hermes_home = Path(
+        json.loads(pilot["config"].read_text(encoding="utf-8"))["hermes_home"]
+    )
+    hermes_home.parent.mkdir(parents=True)
+    hermes_home.symlink_to(escape, target_is_directory=True)
+
+    with pytest.raises(ContinuityError, match="canonical isolated pilot home"):
+        install_hermes_adapter(pilot["repo"], hermes_home)
+
+    assert not (escape / "config.yaml").exists()
+    assert not (escape / continuity_adapters.HERMES_MANIFEST).exists()
+
+
 def test_hermes_manifest_rejects_authenticated_forged_rollback_authority(
     pilot: dict[str, Path],
 ) -> None:
@@ -3242,7 +3289,9 @@ def test_completed_command_does_not_signal_released_process_group(
 ) -> None:
     signalled: list[tuple[int, int]] = []
     cleanup_modes: list[bool] = []
+    released_parent_snapshots: list[int] = []
     real_terminate = continuity_common._terminate_process_tree
+    real_snapshot = continuity_common._ContainedProcess.snapshot_descendants
 
     def record_released_group(pgid: int, signum: int) -> None:
         signalled.append((pgid, signum))
@@ -3251,9 +3300,19 @@ def test_completed_command_does_not_signal_released_process_group(
         cleanup_modes.append(kwargs.get("include_parent", True))
         real_terminate(*args, **kwargs)
 
+    def record_parent_snapshot(contained) -> None:
+        if contained.process.poll() is not None:
+            released_parent_snapshots.append(contained.process.pid)
+        real_snapshot(contained)
+
     monkeypatch.setattr(os, "killpg", record_released_group)
     monkeypatch.setattr(
         continuity_common, "_terminate_process_tree", record_cleanup_mode
+    )
+    monkeypatch.setattr(
+        continuity_common._ContainedProcess,
+        "snapshot_descendants",
+        record_parent_snapshot,
     )
 
     result = run_command(
@@ -3264,6 +3323,7 @@ def test_completed_command_does_not_signal_released_process_group(
     assert result.stdout.strip() == "completed"
     assert signalled == []
     assert cleanup_modes == [False]
+    assert released_parent_snapshots == []
 
 
 def test_empty_child_environment_does_not_inherit_ambient_credentials(
@@ -3483,6 +3543,7 @@ def test_native_observer_consumes_signal_caught_during_handler_restoration(
     assert contained.terminated is True
 
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fork test; Windows proof follows")
 def test_native_observer_blocks_termination_across_spawn_handler_race(
     tmp_path: Path,

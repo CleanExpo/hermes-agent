@@ -31,6 +31,7 @@ from continuity_common import (
 from install_continuity_adapters import (
     HERMES_MANIFEST,
     _managed_hermes_hooks,
+    _require_canonical_hermes_home,
     render_project_adapters,
     validate_hermes_manifest,
 )
@@ -387,6 +388,9 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
 
 
 def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -> None:
+    hermes_home, _committed_config = _require_canonical_hermes_home(
+        repo_root, hermes_home
+    )
     target = hermes_home / "config.yaml"
     config = load_json(config_path)
     hermes_runtime = next(

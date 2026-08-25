@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -138,18 +139,70 @@ def _load_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
     return loaded, text
 
 
-def _require_canonical_hermes_home(repo_root: Path, hermes_home: Path) -> Path:
-    config = load_json(repo_root.resolve() / ".continuity/config.json")
-    state_root = Path(str(config.get("state_root", ""))).resolve()
-    configured = Path(str(config.get("hermes_home", ""))).resolve()
+def _committed_continuity_config(repo_root: Path) -> dict[str, Any]:
+    repo_root = repo_root.resolve()
+    config_path = repo_root / ".continuity/config.json"
+    if config_path.is_symlink():
+        raise ContinuityError(
+            "working continuity config must not be a symlink to Hermes authority"
+        )
+    try:
+        result = subprocess.run(
+            ["git", "show", "HEAD:.continuity/config.json"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ContinuityError(
+            "committed HEAD continuity config could not be read for Hermes authority"
+        ) from exc
+    if result.returncode != 0:
+        raise ContinuityError(
+            "committed HEAD continuity config is unavailable for Hermes authority"
+        )
+    try:
+        committed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContinuityError(
+            "committed HEAD continuity config is invalid JSON"
+        ) from exc
+    if not isinstance(committed, dict):
+        raise ContinuityError("committed HEAD continuity config is not an object")
+    working = load_json(config_path)
+    for key in ("state_root", "hermes_home"):
+        if working.get(key) != committed.get(key):
+            raise ContinuityError(
+                f"working {key} does not match committed HEAD Hermes authority"
+            )
+    return committed
+
+
+def _require_canonical_hermes_home(
+    repo_root: Path, hermes_home: Path
+) -> tuple[Path, dict[str, Any]]:
+    config = _committed_continuity_config(repo_root)
+    state_root = Path(str(config.get("state_root", ""))).expanduser()
+    configured = Path(str(config.get("hermes_home", ""))).expanduser()
+    if not state_root.is_absolute() or not configured.is_absolute():
+        raise ContinuityError("committed HEAD Hermes authority paths must be absolute")
     expected = state_root / "hermes-home" / ".hermes"
-    candidate = hermes_home.resolve()
-    if configured != expected or candidate != configured:
+    candidate = hermes_home.expanduser().absolute()
+    live_home = (Path.home() / ".hermes").resolve()
+    if (
+        configured != expected
+        or candidate != configured
+        or configured.resolve() != configured
+        or candidate.resolve() != candidate
+        or candidate.resolve() == live_home
+    ):
         raise ContinuityError(
             "Hermes operations require the canonical isolated pilot home "
             f"under the configured state root: {expected}"
         )
-    return candidate
+    return candidate, config
 
 
 def _managed_hermes_hooks(repo_root: Path) -> dict[str, Any]:
@@ -178,15 +231,16 @@ def validate_hermes_manifest(
     repo_root: Path, hermes_home: Path, manifest: dict[str, Any]
 ) -> dict[str, Any]:
     """Authenticate and semantically validate the complete rollback authority."""
-    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
+    hermes_home, committed_config = _require_canonical_hermes_home(
+        repo_root, hermes_home
+    )
     status = manifest.get("status")
     allowed_keys = set(HERMES_MANIFEST_BASE_KEYS)
     if status == "ROLLED_BACK":
         allowed_keys.add("restored_sha256")
     if set(manifest) != allowed_keys or manifest.get("schema_version") != 1:
         raise ContinuityError("Hermes adapter manifest has an invalid closed schema")
-    config = load_json(repo_root / ".continuity/config.json")
-    if receipt_signature_errors(config, manifest):
+    if receipt_signature_errors(committed_config, manifest):
         raise ContinuityError("Hermes adapter manifest authentication failed")
     target = hermes_home.resolve() / "config.yaml"
     if (
@@ -245,7 +299,9 @@ def validate_hermes_manifest(
 
 
 def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
-    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
+    hermes_home, committed_config = _require_canonical_hermes_home(
+        repo_root, hermes_home
+    )
     target = hermes_home / "config.yaml"
     manifest_path = hermes_home / HERMES_MANIFEST
     existing, before_text = _load_yaml_mapping(target)
@@ -270,9 +326,7 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
             else:
                 if prior.get("status") == "PREPARED":
                     prior["status"] = "INSTALLED"
-                    prior["auth"] = sign_receipt(
-                        load_json(repo_root / ".continuity/config.json"), prior
-                    )
+                    prior["auth"] = sign_receipt(committed_config, prior)
                     atomic_write_text(
                         manifest_path,
                         json.dumps(prior, indent=2, sort_keys=True) + "\n",
@@ -297,17 +351,13 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
         "absent_before": absent_before,
         "installed_hooks": installed_hooks,
     }
-    manifest["auth"] = sign_receipt(
-        load_json(repo_root / ".continuity/config.json"), manifest
-    )
+    manifest["auth"] = sign_receipt(committed_config, manifest)
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
     atomic_write_text(target, after_text)
     manifest["status"] = "INSTALLED"
-    manifest["auth"] = sign_receipt(
-        load_json(repo_root / ".continuity/config.json"), manifest
-    )
+    manifest["auth"] = sign_receipt(committed_config, manifest)
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -317,7 +367,9 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
 def rollback_hermes_adapter(
     repo_root: Path, hermes_home: Path, *, apply: bool
 ) -> dict[str, Any]:
-    hermes_home = _require_canonical_hermes_home(repo_root, hermes_home)
+    hermes_home, committed_config = _require_canonical_hermes_home(
+        repo_root, hermes_home
+    )
     manifest_path = hermes_home / HERMES_MANIFEST
     manifest = load_json(manifest_path)
     validate_hermes_manifest(repo_root, hermes_home, manifest)
@@ -374,9 +426,7 @@ def rollback_hermes_adapter(
         restored = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     manifest["status"] = "ROLLED_BACK"
     manifest["restored_sha256"] = _sha256_text(restored)
-    manifest["auth"] = sign_receipt(
-        load_json(repo_root / ".continuity/config.json"), manifest
-    )
+    manifest["auth"] = sign_receipt(committed_config, manifest)
     atomic_write_text(
         manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )

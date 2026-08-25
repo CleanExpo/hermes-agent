@@ -1316,6 +1316,7 @@ def _close_windows_job(handle: int) -> None:
 class _ContainedProcess:
     process: subprocess.Popen[str]
     family_token: str
+    leader_process: psutil.Process | None = None
     process_group: int | None = None
     windows_job: int | None = None
     windows_directory_lease: ExitStack | None = None
@@ -1330,9 +1331,8 @@ class _ContainedProcess:
     monitor_thread: threading.Thread | None = None
 
     def start_descendant_monitor(self) -> None:
-        if os.name != "posix":
+        if os.name != "posix" or self.leader_process is None:
             return
-        self.snapshot_descendants()
         self.monitor_thread = threading.Thread(
             target=self._monitor_descendants,
             name=f"continuity-descendants-{self.process.pid}",
@@ -1341,9 +1341,11 @@ class _ContainedProcess:
         self.monitor_thread.start()
 
     def _monitor_descendants(self) -> None:
-        while not self.monitor_stop.wait(5.0):
-            self.snapshot_descendants()
+        while not self.monitor_stop.is_set():
             if self.process.poll() is not None:
+                return
+            self.snapshot_descendants()
+            if self.monitor_stop.wait(0.05):
                 return
 
     def snapshot_process_family(self) -> None:
@@ -1384,8 +1386,11 @@ class _ContainedProcess:
                 self.tracked_descendants[identity] = candidate
 
     def snapshot_descendants(self) -> None:
+        leader = self.leader_process
+        if leader is None:
+            return
         try:
-            descendants = psutil.Process(self.process.pid).children(recursive=True)
+            descendants = leader.children(recursive=True)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return
         with self.descendant_lock:
@@ -1397,12 +1402,10 @@ class _ContainedProcess:
                 self.tracked_descendants[identity] = descendant
 
     def _finish_descendant_monitor(self) -> tuple[psutil.Process, ...]:
-        self.snapshot_descendants()
         self.monitor_stop.set()
         if self.monitor_thread is not None:
             self.monitor_thread.join(timeout=0.1)
             self.monitor_thread = None
-        self.snapshot_descendants()
         if os.name == "posix" and self.process_group is None:
             self.snapshot_process_family()
         with self.descendant_lock:
@@ -1517,6 +1520,7 @@ class _ContainedProcess:
                     _terminate_process_tree(
                         self.process,
                         tracked_descendants=late_descendants,
+                        include_parent=self.process.poll() is None,
                     )
         finally:
             if self.windows_directory_lease is not None:
@@ -1626,9 +1630,20 @@ def _spawn_contained_process(
             windows_job=job,
             windows_directory_lease=directory_lease,
         )
+    leader_process: psutil.Process | None = None
+    if os.name == "posix":
+        try:
+            # Popen still owns an unreaped child here, so its PID cannot yet
+            # be reused. Bind the psutil identity once at that safe point and
+            # never reconstruct it after communicate()/wait() releases it.
+            leader_process = psutil.Process(process.pid)
+            leader_process.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            leader_process = None
     contained = _ContainedProcess(
         process=process,
         family_token=family_token,
+        leader_process=leader_process,
         process_group=process.pid if os.name == "posix" else None,
         linux_subreaper=linux_subreaper,
         linux_cleanup_ack_fd=linux_cleanup_ack_read,
