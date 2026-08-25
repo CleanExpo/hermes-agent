@@ -1,12 +1,48 @@
 ---
 name: "speckit-tasks"
-description: "Generate an actionable, dependency-ordered tasks.md for the feature based on available design artifacts."
+description: "Generate dependency-ordered implementation tasks."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/tasks.md"
+  hermes:
+    tags: [spec-kit, planning]
+    category: development
+    related_skills: [speckit-plan, speckit-implement]
 ---
 
+# Spec Kit Tasks Skill
+
+Generates an actionable, dependency-ordered implementation task list. It does not execute or pre-complete generated tasks.
+
+## Overview
+
+Use the generated task procedure below to translate design artifacts into work units.
+
+## When to Use
+
+Use after planning artifacts are complete and before implementation.
+
+## Prerequisites
+
+A Spec Kit project with an approved specification and implementation plan.
+
+## How to Run
+
+Invoke `$speckit-tasks` with any task-shaping constraints.
+
+## Quick Reference
+
+Inputs are feature design artifacts; output is `tasks.md`.
+
+## Inputs
+
+The current specification, plan, design artifacts, and user constraints.
+
+## Procedure
 
 ## User Input
 
@@ -212,3 +248,31 @@ Every task MUST strictly follow this format:
 - [ ] tasks.md generated with all phases, task IDs, and file paths
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with task count, story breakdown, and MVP scope
+
+## Outputs
+
+A dependency-ordered `tasks.md` with concrete file paths and test work.
+
+## Constraints
+
+Generate tasks only from approved design artifacts.
+
+## Failure Handling
+
+Report missing planning inputs instead of fabricating task dependencies.
+
+## Examples
+
+Use `$speckit-tasks` after the implementation plan is approved.
+
+## Pitfalls
+
+Do not hide cross-story dependencies or pre-check generated tasks.
+
+## Verification
+
+Confirm task identifiers, dependencies, paths, and story phases are coherent.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

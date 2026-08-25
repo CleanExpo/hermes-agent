@@ -388,9 +388,12 @@ def observe_project_hook(repo_root: Path, config_path: Path, surface: str) -> No
 
 
 def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -> None:
-    hermes_home, _committed_config = _require_canonical_hermes_home(
-        repo_root, hermes_home
-    )
+    (
+        hermes_home,
+        _committed_config,
+        committed_adapters,
+        _authority_digests,
+    ) = _require_canonical_hermes_home(repo_root, hermes_home)
     target = hermes_home / "config.yaml"
     config = load_json(config_path)
     hermes_runtime = next(
@@ -411,7 +414,7 @@ def observe_hermes_hook(repo_root: Path, config_path: Path, hermes_home: Path) -
     manifest_digest = sha256_file(hermes_home / HERMES_MANIFEST)
     target_digest = sha256_file(target)
     installed_hooks = manifest.get("installed_hooks")
-    expected_hooks = _managed_hermes_hooks(repo_root)
+    expected_hooks = _managed_hermes_hooks(repo_root, committed_adapters)
     if (
         manifest.get("status") != "INSTALLED"
         or manifest.get("repo_root") != str(repo_root)

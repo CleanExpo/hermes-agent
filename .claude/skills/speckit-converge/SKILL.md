@@ -1,14 +1,48 @@
 ---
 name: "speckit-converge"
-description: "Assess the current codebase against the feature's spec, plan, and tasks, then append any remaining unbuilt work as new tasks to tasks.md so implement can complete it."
+description: "Append remaining implementation work to tasks."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/converge.md"
-user-invocable: true
-disable-model-invocation: false
+  hermes:
+    tags: [spec-kit, implementation]
+    category: development
+    related_skills: [speckit-analyze, speckit-tasks, speckit-implement]
 ---
 
+# Spec Kit Converge Skill
+
+Compares the built code against feature artifacts and appends verified remaining work. It does not silently rewrite completed tasks or implementation.
+
+## Overview
+
+Use the generated convergence procedure below to identify concrete unbuilt work.
+
+## When to Use
+
+Use after an implementation pass when specification coverage may be incomplete.
+
+## Prerequisites
+
+A Spec Kit project with current artifacts and an inspectable implementation.
+
+## How to Run
+
+Invoke `$speckit-converge` with any additional scope constraints.
+
+## Quick Reference
+
+Inputs are artifacts and code; output is appended remaining tasks.
+
+## Inputs
+
+The feature specification, plan, tasks, codebase, and optional user scope.
+
+## Procedure
 
 ## User Input
 
@@ -29,7 +63,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
 
@@ -59,6 +93,34 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
 
+## Outputs
+
+Verified remaining work appended to the current task list.
+
+## Constraints
+
+Preserve existing task history and append only evidence-backed work.
+
+## Failure Handling
+
+Report artifact or codebase gaps before changing the task list.
+
+## Examples
+
+Use `$speckit-converge` after an incomplete implementation pass.
+
+## Pitfalls
+
+Do not duplicate completed tasks or infer unrequested product scope.
+
+## Verification
+
+Confirm each appended task maps to a current artifact requirement and code gap.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.
+
 ## Goal
 
 Close the gap between what a feature's specification, plan, and tasks call for and what the
@@ -67,8 +129,8 @@ source of intent** (with the constitution as governing constraints), assess the 
 state of the code, determine which requirements, acceptance criteria, plan decisions, and
 existing tasks are unmet, incomplete, or only partially satisfied, and **append each piece
 of remaining work as a new, traceable task** at the bottom of `tasks.md` so that
-`/speckit-implement` can complete it. This command MUST run only after
-`/speckit-implement` has run on the current `tasks.md`, and after `/speckit-tasks` has produced a complete `tasks.md`.
+`$speckit-implement` can complete it. This command MUST run only after
+`$speckit-implement` has run on the current `tasks.md`, and after `$speckit-tasks` has produced a complete `tasks.md`.
 
 This is **not** a diff tool and does **not** track changes. It assesses the present state
 of the code relative to the feature's artifacts — no git, no branch comparison, no history.
@@ -82,7 +144,7 @@ of the code relative to the feature's artifacts — no git, no branch comparison
 - rewrite, renumber, reorder, or delete any existing task (including tasks from a prior
   Convergence phase);
 - modify, create, or delete any application code — completing the appended tasks is the
-  job of `/speckit-implement`.
+  job of `$speckit-implement`.
 
 When the codebase already satisfies everything, the command MUST leave `tasks.md`
 **byte-for-byte unchanged** (no empty Convergence header) and report a clean result.
@@ -103,8 +165,8 @@ Run `python3 .specify/scripts/python/check_prerequisites.py --json --require-tas
 - TASKS = FEATURE_DIR/tasks.md
 - CONSTITUTION = `.specify/memory/constitution.md` (if present)
 If `spec.md`, `plan.md`, or `tasks.md` is missing, STOP with a clear, actionable message naming the
-prerequisite command to run (`/speckit-specify` for a missing spec, `/speckit-plan` for a missing plan,
-`/speckit-tasks` for missing tasks). Do not produce partial output.
+prerequisite command to run (`$speckit-specify` for a missing spec, `$speckit-plan` for a missing plan,
+`$speckit-tasks` for missing tasks). Do not produce partial output.
 For single quotes in args like "I'm Groot", use escape syntax: e.g 'I'\''m Groot' (or double-quote if possible: "I'm Groot").
 
 ### 2. Load Artifacts (Progressive Disclosure)
@@ -233,7 +295,7 @@ Append to the **end** of `tasks.md`, per the append contract:
 ### 8. Provide Next Actions (Handoff)
 
 - On `tasks_appended`: state how many tasks were appended under which phase, and recommend
-  running `/speckit-implement` to complete them; note that a follow-up converge
+  running `$speckit-implement` to complete them; note that a follow-up converge
   run will find fewer or no remaining items.
 - On `converged`: recommend proceeding to review / opening a PR. No further implement pass
   is needed for this feature's specified scope.
@@ -250,7 +312,7 @@ After producing the result, check if `.specify/extensions.yml` exists in the pro
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
 - Report the convergence outcome (`converged` or `tasks_appended`) in-session before listing
   any hooks, so users can decide whether to run optional follow-up commands.
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
 

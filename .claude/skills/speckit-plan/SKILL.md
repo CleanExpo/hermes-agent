@@ -1,15 +1,48 @@
 ---
 name: "speckit-plan"
-description: "Execute the implementation planning workflow using the plan template to generate design artifacts."
-argument-hint: "Optional guidance for the planning phase"
+description: "Generate design artifacts from a feature spec."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/plan.md"
-user-invocable: true
-disable-model-invocation: false
+  hermes:
+    tags: [spec-kit, planning]
+    category: development
+    related_skills: [speckit-specify, speckit-clarify, speckit-tasks]
 ---
 
+# Spec Kit Plan Skill
+
+Generates implementation design artifacts from the approved feature specification. It does not execute implementation tasks.
+
+## Overview
+
+Use the generated planning procedure below to apply the project plan template.
+
+## When to Use
+
+Use after specification clarification and before task generation.
+
+## Prerequisites
+
+A Spec Kit project with an approved feature specification and constitution.
+
+## How to Run
+
+Invoke `$speckit-plan` with any design constraints.
+
+## Quick Reference
+
+Input is the approved specification; outputs are the implementation plan and design artifacts.
+
+## Inputs
+
+The current feature specification, constitution, and user constraints.
+
+## Procedure
 
 ## User Input
 
@@ -29,7 +62,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
     ```
@@ -81,7 +114,7 @@ Check if `.specify/extensions.yml` exists in the project root.
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Mandatory hook** (`optional: false`) — **You MUST emit `EXECUTE_COMMAND:` for each mandatory hook**:
     ```
@@ -167,3 +200,31 @@ Command ends after Phase 1 design. Report branch, IMPL_PLAN path, and generated 
 - [ ] Plan workflow executed and design artifacts generated
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with branch, plan path, and generated artifacts
+
+## Outputs
+
+The implementation plan and its required design artifacts.
+
+## Constraints
+
+Respect the constitution and resolve planning gates before proceeding.
+
+## Failure Handling
+
+Stop on unresolved clarifications or constitution violations.
+
+## Examples
+
+Use `$speckit-plan` after specification clarification is complete.
+
+## Pitfalls
+
+Do not turn planning assumptions into unapproved requirements.
+
+## Verification
+
+Confirm all expected artifacts exist and every gate result is reported.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

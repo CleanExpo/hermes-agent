@@ -1286,8 +1286,40 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
             item.add_marker(skip_marker)
 
 
+@pytest.fixture
+def owned_process_group_registry():
+    """Track process groups created by the current test process."""
+    return set()
+
+
+@pytest.fixture
+def register_owned_process_group(owned_process_group_registry):
+    """Register a test-owned process group after proving its ancestry."""
+    import psutil as _psutil
+
+    test_pid = os.getpid()
+
+    def register(pgid: int) -> int:
+        candidate = int(pgid)
+        try:
+            process = _psutil.Process(candidate)
+            family = {process.pid, *(parent.pid for parent in process.parents())}
+        except Exception as exc:
+            raise RuntimeError(
+                f"cannot prove process-group ownership for PGID {candidate}"
+            ) from exc
+        if test_pid not in family:
+            raise RuntimeError(
+                f"PGID {candidate} is outside the current test process subtree"
+            )
+        owned_process_group_registry.add(candidate)
+        return candidate
+
+    return register
+
+
 @pytest.fixture(autouse=True)
-def _live_system_guard(request, monkeypatch):
+def _live_system_guard(request, monkeypatch, owned_process_group_registry):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
     See block comment above for the why. Tests that genuinely need
@@ -1357,6 +1389,24 @@ def _live_system_guard(request, monkeypatch):
 
     real_kill = _os.kill
 
+    def _belongs_to_owned_process_group(pid: int) -> bool:
+        if _os.name != "posix" or pid <= 0:
+            return False
+        try:
+            return int(_os.getpgid(pid)) in owned_process_group_registry
+        except OSError:
+            return False
+
+    def _is_stale_or_zombie(pid: int) -> bool:
+        if _psutil is None or pid <= 0:
+            return False
+        try:
+            return _psutil.Process(pid).status() == _psutil.STATUS_ZOMBIE
+        except _psutil.NoSuchProcess:
+            return True
+        except Exception:
+            return False
+
     def _guarded_kill(pid, sig, *args, **kwargs):
         # Signal 0 is a pure liveness probe — it cannot terminate anything.
         # psutil.pid_exists() uses os.kill(pid, 0) on POSIX, and probing a
@@ -1365,7 +1415,11 @@ def _live_system_guard(request, monkeypatch):
         # test_entire_tree_is_sigkilled_not_just_parent.
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
-        if _is_own_subtree(int(pid)):
+        if (
+            _is_own_subtree(int(pid))
+            or _belongs_to_owned_process_group(int(pid))
+            or _is_stale_or_zombie(int(pid))
+        ):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
@@ -1393,7 +1447,10 @@ def _live_system_guard(request, monkeypatch):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            if (
+                int(pgid) == own_pgid
+                or int(pgid) in owned_process_group_registry
+            ):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -1566,6 +1623,8 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                if _os.name == "posix" and kwargs.get("start_new_session") is True:
+                    owned_process_group_registry.add(int(self.pid))
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"

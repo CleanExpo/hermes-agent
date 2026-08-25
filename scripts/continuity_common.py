@@ -1312,6 +1312,9 @@ def _close_windows_job(handle: int) -> None:
         raise OSError(ctypes.get_last_error(), "CloseHandle failed for process job")
 
 
+_DESCENDANT_MONITOR_DRAIN_TIMEOUT = 2.0
+
+
 @dataclass
 class _ContainedProcess:
     process: subprocess.Popen[str]
@@ -1404,7 +1407,11 @@ class _ContainedProcess:
     def _finish_descendant_monitor(self) -> tuple[psutil.Process, ...]:
         self.monitor_stop.set()
         if self.monitor_thread is not None:
-            self.monitor_thread.join(timeout=0.1)
+            self.monitor_thread.join(timeout=_DESCENDANT_MONITOR_DRAIN_TIMEOUT)
+            if self.monitor_thread.is_alive():
+                raise ContinuityError(
+                    "descendant monitor did not drain before cleanup deadline"
+                )
             self.monitor_thread = None
         if os.name == "posix" and self.process_group is None:
             self.snapshot_process_family()
@@ -1467,7 +1474,19 @@ class _ContainedProcess:
                     pass
 
     def _terminate_tree_owned(self) -> None:
-        tracked_descendants = self._finish_descendant_monitor()
+        try:
+            tracked_descendants = self._finish_descendant_monitor()
+        except ContinuityError:
+            with self.descendant_lock:
+                tracked_descendants = tuple(self.tracked_descendants.values())
+            leader_running = self.process.poll() is None
+            _terminate_process_tree(
+                self.process,
+                process_group=self.process_group if leader_running else None,
+                tracked_descendants=tracked_descendants,
+                include_parent=leader_running,
+            )
+            raise
         with self.descendant_lock:
             prior_identities = set(self.tracked_descendants)
         job_error: OSError | None = None

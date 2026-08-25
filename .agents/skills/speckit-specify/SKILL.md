@@ -1,12 +1,48 @@
 ---
 name: "speckit-specify"
-description: "Create or update the feature specification from a natural language feature description."
+description: "Create or update a feature specification."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/specify.md"
+  hermes:
+    tags: [spec-kit, requirements]
+    category: development
+    related_skills: [speckit-clarify, speckit-plan, speckit-checklist]
 ---
 
+# Spec Kit Specify Skill
+
+Creates or updates a feature specification from the user's stated need. It defines requirements without planning or implementing the solution.
+
+## Overview
+
+Use the generated specification procedure below to establish feature scope and acceptance criteria.
+
+## When to Use
+
+Use when a feature needs a new or revised specification.
+
+## Prerequisites
+
+A Spec Kit project and a concrete natural-language feature description.
+
+## How to Run
+
+Invoke `$speckit-specify` with the feature description.
+
+## Quick Reference
+
+Input is the feature description; output is an updated feature specification.
+
+## Inputs
+
+The user description, current project context, and constitution.
+
+## Procedure
 
 ## User Input
 
@@ -343,3 +379,31 @@ Success criteria must be:
 - [ ] Specification written to `SPEC_FILE` and validated against quality checklist
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with feature directory, spec file path, and checklist results
+
+## Outputs
+
+An updated feature specification and requirements-quality checklist result.
+
+## Constraints
+
+Describe user outcomes without prescribing implementation details.
+
+## Failure Handling
+
+Surface unresolved scope conflicts and avoid inventing requirements.
+
+## Examples
+
+Use `$speckit-specify Add exportable audit reports` for a new feature.
+
+## Pitfalls
+
+Do not encode framework choices as user-facing requirements.
+
+## Verification
+
+Confirm the specification passes its quality checklist and names measurable outcomes.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

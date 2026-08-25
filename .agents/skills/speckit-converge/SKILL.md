@@ -1,12 +1,48 @@
 ---
 name: "speckit-converge"
-description: "Assess the current codebase against the feature's spec, plan, and tasks, then append any remaining unbuilt work as new tasks to tasks.md so implement can complete it."
+description: "Append remaining implementation work to tasks."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/converge.md"
+  hermes:
+    tags: [spec-kit, implementation]
+    category: development
+    related_skills: [speckit-analyze, speckit-tasks, speckit-implement]
 ---
 
+# Spec Kit Converge Skill
+
+Compares the built code against feature artifacts and appends verified remaining work. It does not silently rewrite completed tasks or implementation.
+
+## Overview
+
+Use the generated convergence procedure below to identify concrete unbuilt work.
+
+## When to Use
+
+Use after an implementation pass when specification coverage may be incomplete.
+
+## Prerequisites
+
+A Spec Kit project with current artifacts and an inspectable implementation.
+
+## How to Run
+
+Invoke `$speckit-converge` with any additional scope constraints.
+
+## Quick Reference
+
+Inputs are artifacts and code; output is appended remaining tasks.
+
+## Inputs
+
+The feature specification, plan, tasks, codebase, and optional user scope.
+
+## Procedure
 
 ## User Input
 
@@ -56,6 +92,34 @@ You **MUST** consider the user input before proceeding (if not empty).
     After emitting the block above you MUST actually invoke the hook and wait for it to finish before continuing. Run it the same way you would run the command yourself in this agent/session (the invocation may differ from the literal `{command}` id shown above, e.g. a skills-mode agent runs it as `/skill:speckit-...` or `$speckit-...`). Emitting the block alone does not run the hook.
 
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
+
+## Outputs
+
+Verified remaining work appended to the current task list.
+
+## Constraints
+
+Preserve existing task history and append only evidence-backed work.
+
+## Failure Handling
+
+Report artifact or codebase gaps before changing the task list.
+
+## Examples
+
+Use `$speckit-converge` after an incomplete implementation pass.
+
+## Pitfalls
+
+Do not duplicate completed tasks or infer unrequested product scope.
+
+## Verification
+
+Confirm each appended task maps to a current artifact requirement and code gap.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.
 
 ## Goal
 

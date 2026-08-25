@@ -1,15 +1,48 @@
 ---
 name: "speckit-constitution"
-description: "Create or update the project constitution from interactive or provided principle inputs."
-argument-hint: "Principles or values for the project constitution"
+description: "Create or update the project constitution."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/constitution.md"
-user-invocable: true
-disable-model-invocation: false
+  hermes:
+    tags: [spec-kit, governance]
+    category: development
+    related_skills: [speckit-specify, speckit-plan]
 ---
 
+# Spec Kit Constitution Skill
+
+Creates or updates project governance from supplied principles. It does not implement feature or deployment requests.
+
+## Overview
+
+Use the generated procedure below to preserve governance scope and dependent-template compatibility.
+
+## When to Use
+
+Use when project principles or governance rules must be established or amended.
+
+## Prerequisites
+
+A Spec Kit project and explicit constitution inputs.
+
+## How to Run
+
+Invoke `$speckit-constitution` with the principles to adopt or change.
+
+## Quick Reference
+
+Inputs are governance principles; output is the project constitution.
+
+## Inputs
+
+User-provided principles and the current constitution.
+
+## Procedure
 
 ## User Input
 
@@ -35,7 +68,7 @@ and commands read the constitution at runtime and are not modified here.
   making changes.
 - After completing the constitution update, include a `Next Actions` section for each deferred
   intent. List the original intent and suggest the appropriate follow-up Spec Kit command, such
-  as `/speckit-specify`, without invoking it.
+  as `$speckit-specify`, without invoking it.
 - If there are no non-governance intents, omit the `Next Actions` section.
 
 ## Pre-Execution Checks
@@ -48,7 +81,7 @@ and commands read the constitution at runtime and are not modified here.
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
     ```
@@ -73,6 +106,34 @@ and commands read the constitution at runtime and are not modified here.
     ```
     After emitting the block above you MUST actually invoke the hook and wait for it to finish before continuing. Run it the same way you would run the command yourself in this agent/session (the invocation may differ from the literal `{command}` id shown above, e.g. a skills-mode agent runs it as `/skill:speckit-...` or `$speckit-...`). Emitting the block alone does not run the hook.
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
+
+## Outputs
+
+An updated project constitution and any deferred non-governance intents.
+
+## Constraints
+
+Modify governance only; do not implement features or deployments.
+
+## Failure Handling
+
+Ask for clarification when an instruction cannot be safely classified.
+
+## Examples
+
+Use `$speckit-constitution` to add a test-first project principle.
+
+## Pitfalls
+
+Do not embed transient feature decisions as permanent governance.
+
+## Verification
+
+Confirm the constitution is internally consistent and dependent intents are deferred.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.
 
 ## Outline
 
@@ -155,7 +216,7 @@ Check if `.specify/extensions.yml` exists in the project root.
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
     ```

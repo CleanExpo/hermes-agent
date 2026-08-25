@@ -1,12 +1,48 @@
 ---
 name: "speckit-constitution"
-description: "Create or update the project constitution from interactive or provided principle inputs."
+description: "Create or update the project constitution."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/constitution.md"
+  hermes:
+    tags: [spec-kit, governance]
+    category: development
+    related_skills: [speckit-specify, speckit-plan]
 ---
 
+# Spec Kit Constitution Skill
+
+Creates or updates project governance from supplied principles. It does not implement feature or deployment requests.
+
+## Overview
+
+Use the generated procedure below to preserve governance scope and dependent-template compatibility.
+
+## When to Use
+
+Use when project principles or governance rules must be established or amended.
+
+## Prerequisites
+
+A Spec Kit project and explicit constitution inputs.
+
+## How to Run
+
+Invoke `$speckit-constitution` with the principles to adopt or change.
+
+## Quick Reference
+
+Inputs are governance principles; output is the project constitution.
+
+## Inputs
+
+User-provided principles and the current constitution.
+
+## Procedure
 
 ## User Input
 
@@ -70,6 +106,34 @@ and commands read the constitution at runtime and are not modified here.
     ```
     After emitting the block above you MUST actually invoke the hook and wait for it to finish before continuing. Run it the same way you would run the command yourself in this agent/session (the invocation may differ from the literal `{command}` id shown above, e.g. a skills-mode agent runs it as `/skill:speckit-...` or `$speckit-...`). Emitting the block alone does not run the hook.
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
+
+## Outputs
+
+An updated project constitution and any deferred non-governance intents.
+
+## Constraints
+
+Modify governance only; do not implement features or deployments.
+
+## Failure Handling
+
+Ask for clarification when an instruction cannot be safely classified.
+
+## Examples
+
+Use `$speckit-constitution` to add a test-first project principle.
+
+## Pitfalls
+
+Do not embed transient feature decisions as permanent governance.
+
+## Verification
+
+Confirm the constitution is internally consistent and dependent intents are deferred.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.
 
 ## Outline
 

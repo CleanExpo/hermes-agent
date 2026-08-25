@@ -1,15 +1,48 @@
 ---
 name: "speckit-specify"
-description: "Create or update the feature specification from a natural language feature description."
-argument-hint: "Describe the feature you want to specify"
+description: "Create or update a feature specification."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/specify.md"
-user-invocable: true
-disable-model-invocation: false
+  hermes:
+    tags: [spec-kit, requirements]
+    category: development
+    related_skills: [speckit-clarify, speckit-plan, speckit-checklist]
 ---
 
+# Spec Kit Specify Skill
+
+Creates or updates a feature specification from the user's stated need. It defines requirements without planning or implementing the solution.
+
+## Overview
+
+Use the generated specification procedure below to establish feature scope and acceptance criteria.
+
+## When to Use
+
+Use when a feature needs a new or revised specification.
+
+## Prerequisites
+
+A Spec Kit project and a concrete natural-language feature description.
+
+## How to Run
+
+Invoke `$speckit-specify` with the feature description.
+
+## Quick Reference
+
+Input is the feature description; output is an updated feature specification.
+
+## Inputs
+
+The user description, current project context, and constitution.
+
+## Procedure
 
 ## User Input
 
@@ -29,7 +62,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Optional hook** (`optional: true`):
     ```
@@ -57,7 +90,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 ## Outline
 
-The text the user typed after `/speckit-specify` in the triggering message **is** the feature description. Assume you always have it available in this conversation even if `$ARGUMENTS` appears literally below. Do not ask the user to repeat it unless they provided an empty command.
+The text the user typed after `$speckit-specify` in the triggering message **is** the feature description. Assume you always have it available in this conversation even if `$ARGUMENTS` appears literally below. Do not ask the user to repeat it unless they provided an empty command.
 
 Given that feature description, do this:
 
@@ -105,10 +138,10 @@ Given that feature description, do this:
      }
      ```
      Write the actual resolved directory path value (for example, `specs/003-user-auth`), not the literal string `SPECIFY_FEATURE_DIRECTORY`.
-     This allows downstream commands (`/speckit-plan`, `/speckit-tasks`, etc.) to locate the feature directory without relying on git branch name conventions.
+     This allows downstream commands (`$speckit-plan`, `$speckit-tasks`, etc.) to locate the feature directory without relying on git branch name conventions.
 
    **IMPORTANT**:
-   - You must only create one feature per `/speckit-specify` invocation
+   - You must only create one feature per `$speckit-specify` invocation
    - The spec directory name and the git branch name are independent — they may be the same but that is the user's choice
    - The spec directory and file are always created by this command, never by the hook
 
@@ -181,7 +214,7 @@ Given that feature description, do this:
 
       ## Notes
 
-      - Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`
+      - Items marked incomplete require spec updates before `$speckit-clarify` or `$speckit-plan`
       ```
 
    b. **Run Validation Check**: Review the spec against each checklist item:
@@ -247,7 +280,7 @@ Check if `.specify/extensions.yml` exists in the project root.
 - For each remaining hook, do **not** attempt to interpret or evaluate hook `condition` expressions:
   - If the hook has no `condition` field, or it is null/empty, treat the hook as executable
   - If the hook defines a non-empty `condition`, skip the hook and leave condition evaluation to the HookExecutor implementation
-- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `/speckit-git-commit`.
+- When constructing command invocations from hook command names, replace dots (`.`) with hyphens (`-`). For example, `speckit.git.commit` → `$speckit-git-commit`.
 - For each executable hook, output the following based on its `optional` flag:
   - **Mandatory hook** (`optional: false`) — **You MUST emit `EXECUTE_COMMAND:` for each mandatory hook**:
     ```
@@ -276,7 +309,7 @@ Report completion to the user with:
 - `SPECIFY_FEATURE_DIRECTORY` — the feature directory path
 - `SPEC_FILE` — the spec file path
 - Checklist results summary
-- Readiness for the next phase (`/speckit-clarify` or `/speckit-plan`)
+- Readiness for the next phase (`$speckit-clarify` or `$speckit-plan`)
 
 **NOTE:** Branch creation is handled by the `before_specify` hook (git extension). Spec directory and file creation are always handled by this core command.
 
@@ -346,3 +379,31 @@ Success criteria must be:
 - [ ] Specification written to `SPEC_FILE` and validated against quality checklist
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with feature directory, spec file path, and checklist results
+
+## Outputs
+
+An updated feature specification and requirements-quality checklist result.
+
+## Constraints
+
+Describe user outcomes without prescribing implementation details.
+
+## Failure Handling
+
+Surface unresolved scope conflicts and avoid inventing requirements.
+
+## Examples
+
+Use `$speckit-specify Add exportable audit reports` for a new feature.
+
+## Pitfalls
+
+Do not encode framework choices as user-facing requirements.
+
+## Verification
+
+Confirm the specification passes its quality checklist and names measurable outcomes.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

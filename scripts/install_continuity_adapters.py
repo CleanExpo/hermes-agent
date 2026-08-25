@@ -34,8 +34,14 @@ HERMES_MANIFEST_BASE_KEYS = {
     "before_hooks",
     "absent_before",
     "installed_hooks",
+    "authority_inputs",
     "auth",
 }
+HERMES_AUTHORITY_INPUTS = (
+    ".continuity/config.json",
+    ".continuity/adapters.json",
+    ".continuity/toolchain.lock.json",
+)
 
 
 CLAUDE_EVENT_NAMES = {
@@ -102,9 +108,16 @@ def render_project_adapters(repo_root: Path) -> dict[Path, str]:
 
 
 def render_hermes_config(
-    repo_root: Path, existing: dict[str, Any] | None = None
+    repo_root: Path,
+    existing: dict[str, Any] | None = None,
+    *,
+    adapter_contract: dict[str, Any] | None = None,
 ) -> str:
-    contract = load_json(repo_root / ".continuity/adapters.json")
+    contract = (
+        adapter_contract
+        if adapter_contract is not None
+        else load_json(repo_root / ".continuity/adapters.json")
+    )
     timeout = int(contract["timeout_seconds"])
     config = dict(existing or {})
     hooks = dict(config.get("hooks") or {})
@@ -139,51 +152,68 @@ def _load_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
     return loaded, text
 
 
-def _committed_continuity_config(repo_root: Path) -> dict[str, Any]:
+def _committed_installer_authority(
+    repo_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     repo_root = repo_root.resolve()
-    config_path = repo_root / ".continuity/config.json"
-    if config_path.is_symlink():
-        raise ContinuityError(
-            "working continuity config must not be a symlink to Hermes authority"
-        )
-    try:
-        result = subprocess.run(
-            ["git", "show", "HEAD:.continuity/config.json"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ContinuityError(
-            "committed HEAD continuity config could not be read for Hermes authority"
-        ) from exc
-    if result.returncode != 0:
-        raise ContinuityError(
-            "committed HEAD continuity config is unavailable for Hermes authority"
-        )
-    try:
-        committed = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ContinuityError(
-            "committed HEAD continuity config is invalid JSON"
-        ) from exc
-    if not isinstance(committed, dict):
-        raise ContinuityError("committed HEAD continuity config is not an object")
-    working = load_json(config_path)
-    for key in ("state_root", "hermes_home"):
-        if working.get(key) != committed.get(key):
+    committed_bytes: dict[str, bytes] = {}
+    for relative in HERMES_AUTHORITY_INPUTS:
+        working_path = repo_root / relative
+        if working_path.is_symlink() or not working_path.is_file():
             raise ContinuityError(
-                f"working {key} does not match committed HEAD Hermes authority"
+                f"working {relative} is not a regular installer authority input"
             )
-    return committed
+        try:
+            result = subprocess.run(
+                ["git", "show", f"HEAD:{relative}"],
+                cwd=repo_root,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            working = working_path.read_bytes()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContinuityError(
+                f"committed HEAD installer authority could not read {relative}"
+            ) from exc
+        if result.returncode != 0:
+            raise ContinuityError(
+                f"committed HEAD installer authority is missing {relative}"
+            )
+        if working != result.stdout:
+            raise ContinuityError(
+                f"working {relative} does not match committed HEAD installer authority"
+            )
+        committed_bytes[relative] = result.stdout
+
+    parsed: dict[str, dict[str, Any]] = {}
+    for relative, payload in committed_bytes.items():
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ContinuityError(
+                f"committed HEAD installer authority is invalid JSON: {relative}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise ContinuityError(
+                f"committed HEAD installer authority is not an object: {relative}"
+            )
+        parsed[relative] = value
+    digests = {
+        relative: hashlib.sha256(payload).hexdigest()
+        for relative, payload in committed_bytes.items()
+    }
+    return (
+        parsed[".continuity/config.json"],
+        parsed[".continuity/adapters.json"],
+        digests,
+    )
 
 
 def _require_canonical_hermes_home(
     repo_root: Path, hermes_home: Path
-) -> tuple[Path, dict[str, Any]]:
-    config = _committed_continuity_config(repo_root)
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, str]]:
+    config, adapters, authority_digests = _committed_installer_authority(repo_root)
     state_root = Path(str(config.get("state_root", ""))).expanduser()
     configured = Path(str(config.get("hermes_home", ""))).expanduser()
     if not state_root.is_absolute() or not configured.is_absolute():
@@ -202,11 +232,15 @@ def _require_canonical_hermes_home(
             "Hermes operations require the canonical isolated pilot home "
             f"under the configured state root: {expected}"
         )
-    return candidate, config
+    return candidate, config, adapters, authority_digests
 
 
-def _managed_hermes_hooks(repo_root: Path) -> dict[str, Any]:
-    rendered = yaml.safe_load(render_hermes_config(repo_root)) or {}
+def _managed_hermes_hooks(
+    repo_root: Path, adapter_contract: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    rendered = yaml.safe_load(
+        render_hermes_config(repo_root, adapter_contract=adapter_contract)
+    ) or {}
     return dict(rendered.get("hooks") or {})
 
 
@@ -231,15 +265,20 @@ def validate_hermes_manifest(
     repo_root: Path, hermes_home: Path, manifest: dict[str, Any]
 ) -> dict[str, Any]:
     """Authenticate and semantically validate the complete rollback authority."""
-    hermes_home, committed_config = _require_canonical_hermes_home(
-        repo_root, hermes_home
-    )
+    (
+        hermes_home,
+        committed_config,
+        committed_adapters,
+        authority_digests,
+    ) = _require_canonical_hermes_home(repo_root, hermes_home)
     status = manifest.get("status")
     allowed_keys = set(HERMES_MANIFEST_BASE_KEYS)
     if status == "ROLLED_BACK":
         allowed_keys.add("restored_sha256")
     if set(manifest) != allowed_keys or manifest.get("schema_version") != 1:
         raise ContinuityError("Hermes adapter manifest has an invalid closed schema")
+    if manifest.get("authority_inputs") != authority_digests:
+        raise ContinuityError("Hermes adapter manifest authority inputs are stale")
     if receipt_signature_errors(committed_config, manifest):
         raise ContinuityError("Hermes adapter manifest authentication failed")
     target = hermes_home.resolve() / "config.yaml"
@@ -256,7 +295,7 @@ def validate_hermes_manifest(
     installed = manifest.get("installed_hooks")
     before = manifest.get("before_hooks")
     absent = manifest.get("absent_before")
-    expected = _managed_hermes_hooks(repo_root)
+    expected = _managed_hermes_hooks(repo_root, committed_adapters)
     if (
         not isinstance(installed, dict)
         or installed != expected
@@ -299,13 +338,16 @@ def validate_hermes_manifest(
 
 
 def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]:
-    hermes_home, committed_config = _require_canonical_hermes_home(
-        repo_root, hermes_home
-    )
+    (
+        hermes_home,
+        committed_config,
+        committed_adapters,
+        authority_digests,
+    ) = _require_canonical_hermes_home(repo_root, hermes_home)
     target = hermes_home / "config.yaml"
     manifest_path = hermes_home / HERMES_MANIFEST
     existing, before_text = _load_yaml_mapping(target)
-    installed_hooks = _managed_hermes_hooks(repo_root)
+    installed_hooks = _managed_hermes_hooks(repo_root, committed_adapters)
     hooks = dict(existing.get("hooks") or {})
 
     if manifest_path.is_file():
@@ -339,7 +381,9 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
 
     before_hooks = {name: hooks[name] for name in installed_hooks if name in hooks}
     absent_before = sorted(name for name in installed_hooks if name not in hooks)
-    after_text = render_hermes_config(repo_root, existing)
+    after_text = render_hermes_config(
+        repo_root, existing, adapter_contract=committed_adapters
+    )
     manifest = {
         "schema_version": 1,
         "status": "PREPARED",
@@ -350,6 +394,7 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
         "before_hooks": before_hooks,
         "absent_before": absent_before,
         "installed_hooks": installed_hooks,
+        "authority_inputs": authority_digests,
     }
     manifest["auth"] = sign_receipt(committed_config, manifest)
     atomic_write_text(
@@ -367,9 +412,12 @@ def install_hermes_adapter(repo_root: Path, hermes_home: Path) -> dict[str, Any]
 def rollback_hermes_adapter(
     repo_root: Path, hermes_home: Path, *, apply: bool
 ) -> dict[str, Any]:
-    hermes_home, committed_config = _require_canonical_hermes_home(
-        repo_root, hermes_home
-    )
+    (
+        hermes_home,
+        committed_config,
+        _committed_adapters,
+        _authority_digests,
+    ) = _require_canonical_hermes_home(repo_root, hermes_home)
     manifest_path = hermes_home / HERMES_MANIFEST
     manifest = load_json(manifest_path)
     validate_hermes_manifest(repo_root, hermes_home, manifest)

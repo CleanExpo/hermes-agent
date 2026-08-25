@@ -1,12 +1,48 @@
 ---
 name: "speckit-implement"
-description: "Execute the implementation plan by processing and executing all tasks defined in tasks.md"
+description: "Execute all tasks in the implementation plan."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/implement.md"
+  hermes:
+    tags: [spec-kit, implementation]
+    category: development
+    related_skills: [speckit-plan, speckit-tasks, speckit-converge]
 ---
 
+# Spec Kit Implement Skill
+
+Executes the dependency-ordered tasks for the current feature. It preserves task scope and stops on unresolved blocking prerequisites.
+
+## Overview
+
+Use the generated implementation procedure below as the execution authority.
+
+## When to Use
+
+Use after the specification, plan, and tasks are ready for implementation.
+
+## Prerequisites
+
+A Spec Kit project with complete feature artifacts and an approved task list.
+
+## How to Run
+
+Invoke `$speckit-implement` with any explicit execution constraints.
+
+## Quick Reference
+
+Inputs are the implementation artifacts; outputs are code, tests, and task updates.
+
+## Inputs
+
+The current feature plan, task list, codebase, and user constraints.
+
+## Procedure
 
 ## User Input
 
@@ -224,3 +260,31 @@ Report final status with summary of completed work.
 - [ ] Implementation validated against specification, plan, and test coverage
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with summary of completed work
+
+## Outputs
+
+Implemented code, validation evidence, and truthful task status updates.
+
+## Constraints
+
+Follow task dependencies and remain within the approved feature scope.
+
+## Failure Handling
+
+Stop on blocking prerequisites and report the exact unfinished work.
+
+## Examples
+
+Use `$speckit-implement` after `tasks.md` has been reviewed.
+
+## Pitfalls
+
+Do not mark a task complete before its required checks run.
+
+## Verification
+
+Run the specified validation and reconcile every task state with evidence.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

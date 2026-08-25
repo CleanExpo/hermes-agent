@@ -1,12 +1,48 @@
 ---
 name: "speckit-plan"
-description: "Execute the implementation planning workflow using the plan template to generate design artifacts."
+description: "Generate design artifacts from a feature spec."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/plan.md"
+  hermes:
+    tags: [spec-kit, planning]
+    category: development
+    related_skills: [speckit-specify, speckit-clarify, speckit-tasks]
 ---
 
+# Spec Kit Plan Skill
+
+Generates implementation design artifacts from the approved feature specification. It does not execute implementation tasks.
+
+## Overview
+
+Use the generated planning procedure below to apply the project plan template.
+
+## When to Use
+
+Use after specification clarification and before task generation.
+
+## Prerequisites
+
+A Spec Kit project with an approved feature specification and constitution.
+
+## How to Run
+
+Invoke `$speckit-plan` with any design constraints.
+
+## Quick Reference
+
+Input is the approved specification; outputs are the implementation plan and design artifacts.
+
+## Inputs
+
+The current feature specification, constitution, and user constraints.
+
+## Procedure
 
 ## User Input
 
@@ -164,3 +200,31 @@ Command ends after Phase 1 design. Report branch, IMPL_PLAN path, and generated 
 - [ ] Plan workflow executed and design artifacts generated
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with branch, plan path, and generated artifacts
+
+## Outputs
+
+The implementation plan and its required design artifacts.
+
+## Constraints
+
+Respect the constitution and resolve planning gates before proceeding.
+
+## Failure Handling
+
+Stop on unresolved clarifications or constitution violations.
+
+## Examples
+
+Use `$speckit-plan` after specification clarification is complete.
+
+## Pitfalls
+
+Do not turn planning assumptions into unapproved requirements.
+
+## Verification
+
+Confirm all expected artifacts exist and every gate result is reported.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

@@ -1,12 +1,48 @@
 ---
 name: "speckit-clarify"
-description: "Identify underspecified areas in the current feature spec by asking up to 5 highly targeted clarification questions and encoding answers back into the spec."
+description: "Resolve ambiguity in a feature specification."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/clarify.md"
+  hermes:
+    tags: [spec-kit, requirements]
+    category: development
+    related_skills: [speckit-specify, speckit-checklist]
 ---
 
+# Spec Kit Clarify Skill
+
+Finds material ambiguity and records confirmed answers in the feature specification. It limits questioning to the generated clarification workflow.
+
+## Overview
+
+Use the procedure below to prioritize and resolve specification gaps.
+
+## When to Use
+
+Use before planning when the current feature specification is underspecified.
+
+## Prerequisites
+
+A Spec Kit project with a current feature specification.
+
+## How to Run
+
+Invoke `$speckit-clarify` with any additional clarification focus.
+
+## Quick Reference
+
+Inputs are the specification and answers; output is an updated specification.
+
+## Inputs
+
+The current feature specification and optional user focus.
+
+## Procedure
 
 ## User Input
 
@@ -289,3 +325,31 @@ Report completion (after questioning loop ends or early termination):
 - [ ] Spec quality checklist re-validated against updated spec (if `FEATURE_DIR/checklists/requirements.md` exists)
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with questions answered, sections touched, checklist status, and coverage summary
+
+## Outputs
+
+An updated specification with confirmed clarifications and a coverage summary.
+
+## Constraints
+
+Respect the question limit and do not infer user decisions.
+
+## Failure Handling
+
+Record deferred ambiguity and stop when a required answer is unavailable.
+
+## Examples
+
+Use `$speckit-clarify` before planning an underspecified feature.
+
+## Pitfalls
+
+Do not ask low-impact questions ahead of material scope or acceptance gaps.
+
+## Verification
+
+Confirm answers are encoded in the specification and summarized to the user.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.

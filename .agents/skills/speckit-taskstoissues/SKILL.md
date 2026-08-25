@@ -1,12 +1,48 @@
 ---
 name: "speckit-taskstoissues"
-description: "Convert existing tasks into actionable, dependency-ordered GitHub issues for the feature based on available design artifacts."
+description: "Convert feature tasks into GitHub issues."
+version: "1.0.0"
+author: "GitHub Spec Kit contributors"
+license: "MIT"
+platforms: [linux, macos, windows]
 compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
-  author: "github-spec-kit"
   source: "templates/commands/taskstoissues.md"
+  hermes:
+    tags: [spec-kit, github]
+    category: development
+    related_skills: [speckit-tasks]
 ---
 
+# Spec Kit Tasks to Issues Skill
+
+Converts existing feature tasks into dependency-aware GitHub issue definitions. It does not invent work beyond the current task artifacts.
+
+## Overview
+
+Use the generated conversion procedure below to preserve task identity and dependencies.
+
+## When to Use
+
+Use when an approved task list must be represented as GitHub issues.
+
+## Prerequisites
+
+A Spec Kit project with current `tasks.md` and authorized GitHub issue creation.
+
+## How to Run
+
+Invoke `$speckit-taskstoissues` after confirming the target repository.
+
+## Quick Reference
+
+Input is `tasks.md`; output is a set of GitHub issues.
+
+## Inputs
+
+The current task list, design artifacts, and repository context.
+
+## Procedure
 
 ## User Input
 
@@ -51,6 +87,34 @@ You **MUST** consider the user input before proceeding (if not empty).
     ```
     After emitting the block above you MUST actually invoke the hook and wait for it to finish before continuing. Run it the same way you would run the command yourself in this agent/session (the invocation may differ from the literal `{command}` id shown above, e.g. a skills-mode agent runs it as `/skill:speckit-...` or `$speckit-...`). Emitting the block alone does not run the hook.
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
+
+## Outputs
+
+GitHub issues that preserve task order, identity, and dependencies.
+
+## Constraints
+
+Use only existing tasks and the explicitly authorized repository.
+
+## Failure Handling
+
+Stop before external writes when repository authority or task mapping is unclear.
+
+## Examples
+
+Use `$speckit-taskstoissues` after reviewing `tasks.md`.
+
+## Pitfalls
+
+Do not duplicate existing issues or collapse dependent tasks ambiguously.
+
+## Verification
+
+Confirm every created issue maps back to one current task.
+
+## References
+
+The upstream source template is recorded in frontmatter metadata.
 
 ## Outline
 

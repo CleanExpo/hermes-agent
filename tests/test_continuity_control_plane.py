@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -62,6 +63,15 @@ from install_continuity_adapters import (
 GOAL = "Pilot deterministic cross-agent continuity in Hermes"
 TASK_ID = "hermes-continuity-b6l"
 CHANGE_ID = "001-global-continuity-pilot"
+POSIX_CASES = (
+    pytest.param("linux", marks=pytest.mark.linux_only),
+    pytest.param("macos", marks=pytest.mark.macos_only),
+)
+SPECIAL_LEAF_CASES = (
+    pytest.param("symlink", marks=pytest.mark.require_symlinks),
+    pytest.param("fifo", id="fifo-linux", marks=pytest.mark.linux_only),
+    pytest.param("fifo", id="fifo-macos", marks=pytest.mark.macos_only),
+)
 
 
 def _test_event_checkpoint(path: Path) -> tuple[Path, int, None, dict[str, str]]:
@@ -453,7 +463,8 @@ def pilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     import yaml
 
     requirements_lock.write_text(
-        f"PyYAML=={yaml.__version__} \\\n    --hash=sha256:{'0' * 64}\n",
+        f"PyYAML=={yaml.__version__} \\\n    --hash=sha256:{'0' * 64}\n"
+        f"psutil=={psutil.__version__} \\\n    --hash=sha256:{'1' * 64}\n",
         encoding="utf-8",
     )
     atomic_write_json(
@@ -981,9 +992,9 @@ def test_confined_directory_rejects_existing_symlink_child(
         continuity_common.confined_ensure_dir(config, "evidence-home")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows has a validated path fallback")
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_storage_capability_gate_precedes_authority_work(
-    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch, _os_case: str
 ) -> None:
     called = False
 
@@ -1033,6 +1044,7 @@ def test_windows_confined_state_fallback_reads_writes_and_creates_direct_child(
 
 
 @pytest.mark.windows_only
+@pytest.mark.require_symlinks
 def test_windows_confined_state_fallback_rejects_reparse_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1041,10 +1053,7 @@ def test_windows_confined_state_fallback_rejects_reparse_child(
     sibling = state / "sibling"
     sibling.mkdir()
     link = state / "evidence-home"
-    try:
-        link.symlink_to(sibling, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"Windows symlink creation is unavailable: {exc}")
+    link.symlink_to(sibling, target_is_directory=True)
     config = {
         "external_volume": str(Path(tmp_path.anchor)),
         "state_root": str(state),
@@ -1056,6 +1065,7 @@ def test_windows_confined_state_fallback_rejects_reparse_child(
 
 
 @pytest.mark.windows_only
+@pytest.mark.require_symlinks
 def test_windows_child_environment_rejects_reparse_tmp_before_spawn(
     tmp_path: Path,
 ) -> None:
@@ -1064,10 +1074,7 @@ def test_windows_child_environment_rejects_reparse_tmp_before_spawn(
     sibling = state / "sibling"
     sibling.mkdir()
     temp_link = state / "tmp"
-    try:
-        temp_link.symlink_to(sibling, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"Windows symlink creation is unavailable: {exc}")
+    temp_link.symlink_to(sibling, target_is_directory=True)
 
     with pytest.raises(ContinuityError, match="confined direct directory"):
         continuity_common.minimal_child_env(
@@ -1132,9 +1139,9 @@ def test_promotion_lock_rejects_symlink_leaf(
     assert outside.read_text(encoding="utf-8") == "outside\n"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_confined_state_rejects_special_file_leaves_without_blocking(
-    pilot: dict[str, Path],
+    pilot: dict[str, Path], _os_case: str,
 ) -> None:
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     receipt_fifo = pilot["state"] / "receipts/special.json"
@@ -1180,7 +1187,6 @@ def test_promotion_lock_capability_gate_precedes_authority_work(
     assert called is False
 
 
-@pytest.mark.live_system_guard_bypass
 def test_run_command_terminates_tree_when_required_mount_disappears(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1213,7 +1219,6 @@ def test_run_command_terminates_tree_when_required_mount_disappears(
     assert not sentinel.exists()
 
 
-@pytest.mark.live_system_guard_bypass
 def test_native_observer_terminates_tree_when_required_mount_disappears(
     pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1286,8 +1291,6 @@ def _replace_authority_leaf(
 ) -> Path | None:
     path.unlink(missing_ok=True)
     if kind == "fifo":
-        if os.name == "nt":
-            pytest.skip("POSIX FIFO semantics")
         os.mkfifo(path)
         return None
     outside = tmp_path / f"outside-{path.name}"
@@ -1296,7 +1299,7 @@ def _replace_authority_leaf(
     return outside
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_adjacency_authority_read_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1326,7 +1329,7 @@ def test_adjacency_authority_read_rejects_escaped_or_special_leaf(
         assert outside.exists()
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_event_audit_append_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1342,7 +1345,7 @@ def test_event_audit_append_rejects_escaped_or_special_leaf(
         assert outside.read_text(encoding="utf-8") == "outside-audit\n"
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_basic_memory_authority_read_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1353,7 +1356,7 @@ def test_basic_memory_authority_read_rejects_escaped_or_special_leaf(
     assert any("confined state file" in error for error in result["errors"])
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_beads_fallback_authority_read_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path],
     tmp_path: Path,
@@ -1377,7 +1380,7 @@ def test_beads_fallback_authority_read_rejects_escaped_or_special_leaf(
         continuity_bridge._read_beads(config, pilot["repo"])
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_promotion_journal_authority_read_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1389,7 +1392,7 @@ def test_promotion_journal_authority_read_rejects_escaped_or_special_leaf(
     assert any("confined state file" in error for error in result["errors"])
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_terminal_receipt_authority_read_rejects_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1417,7 +1420,7 @@ def test_terminal_receipt_authority_read_rejects_escaped_or_special_leaf(
         assert outside.exists()
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("kind", SPECIAL_LEAF_CASES)
 def test_native_event_authority_reads_reject_escaped_or_special_leaf(
     pilot: dict[str, Path], tmp_path: Path, kind: str
 ) -> None:
@@ -1771,6 +1774,44 @@ def test_dependency_identity_rejects_lock_environment_mismatch(
         match="resolved dependency environment does not match requirements lock",
     ):
         _passing_receipt(pilot)
+
+
+def test_dependency_identity_rejects_wrong_psutil_version(
+    pilot: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packages = [
+        {
+            "name": "pyyaml",
+            "version": yaml.__version__,
+            "METADATA": "a" * 64,
+            "RECORD": "b" * 64,
+            "direct_url.json": "c" * 64,
+        },
+        {
+            "name": "psutil",
+            "version": "0.0.0",
+            "METADATA": "d" * 64,
+            "RECORD": "e" * 64,
+            "direct_url.json": "f" * 64,
+        },
+    ]
+    monkeypatch.setattr(
+        continuity_gate,
+        "run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"python_version": sys.version, "packages": packages}),
+            stderr="",
+        ),
+    )
+    config = json.loads(pilot["config"].read_text(encoding="utf-8"))
+
+    with pytest.raises(
+        ContinuityError,
+        match="resolved dependency environment does not match requirements lock: psutil",
+    ):
+        continuity_gate._dependency_identity(config, pilot["repo"])
 
 
 def test_enforced_receipt_requires_fresh_native_surface_coverage(
@@ -2480,7 +2521,6 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
     hermes_home = _pilot_hermes_home(pilot)
-    install_hermes_adapter(pilot["repo"], hermes_home)
     config = json.loads(pilot["config"].read_text(encoding="utf-8"))
     config["evidence_policy"]["runtime_checks"].append({
         "surface": "hermes",
@@ -2495,6 +2535,8 @@ def test_native_hermes_observer_requires_list_doctor_and_fresh_admission(
         "sha256": sha256_file(Path(sys.executable).resolve()),
     }
     atomic_write_json(pilot["config"], config)
+    _commit_and_rebind(pilot, "test: bind Hermes observation authority")
+    install_hermes_adapter(pilot["repo"], hermes_home)
     events_before = pilot["events"].read_bytes() if pilot["events"].exists() else None
     result = subprocess.run(
         [
@@ -2553,6 +2595,7 @@ def test_native_hermes_observer_rejects_self_consistent_forged_manifest(
         "adapter_path": str(config_path),
     })
     atomic_write_json(pilot["config"], policy)
+    _commit_and_rebind(pilot, "test: bind forged Hermes observation policy")
 
     with pytest.raises(ContinuityError, match="manifest"):
         continuity_native_observation.observe_hermes_hook(
@@ -2609,7 +2652,86 @@ def test_hermes_adapter_rejects_dirty_config_home_retarget(
     assert not retargeted_home.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation semantics")
+@pytest.mark.parametrize(
+    ("authority_path", "operation"),
+    [
+        (authority_path, operation)
+        for authority_path in (
+            ".continuity/adapters.json",
+            ".continuity/toolchain.lock.json",
+        )
+        for operation in ("apply", "rollback", "validate", "observe")
+    ],
+)
+def test_hermes_operations_reject_dirty_installer_authority_before_target_access(
+    pilot: dict[str, Path], authority_path: str, operation: str
+) -> None:
+    hermes_home = _pilot_hermes_home(pilot)
+    target = hermes_home / "config.yaml"
+    manifest_path = hermes_home / continuity_adapters.HERMES_MANIFEST
+    if operation != "apply":
+        install_hermes_adapter(pilot["repo"], hermes_home)
+    target_before = target.read_bytes() if target.exists() else None
+    manifest_before = manifest_path.read_bytes() if manifest_path.exists() else None
+
+    path = pilot["repo"] / authority_path
+    authority = json.loads(path.read_text(encoding="utf-8"))
+    if authority_path.endswith("adapters.json"):
+        authority["surfaces"]["hermes"].remove("pre_tool_call")
+    else:
+        authority["review_mutant"] = True
+    atomic_write_json(path, authority)
+
+    with pytest.raises(ContinuityError, match="committed HEAD installer authority"):
+        if operation == "apply":
+            install_hermes_adapter(pilot["repo"], hermes_home)
+        elif operation == "rollback":
+            rollback_hermes_adapter(pilot["repo"], hermes_home, apply=False)
+        elif operation == "validate":
+            validate_hermes_manifest(
+                pilot["repo"],
+                hermes_home,
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+            )
+        else:
+            continuity_native_observation.observe_hermes_hook(
+                pilot["repo"], pilot["config"], hermes_home
+            )
+
+    assert (target.read_bytes() if target.exists() else None) == target_before
+    assert (
+        manifest_path.read_bytes() if manifest_path.exists() else None
+    ) == manifest_before
+
+
+def test_hermes_manifest_binds_committed_installer_authority_digests(
+    pilot: dict[str, Path],
+) -> None:
+    hermes_home = _pilot_hermes_home(pilot)
+    install_hermes_adapter(pilot["repo"], hermes_home)
+    manifest = json.loads(
+        (hermes_home / continuity_adapters.HERMES_MANIFEST).read_text(
+            encoding="utf-8"
+        )
+    )
+    expected = {}
+    for relative in (
+        ".continuity/config.json",
+        ".continuity/adapters.json",
+        ".continuity/toolchain.lock.json",
+    ):
+        committed = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
+            cwd=pilot["repo"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        expected[relative] = hashlib.sha256(committed).hexdigest()
+
+    assert manifest["authority_inputs"] == expected
+
+
+@pytest.mark.require_symlinks
 def test_hermes_adapter_rejects_canonical_home_symlink_escape(
     pilot: dict[str, Path], tmp_path: Path
 ) -> None:
@@ -2792,7 +2914,6 @@ def test_rollback_replay_names_managed_hook_drift(pilot: dict[str, Path]) -> Non
         rollback_hermes_adapter(pilot["repo"], hermes_home, apply=True)
 
 
-@pytest.mark.live_system_guard_bypass
 def test_timed_out_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
     sentinel = tmp_path / "grandchild-survived.txt"
     grandchild = (
@@ -2845,24 +2966,23 @@ def test_windows_timed_out_evidence_reaps_delayed_grandchild(
     assert not sentinel.exists()
 
 
-@pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
-def test_native_observer_reaps_descendant_after_root_exits(tmp_path: Path) -> None:
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_native_observer_reaps_descendant_after_root_exits(
+    tmp_path: Path, _os_case: str
+) -> None:
     _assert_native_observer_reaps_after_root_exit(tmp_path, detached=False)
 
 
-@pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session semantics")
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_native_observer_reaps_detached_descendant_after_root_exits(
-    tmp_path: Path,
+    tmp_path: Path, _os_case: str,
 ) -> None:
     _assert_native_observer_reaps_after_root_exit(tmp_path, detached=True)
 
 
-@pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-session semantics")
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_fast_spawn_detach_exit_stress_reaps_every_descendant(
-    tmp_path: Path,
+    tmp_path: Path, _os_case: str,
 ) -> None:
     denial = tmp_path / "fast-detach-denied.txt"
     launched = tmp_path / "fast-detach-launched.txt"
@@ -2963,7 +3083,7 @@ def test_nested_contained_command_does_not_rewrap_or_kill_outer_authority(
     assert result.stdout.strip() == "nested-ok"
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+@pytest.mark.linux_only
 def test_linux_subreaper_reaps_multigeneration_token_scrubbed_detach(
     tmp_path: Path,
 ) -> None:
@@ -3135,7 +3255,7 @@ def test_linux_subreaper_child_signal_cleans_tree(
     assert not sentinel.exists()
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+@pytest.mark.linux_only
 def test_linux_strict_containment_ignores_forged_ambient_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3165,7 +3285,7 @@ def test_unsupported_posix_native_containment_fails_closed(
         continuity_common._native_posix_containment_command(["authority-command"])
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper semantics")
+@pytest.mark.linux_only
 def test_linux_subreaper_timeout_reaps_token_scrubbed_multigeneration_detach(
     tmp_path: Path,
 ) -> None:
@@ -3198,7 +3318,7 @@ def test_linux_subreaper_timeout_reaps_token_scrubbed_multigeneration_detach(
     assert not sentinel.exists()
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux parent-death signal")
+@pytest.mark.linux_only
 def test_linux_subreaper_cleans_tree_when_controller_is_sigkilled(
     tmp_path: Path,
 ) -> None:
@@ -3283,15 +3403,164 @@ def test_fast_commands_leave_no_descendant_monitor_threads(tmp_path: Path) -> No
     assert after == before
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_descendant_monitor_drains_blocked_snapshot_without_losing_identity() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    descendant = psutil.Process(os.getpid())
+
+    class RunningProcess:
+        pid = os.getpid()
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    contained = continuity_common._ContainedProcess(
+        process=RunningProcess(),
+        family_token="blocked-monitor-regression",
+        leader_process=descendant,
+        process_group=os.getpgrp(),
+    )
+
+    def blocked_snapshot() -> None:
+        started.set()
+        release.wait(1)
+        identity = (descendant.pid, descendant.create_time())
+        with contained.descendant_lock:
+            contained.tracked_descendants[identity] = descendant
+
+    contained.snapshot_descendants = blocked_snapshot
+    contained.start_descendant_monitor()
+    assert started.wait(1)
+    timer = threading.Timer(0.25, release.set)
+    timer.start()
+    try:
+        tracked = contained._finish_descendant_monitor()
+    finally:
+        release.set()
+        timer.join()
+        if contained.monitor_thread is not None:
+            contained.monitor_thread.join(1)
+
+    assert contained.monitor_thread is None
+    assert descendant in tracked
+
+
+def test_descendant_monitor_timeout_fails_closed_and_retains_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    descendant = psutil.Process(os.getpid())
+
+    class RunningProcess:
+        pid = os.getpid()
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    contained = continuity_common._ContainedProcess(
+        process=RunningProcess(),
+        family_token="blocked-monitor-timeout",
+        leader_process=descendant,
+        process_group=os.getpgrp(),
+    )
+
+    def blocked_snapshot() -> None:
+        started.set()
+        release.wait(1)
+
+    contained.snapshot_descendants = blocked_snapshot
+    monkeypatch.setattr(
+        continuity_common, "_DESCENDANT_MONITOR_DRAIN_TIMEOUT", 0.05
+    )
+    contained.start_descendant_monitor()
+    assert started.wait(1)
+
+    with pytest.raises(ContinuityError, match="monitor did not drain"):
+        contained._finish_descendant_monitor()
+
+    assert contained.monitor_thread is not None
+    assert contained.monitor_thread.is_alive()
+    release.set()
+    contained.monitor_thread.join(1)
+    assert contained._finish_descendant_monitor() == ()
+    assert contained.monitor_thread is None
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_allows_only_registered_owned_process_groups(
+    register_owned_process_group, _os_case: str
+) -> None:
+    ready_read, ready_write = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(ready_read)
+        os.setsid()
+        os.write(ready_write, b"ready")
+        os.close(ready_write)
+        signal.pause()
+        raise SystemExit(0)
+
+    os.close(ready_write)
+    try:
+        assert os.read(ready_read, 5) == b"ready"
+        with pytest.raises(RuntimeError, match="PGID is outside"):
+            os.killpg(child_pid, signal.SIGTERM)
+
+        register_owned_process_group(child_pid)
+        os.killpg(child_pid, signal.SIGTERM)
+        waited_pid, _status = os.waitpid(child_pid, 0)
+        assert waited_pid == child_pid
+    finally:
+        os.close(ready_read)
+        try:
+            register_owned_process_group(child_pid)
+            os.killpg(child_pid, signal.SIGKILL)
+        except (OSError, RuntimeError, psutil.Error):
+            pass
+        try:
+            os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_completed_command_does_not_signal_released_process_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_case: str
 ) -> None:
     signalled: list[tuple[int, int]] = []
     cleanup_modes: list[bool] = []
     released_parent_snapshots: list[int] = []
+    released_parent_lookups: list[int] = []
+    spawned: list[subprocess.Popen[str]] = []
     real_terminate = continuity_common._terminate_process_tree
     real_snapshot = continuity_common._ContainedProcess.snapshot_descendants
+    real_popen = continuity_common.subprocess.Popen
+    real_psutil_process = continuity_common.psutil.Process
+
+    def record_spawn(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    class ProcessProxyMeta(type):
+        def __instancecheck__(cls, instance) -> bool:
+            return isinstance(instance, real_psutil_process)
+
+        def __call__(cls, pid=None, *args, **kwargs):
+            if (
+                spawned
+                and pid == spawned[-1].pid
+                and spawned[-1].poll() is not None
+            ):
+                released_parent_lookups.append(pid)
+                raise AssertionError("released parent PID was looked up")
+            return real_psutil_process(pid, *args, **kwargs)
+
+    class ProcessProxy(metaclass=ProcessProxyMeta):
+        pass
 
     def record_released_group(pgid: int, signum: int) -> None:
         signalled.append((pgid, signum))
@@ -3306,6 +3575,8 @@ def test_completed_command_does_not_signal_released_process_group(
         real_snapshot(contained)
 
     monkeypatch.setattr(os, "killpg", record_released_group)
+    monkeypatch.setattr(continuity_common.subprocess, "Popen", record_spawn)
+    monkeypatch.setattr(continuity_common.psutil, "Process", ProcessProxy)
     monkeypatch.setattr(
         continuity_common, "_terminate_process_tree", record_cleanup_mode
     )
@@ -3324,6 +3595,24 @@ def test_completed_command_does_not_signal_released_process_group(
     assert signalled == []
     assert cleanup_modes == [False]
     assert released_parent_snapshots == []
+    assert released_parent_lookups == []
+
+    real_finish = continuity_common._ContainedProcess._finish_descendant_monitor
+
+    def released_parent_lookup_mutant(contained):
+        tracked = real_finish(contained)
+        assert contained.process.poll() is not None
+        continuity_common.psutil.Process(contained.process.pid)
+        return tracked
+
+    monkeypatch.setattr(
+        continuity_common._ContainedProcess,
+        "_finish_descendant_monitor",
+        released_parent_lookup_mutant,
+    )
+    with pytest.raises(AssertionError, match="released parent PID was looked up"):
+        run_command([sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5)
+    assert released_parent_lookups == [spawned[-1].pid]
 
 
 def test_empty_child_environment_does_not_inherit_ambient_credentials(
@@ -3349,9 +3638,10 @@ def test_windows_native_observer_job_reaps_descendant_after_root_exits(
     _assert_native_observer_reaps_after_root_exit(tmp_path, detached=False)
 
 
-@pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="POSIX signal-delivery semantics")
-def test_interrupted_evidence_reaps_delayed_grandchild(tmp_path: Path) -> None:
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_interrupted_evidence_reaps_delayed_grandchild(
+    tmp_path: Path, _os_case: str
+) -> None:
     ready = tmp_path / "interrupt-ready.txt"
     sentinel = tmp_path / "interrupt-grandchild-survived.txt"
     context = multiprocessing.get_context("fork")
@@ -3543,10 +3833,9 @@ def test_native_observer_consumes_signal_caught_during_handler_restoration(
     assert contained.terminated is True
 
 
-@pytest.mark.live_system_guard_bypass
-@pytest.mark.skipif(os.name == "nt", reason="POSIX fork test; Windows proof follows")
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
 def test_native_observer_blocks_termination_across_spawn_handler_race(
-    tmp_path: Path,
+    tmp_path: Path, _os_case: str,
 ) -> None:
     child_pid_path = tmp_path / "spawned-child-pid.txt"
     sentinel = tmp_path / "spawn-race-host-survived.txt"
