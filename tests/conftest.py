@@ -1403,9 +1403,11 @@ def _live_system_guard(
         return
 
     import os as _os
+    import errno as _errno
     import select as _select
     import shlex as _shlex
     import signal as _signal
+    import struct as _struct
     import subprocess as _subprocess
 
     real_kill = _live_system_signal_primitives["kill"]
@@ -1413,6 +1415,8 @@ def _live_system_guard(
     real_waitpid = getattr(_os, "waitpid", None)
     real_getpgid = getattr(_os, "getpgid", None)
     real_os_close = _os.close
+    real_os_fstat = _os.fstat
+    real_os_listdir = _os.listdir
     real_os_read = _os.read
     real_os_write = _os.write
     real_select = _select.select
@@ -1592,6 +1596,12 @@ def _live_system_guard(
                 record["monitor_error"] = repr(exc)
             finally:
                 ready_event.set()
+                signal_owner = record.pop("signal_owner", None)
+                close_signal_channel = getattr(
+                    signal_owner, "_close_guarded_signal_channel", None
+                )
+                if callable(close_signal_channel):
+                    close_signal_channel()
                 for key in ("done_read", "control_write"):
                     descriptor = record.pop(key, None)
                     if isinstance(descriptor, int):
@@ -1981,9 +1991,13 @@ def _live_system_guard(
         real = _subprocess.Popen
         popen_signature = inspect.signature(real)
         group_harness = (
-            "import json,os,signal,subprocess,sys,traceback\n"
-            "control_read=int(sys.argv[1]); done_write=int(sys.argv[2])\n"
-            "payload=json.loads(sys.argv[3]); target=None; returncode=1\n"
+            "import json,os,select,signal,struct,subprocess,sys,traceback\n"
+            "control_read=int(sys.argv[1]); done_write=int(sys.argv[2]); "
+            "target_pid_write=int(sys.argv[3]); signal_read=int(sys.argv[4]); "
+            "signal_ack_write=int(sys.argv[5])\n"
+            "payload=json.loads(sys.argv[6]); target=None; returncode=1\n"
+            "for descriptor in (control_read,done_write,target_pid_write,"
+            "signal_read,signal_ack_write): os.set_inheritable(descriptor,False)\n"
             "def forward(signum, _frame):\n"
             "    if target is not None and target.poll() is None:\n"
             "        try: os.kill(target.pid, signum)\n"
@@ -1995,10 +2009,35 @@ def _live_system_guard(
             "    target=subprocess.Popen(payload['cmd'], shell=payload['shell'], "
             "executable=payload['executable'], close_fds=payload['close_fds'], "
             "pass_fds=tuple(payload['pass_fds']))\n"
+            "    os.write(target_pid_write, f'{target.pid}\\n'.encode('ascii'))\n"
+            "    os.close(target_pid_write); target_pid_write=-1\n"
+            "    while target.poll() is None:\n"
+            "        readable,_,_=select.select((signal_read,),(),(),0.02)\n"
+            "        if not readable: continue\n"
+            "        request=b''\n"
+            "        while len(request) < 4:\n"
+            "            chunk=os.read(signal_read, 4-len(request))\n"
+            "            if not chunk: break\n"
+            "            request += chunk\n"
+            "        if len(request) != 4: break\n"
+            "        signum=struct.unpack('!i', request)[0]\n"
+            "        delivered=b'N'\n"
+            "        if target.poll() is None:\n"
+            "            try:\n"
+            "                target.send_signal(signum); delivered=b'A'\n"
+            "            except (ProcessLookupError,OSError,ValueError): pass\n"
+            "        try: os.write(signal_ack_write, delivered)\n"
+            "        except OSError: break\n"
             "    returncode=target.wait()\n"
             "except BaseException:\n"
             "    traceback.print_exc()\n"
             "finally:\n"
+            "    if target_pid_write >= 0:\n"
+            "        try: os.close(target_pid_write)\n"
+            "        except OSError: pass\n"
+            "    for descriptor in (signal_read,signal_ack_write):\n"
+            "        try: os.close(descriptor)\n"
+            "        except OSError: pass\n"
             "    try: os.write(done_write, b'D')\n"
             "    except OSError: pass\n"
             "    final_marker=b''\n"
@@ -2007,8 +2046,11 @@ def _live_system_guard(
             "    os.close(control_read); os.close(done_write)\n"
             "    if final_marker != b'F': os._exit(125)\n"
             "if returncode < 0:\n"
-            "    signum=-returncode; signal.signal(signum, signal.SIG_DFL); "
-            "os.kill(os.getpid(), signum)\n"
+            "    signum=-returncode\n"
+            "    if signum not in tuple(getattr(signal, name, None) for name in "
+            "('SIGKILL', 'SIGSTOP')): "
+            "signal.signal(signum, signal.SIG_DFL)\n"
+            "    os.kill(os.getpid(), signum)\n"
             "raise SystemExit(returncode)\n"
         )
 
@@ -2016,6 +2058,31 @@ def _live_system_guard(
             if isinstance(cmd, (str, bytes, _os.PathLike)):
                 return _os.fsdecode(cmd)
             return [_os.fsdecode(part) for part in cmd]
+
+        def inherited_caller_fds() -> tuple[int, ...]:
+            """Snapshot unnamed inheritable FDs for close_fds=False parity."""
+            for fd_root in ("/dev/fd", "/proc/self/fd"):
+                try:
+                    names = real_os_listdir(fd_root)
+                except OSError:
+                    continue
+                inherited = []
+                for name in names:
+                    try:
+                        descriptor = int(name)
+                    except ValueError:
+                        continue
+                    if descriptor <= 2:
+                        continue
+                    try:
+                        if _os.get_inheritable(descriptor):
+                            inherited.append(descriptor)
+                    except OSError:
+                        continue
+                return tuple(sorted(set(inherited)))
+            raise RuntimeError(
+                "cannot preserve close_fds=False without an open-FD directory"
+            )
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, *popen_args, **kwargs):
@@ -2031,9 +2098,41 @@ def _live_system_guard(
                     _record_owned_process(self.pid)
                     return
 
+                original_pass_fds = tuple(
+                    int(descriptor) for descriptor in call_arguments.get("pass_fds", ())
+                )
+                for descriptor in original_pass_fds:
+                    real_os_fstat(descriptor)
+                effective_close_fds = bool(
+                    call_arguments.get("close_fds", True) or original_pass_fds
+                )
+                caller_inheritable_fds = (
+                    () if effective_close_fds else inherited_caller_fds()
+                )
                 control_read, control_write = _os.pipe()
                 done_read, done_write = _os.pipe()
-                original_pass_fds = tuple(call_arguments.get("pass_fds", ()))
+                target_pid_read, target_pid_write = _os.pipe()
+                signal_read, signal_write = _os.pipe()
+                signal_ack_read, signal_ack_write = _os.pipe()
+                control_descriptors = (
+                    control_read,
+                    control_write,
+                    done_read,
+                    done_write,
+                    target_pid_read,
+                    target_pid_write,
+                    signal_read,
+                    signal_write,
+                    signal_ack_read,
+                    signal_ack_write,
+                )
+                if set(original_pass_fds).intersection(control_descriptors):
+                    for descriptor in control_descriptors:
+                        real_os_close(descriptor)
+                    raise OSError(
+                        _errno.EBADF,
+                        "caller pass_fds changed during guarded Popen setup",
+                    )
                 payload = {
                     "cmd": normalize_command(bound_cmd),
                     "shell": bool(call_arguments.get("shell", False)),
@@ -2050,7 +2149,15 @@ def _live_system_guard(
                 harness_kwargs.pop("executable", None)
                 harness_kwargs["close_fds"] = True
                 harness_kwargs["pass_fds"] = tuple(
-                    sorted({*original_pass_fds, control_read, done_write})
+                    sorted({
+                        *original_pass_fds,
+                        *caller_inheritable_fds,
+                        control_read,
+                        done_write,
+                        target_pid_write,
+                        signal_read,
+                        signal_ack_write,
+                    })
                 )
                 harness_cmd = [
                     sys.executable,
@@ -2058,17 +2165,15 @@ def _live_system_guard(
                     group_harness,
                     str(control_read),
                     str(done_write),
+                    str(target_pid_write),
+                    str(signal_read),
+                    str(signal_ack_write),
                     json.dumps(payload, separators=(",", ":")),
                 ]
                 try:
                     super().__init__(harness_cmd, **harness_kwargs)
                 except BaseException:
-                    for descriptor in (
-                        control_read,
-                        control_write,
-                        done_read,
-                        done_write,
-                    ):
+                    for descriptor in control_descriptors:
                         try:
                             real_os_close(descriptor)
                         except OSError:
@@ -2076,7 +2181,13 @@ def _live_system_guard(
                     raise
                 real_os_close(control_read)
                 real_os_close(done_write)
+                real_os_close(target_pid_write)
+                real_os_close(signal_read)
+                real_os_close(signal_ack_write)
                 self.args = bound_cmd
+                self._guarded_signal_lock = threading.Lock()
+                self._guarded_signal_write = signal_write
+                self._guarded_signal_ack_read = signal_ack_read
                 _record_owned_process(self.pid)
                 try:
                     leader_created_at = real_psutil_process(self.pid).create_time()
@@ -2091,13 +2202,35 @@ def _live_system_guard(
                     "expected_pgid": int(self.pid),
                     "control_write": control_write,
                     "done_read": done_read,
+                    "signal_owner": self,
                 }
                 try:
                     _start_owned_group_monitor(
                         int(self.pid), owned_process_group_registry[int(self.pid)]
                     )
                     real_os_write(control_write, b"S")
+                    target_pid_bytes = b""
+                    target_pid_deadline = time.monotonic() + 5.0
+                    while b"\n" not in target_pid_bytes:
+                        remaining = target_pid_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError(
+                                "owned process-group harness did not publish target PID"
+                            )
+                        readable, _, _ = real_select(
+                            (target_pid_read,), (), (), remaining
+                        )
+                        if not readable:
+                            continue
+                        chunk = real_os_read(target_pid_read, 64)
+                        if not chunk:
+                            raise RuntimeError(
+                                "owned process-group harness closed before target PID"
+                            )
+                        target_pid_bytes += chunk
+                    self._guarded_target_pid = int(target_pid_bytes.split(b"\n", 1)[0])
                 except BaseException:
+                    self._close_guarded_signal_channel()
                     try:
                         teardown_killpg(int(self.pid), _signal.SIGKILL)
                     except (ProcessLookupError, TypeError):
@@ -2107,6 +2240,75 @@ def _live_system_guard(
                     except ChildProcessError:
                         pass
                     raise
+                finally:
+                    try:
+                        real_os_close(target_pid_read)
+                    except OSError:
+                        pass
+
+            def _close_guarded_signal_channel(self):
+                lock = getattr(self, "_guarded_signal_lock", None)
+                if lock is None:
+                    return
+                with lock:
+                    for attribute in (
+                        "_guarded_signal_write",
+                        "_guarded_signal_ack_read",
+                    ):
+                        descriptor = getattr(self, attribute, None)
+                        setattr(self, attribute, None)
+                        if isinstance(descriptor, int):
+                            try:
+                                real_os_close(descriptor)
+                            except OSError:
+                                pass
+
+            def send_signal(self, sig):
+                target_pid = getattr(self, "_guarded_target_pid", None)
+                if target_pid is None:
+                    return super().send_signal(sig)
+                if self.poll() is not None:
+                    return None
+                lock = self._guarded_signal_lock
+                with lock:
+                    signal_write = self._guarded_signal_write
+                    signal_ack_read = self._guarded_signal_ack_read
+                    if signal_write is None or signal_ack_read is None:
+                        return None
+                    try:
+                        real_os_write(signal_write, _struct.pack("!i", int(sig)))
+                        readable, _, _ = real_select((signal_ack_read,), (), (), 2.0)
+                        if not readable:
+                            raise RuntimeError(
+                                "owned process-group harness did not acknowledge signal"
+                            )
+                        acknowledgement = real_os_read(signal_ack_read, 1)
+                    except (BrokenPipeError, ProcessLookupError, OSError):
+                        return None
+                    if acknowledgement not in (b"", b"A", b"N"):
+                        raise RuntimeError(
+                            "owned process-group harness returned invalid signal acknowledgement"
+                        )
+                return None
+
+            def poll(self):
+                returncode = super().poll()
+                if returncode is not None:
+                    self._close_guarded_signal_channel()
+                return returncode
+
+            def wait(self, timeout=None):
+                try:
+                    return super().wait(timeout=timeout)
+                finally:
+                    if self.returncode is not None:
+                        self._close_guarded_signal_channel()
+
+            def terminate(self):
+                self.send_signal(_signal.SIGTERM)
+
+            def kill(self):
+                self.send_signal(_signal.SIGKILL)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"

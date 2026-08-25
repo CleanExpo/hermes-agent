@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -63,6 +64,7 @@ from install_continuity_adapters import (
 GOAL = "Pilot deterministic cross-agent continuity in Hermes"
 TASK_ID = "hermes-continuity-b6l"
 CHANGE_ID = "001-global-continuity-pilot"
+GUARD_FAILURE_PLUGIN = "tests.continuity_guard_install_failure_plugin"
 POSIX_CASES = (
     pytest.param("linux", marks=pytest.mark.linux_only),
     pytest.param("macos", marks=pytest.mark.macos_only),
@@ -76,6 +78,12 @@ SPECIAL_LEAF_CASES = (
     pytest.param("fifo", id="fifo-linux", marks=pytest.mark.linux_only),
     pytest.param("fifo", id="fifo-macos", marks=pytest.mark.macos_only),
 )
+
+
+def _canonical_runner_argv(*args: str) -> list[str]:
+    bash = shutil.which("bash")
+    assert bash is not None, "canonical test runner requires bash"
+    return [bash, str(SCRIPTS / "run_tests.sh"), *args]
 
 
 def _test_event_checkpoint(path: Path) -> tuple[Path, int, None, dict[str, str]]:
@@ -2250,6 +2258,7 @@ def test_static_gate_pins_each_required_native_surface(
     config = json.loads(
         (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
     )
+    policy = config["evidence_policy"]
     config["native_observation_policy"]["required_surfaces"].remove(removed_surface)
     del config["native_observation_policy"]["hosts"][removed_surface]
     config["evidence_policy"]["runtime_checks"] = [
@@ -3776,14 +3785,13 @@ def test_live_system_guard_refuses_reused_direct_pid_at_teardown(
     env["HOME"] = str(tmp_path)
     env["HERMES_TEST_SKIP_PRECOMPILE"] = "1"
     result = subprocess.run(
-        [
-            str(REPO_ROOT / "scripts" / "run_tests.sh"),
+        _canonical_runner_argv(
             "--file-retries",
             "0",
             str(Path(__file__).resolve()),
             "-k",
             "test_live_system_guard_reused_direct_pid_probe",
-        ],
+        ),
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -3822,16 +3830,15 @@ def _assert_live_system_guard_install_failure(tmp_path: Path, guard_name: str) -
     env["HERMES_TEST_SKIP_PRECOMPILE"] = "1"
     env["CONTINUITY_GUARD_INSTALL_FAILURE_MODE"] = guard_name
     result = subprocess.run(
-        [
-            str(REPO_ROOT / "scripts" / "run_tests.sh"),
+        _canonical_runner_argv(
             "--file-retries",
             "0",
             "-p",
-            "tests.continuity_guard_install_failure_plugin",
+            GUARD_FAILURE_PLUGIN,
             str(Path(__file__).resolve()),
             "-k",
             "test_live_system_guard_install_failure_probe",
-        ],
+        ),
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -3900,14 +3907,13 @@ def test_live_system_guard_reaps_descendant_after_released_leader(
             nested_stderr.open("w", encoding="utf-8") as stderr_handle,
         ):
             result = subprocess.run(
-                [
-                    str(REPO_ROOT / "scripts" / "run_tests.sh"),
+                _canonical_runner_argv(
                     "--file-retries",
                     "0",
                     str(Path(__file__).resolve()),
                     "-k",
                     "test_live_system_guard_released_leader_probe",
-                ],
+                ),
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
@@ -4038,6 +4044,253 @@ def test_live_system_guard_group_harness_waits_for_both_handshake_gates(
         launcher.join(5)
         if waiter is not None:
             waiter.join(5)
+
+
+@pytest.mark.parametrize("signal_mode", ("kill", "usr1"))
+@pytest.mark.parametrize("published_pid_mode", ("exact", "decoy"))
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_popen_signals_reach_the_requested_target(
+    tmp_path: Path,
+    _live_system_signal_primitives: dict[str, object],
+    signal_mode: str,
+    published_pid_mode: str,
+    _os_case: str,
+) -> None:
+    """The owning harness signals its child without trusting a published PID."""
+    identity_path = tmp_path / f"signalled-target-{signal_mode}.txt"
+    target = (
+        "import pathlib,psutil,sys,time; "
+        "process=psutil.Process(); "
+        "pathlib.Path(sys.argv[1]).write_text("
+        "f'{process.pid}:{process.create_time()}', encoding='utf-8'); "
+        "time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", target, str(identity_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 3.0
+    while not identity_path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert identity_path.is_file()
+    pid_text, created_at_text = identity_path.read_text(encoding="utf-8").split(":")
+    target_pid = int(pid_text)
+    target_created_at = float(created_at_text)
+    decoy = None
+    if published_pid_mode == "decoy":
+        decoy = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        process._guarded_target_pid = decoy.pid
+
+    def target_is_live() -> bool:
+        try:
+            candidate = psutil.Process(target_pid)
+            return (
+                candidate.create_time() == target_created_at
+                and candidate.status() != psutil.STATUS_ZOMBIE
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    try:
+        if signal_mode == "kill":
+            delivered_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            process.kill()
+        else:
+            delivered_signal = getattr(signal, "SIGUSR1")
+            process.send_signal(delivered_signal)
+        assert process.wait(timeout=5) == -int(delivered_signal)
+        deadline = time.monotonic() + 2.0
+        while target_is_live() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not target_is_live()
+        if decoy is not None:
+            assert decoy.poll() is None, "published-PID mutant received the signal"
+    finally:
+        real_kill = _live_system_signal_primitives["kill"]
+        assert callable(real_kill)
+        if target_is_live():
+            real_kill(target_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        if process.poll() is None:
+            process.wait(timeout=5)
+        if decoy is not None and decoy.poll() is None:
+            real_kill(decoy.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            decoy.wait(timeout=5)
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_popen_preserves_close_fds_false(
+    _os_case: str,
+) -> None:
+    """An unnamed inheritable caller FD must reach the requested target."""
+    read_fd, write_fd = os.pipe()
+    process = None
+    try:
+        os.set_inheritable(write_fd, True)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; os.write(int(sys.argv[1]), b'ok')",
+                str(write_fd),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=False,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert process.wait(timeout=5) == 0
+        assert os.read(read_fd, 2) == b"ok"
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_rejects_closed_pass_fd_before_target_start(
+    tmp_path: Path,
+    _os_case: str,
+) -> None:
+    """A bad caller FD cannot alias a newly allocated harness control FD."""
+    closed_read, closed_write = os.pipe()
+    os.close(closed_read)
+    os.close(closed_write)
+    sentinel = tmp_path / "closed-pass-fd-target-started"
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+                str(sentinel),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            pass_fds=(closed_read,),
+        )
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_rejects_pass_fd_closed_during_control_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _os_case: str,
+) -> None:
+    """A validated caller FD cannot be recycled as a harness control FD."""
+    companion_fd, pass_fd = os.pipe()
+    pass_fd_number = pass_fd
+    real_pipe = os.pipe
+    first_pipe = True
+    sentinel = tmp_path / "colliding-pass-fd-target-started"
+
+    def colliding_pipe() -> tuple[int, int]:
+        nonlocal first_pipe, pass_fd
+        if first_pipe:
+            first_pipe = False
+            os.close(pass_fd)
+            pass_fd = -1
+        return real_pipe()
+
+    try:
+        monkeypatch.setattr(os, "pipe", colliding_pipe)
+        with pytest.raises(OSError, match="changed during guarded Popen setup"):
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+                    str(sentinel),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=(pass_fd_number,),
+            )
+    finally:
+        monkeypatch.setattr(os, "pipe", real_pipe)
+        if pass_fd >= 0:
+            os.close(pass_fd)
+        os.close(companion_fd)
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("fd_mode", ("pass_fds", "close_fds_false"))
+@pytest.mark.parametrize("_os_case", POSIX_CASES)
+def test_live_system_guard_target_inherits_only_caller_fds(
+    tmp_path: Path,
+    fd_mode: str,
+    _os_case: str,
+) -> None:
+    """Harness control descriptors must never cross into the target."""
+    existing_fds = [int(name) for name in os.listdir("/dev/fd") if str(name).isdigit()]
+    scan_limit = max(4096, max(existing_fds, default=2) + 64)
+    read_fd, write_fd = os.pipe()
+    process = None
+    result_path = tmp_path / f"target-fds-{fd_mode}.json"
+    try:
+        kwargs: dict[str, object]
+        if fd_mode == "pass_fds":
+            expected = {write_fd}
+            kwargs = {"pass_fds": (write_fd,)}
+        else:
+            os.set_inheritable(write_fd, True)
+            expected = set()
+            for descriptor in range(3, scan_limit):
+                try:
+                    if os.get_inheritable(descriptor):
+                        expected.add(descriptor)
+                except OSError:
+                    continue
+            kwargs = {"close_fds": False}
+
+        target = (
+            "import json,os,pathlib,sys\n"
+            "opened=[]\n"
+            "for fd in range(3,int(sys.argv[2])):\n"
+            "    try: os.fstat(fd)\n"
+            "    except OSError: continue\n"
+            "    opened.append(fd)\n"
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(opened), "
+            "encoding='utf-8')\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", target, str(result_path), str(scan_limit)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            **kwargs,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert process.wait(timeout=5) == 0
+        observed = set(json.loads(result_path.read_text(encoding="utf-8")))
+        assert observed == expected
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.parametrize("_os_case", POSIX_CASES)
@@ -5034,6 +5287,7 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
     config = json.loads(
         (REPO_ROOT / ".continuity/config.json").read_text(encoding="utf-8")
     )
+    policy = config["evidence_policy"]
     protected_paths = {
         ".continuity/config.json",
         config["toolchain_lock"],
@@ -5049,7 +5303,16 @@ def test_continuity_workflow_covers_policy_authority_and_pins_actions() -> None:
         if uses.startswith("./"):
             action_path = uses.removeprefix("./").rstrip("/")
             protected_paths.add(f"{action_path}/action.yml")
-    policy = config["evidence_policy"]
+    focused_test_paths = [
+        Path(token)
+        for token in policy["focused_suite"]["argv"][2:]
+        if token.endswith(".py")
+    ]
+    for test_path in focused_test_paths:
+        candidate = test_path.parent / "conftest.py"
+        if (REPO_ROOT / candidate).is_file():
+            protected_paths.add(str(candidate))
+    protected_paths.add(f"{GUARD_FAILURE_PLUGIN.replace('.', '/')}.py")
     for spec in [
         policy["focused_suite"],
         policy["full_suite"],

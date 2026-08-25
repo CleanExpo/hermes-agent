@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -178,7 +179,7 @@ def test_spec_body_rejects_unresolved_template_markers() -> None:
 
 def test_every_discovered_canonical_template_placeholder_is_rejected() -> None:
     template = continuity_bridge.SPEC_TEMPLATE_PATH.read_text(encoding="utf-8")
-    markers = continuity_bridge._balanced_bracket_markers(template)
+    markers = set(re.findall(r"\[[^\[\]\n]+\]", template))
 
     assert markers
     for marker in markers:
